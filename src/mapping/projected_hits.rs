@@ -149,6 +149,24 @@ impl<'a> ProjectedHits<'a> {
         self.resulted_from_open_search = v;
     }
 
+    /// Set the global k-mer position.
+    #[inline]
+    pub fn set_global_pos(&mut self, pos: u64) {
+        self.global_pos = pos;
+    }
+
+    /// Set the contig position.
+    #[inline]
+    pub fn set_contig_pos(&mut self, pos: u32) {
+        self.contig_pos = pos;
+    }
+
+    /// Set the contig orientation.
+    #[inline]
+    pub fn set_contig_orientation(&mut self, fw: bool) {
+        self.contig_orientation = fw;
+    }
+
     /// Decode a packed contig table entry into a reference position and
     /// orientation.
     ///

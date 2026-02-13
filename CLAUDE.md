@@ -21,11 +21,12 @@ The full implementation plan with C++ → Rust type mappings, architectural note
 
 - **Phase 3A+3B: ProjectedHits + PiscemStreamingQuery** — `ProjectedHits<'a>` (`src/mapping/projected_hits.rs`) with `RefPos`, 4-case `decode_hit()` orientation logic, accessors, `resulted_from_open_search` flag. `PiscemStreamingQuery<'a, K>` (`src/mapping/streaming_query.rs`) thin wrapper around sshash-rs `StreamingQueryEngine`. `ReferenceIndex::resolve_lookup()` bridges `LookupResult` → `Option<ProjectedHits>`. 8 new tests, 51 total.
 
+- **Phase 3C: HitSearcher** (`src/mapping/hit_searcher.rs`) — Core k-mer hit collection engine. `SkippingStrategy` enum (Strict/Permissive), `KmerMatchType` enum, `ReadKmerIter` (N-skipping, Clone for save/restore), `HitSearcher` struct with `get_raw_hits_sketch<K>()`. PERMISSIVE mode: skip along contigs using SPSS verification (`check_direct_match`), binary search midpoint recovery, index query fallback. STRICT mode: delegates to `walk_safely_until` which queries every position and extends along contigs via SPSS comparison. Added `Dictionary::kmer_at_pos()` to sshash-rs for SPSS k-mer access. Added `ProjectedHits` setter methods (`set_global_pos`, `set_contig_pos`, `set_contig_orientation`). Unitig-end cache deferred to Phase 5. 18 new tests, 69 total.
+
 ### Next Up
 
-- **Phase 3C**: HitSearcher — `get_raw_hits_sketch` with PERMISSIVE mode, mapping cache
 - **Phase 4**: Protocol support (scRNA → bulk → scATAC)
-- **Phase 5**: Hardening and performance
+- **Phase 5**: Hardening and performance (unitig-end cache, etc.)
 
 ## Key Design Decisions
 
@@ -77,6 +78,7 @@ piscem-rs/
       formats.rs                # ArtifactFormat enum
     cli/                        # CLI subcommands (scaffolded)
     mapping/
+      hit_searcher.rs           # DONE — HitSearcher, ReadKmerIter, PERMISSIVE/STRICT modes
       projected_hits.rs         # DONE — RefPos, ProjectedHits<'a>, decode_hit()
       streaming_query.rs        # DONE — PiscemStreamingQuery<'a, K> wrapper
     io/                         # I/O utilities (scaffolded)
@@ -94,7 +96,7 @@ piscem-rs/
 ## Running Tests
 
 ```bash
-cargo test              # All 51 tests should pass (1 ignored integration test)
+cargo test              # All 69 tests should pass (1 ignored integration test)
 cargo check             # Should compile clean with no warnings
 RUST_LOG=info cargo run # Run with logging
 ```
