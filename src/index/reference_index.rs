@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 
 use super::contig_table::{ContigTable, EntryEncoding};
+use super::eq_classes::EqClassMap;
 use super::refinfo::RefInfo;
 
 // ---------------------------------------------------------------------------
@@ -61,8 +62,8 @@ pub struct ReferenceIndex {
     ref_info: RefInfo,
     /// Pre-computed entry encoding parameters (derived from contig table).
     encoding: EntryEncoding,
-    /// Whether an equivalence class table was loaded.
-    has_ec_table: bool,
+    /// Optional equivalence class table (tile → EC → label entries).
+    ec_table: Option<EqClassMap>,
 }
 
 impl ReferenceIndex {
@@ -114,19 +115,28 @@ impl ReferenceIndex {
         );
 
         // 4. Optionally load equivalence class table
-        let has_ec_table = if load_ec {
+        let ec_table = if load_ec {
             let ectab_path = with_ext(prefix, ECTAB_EXT);
             if ectab_path.exists() {
                 info!("Loading equivalence class table from {}", ectab_path.display());
-                // TODO: implement EqClassMap load (Phase 1D)
-                tracing::warn!("EC table loading not yet implemented; skipping");
-                false
+                let ectab_file = std::fs::File::open(&ectab_path)
+                    .with_context(|| format!("failed to open {}", ectab_path.display()))?;
+                let mut ectab_reader = std::io::BufReader::new(ectab_file);
+                let ec = EqClassMap::load(&mut ectab_reader)
+                    .with_context(|| format!("failed to load {}", ectab_path.display()))?;
+                info!(
+                    "  {} tiles, {} ECs, {} label entries",
+                    ec.num_tiles(),
+                    ec.num_ecs(),
+                    ec.num_label_entries(),
+                );
+                Some(ec)
             } else {
                 info!("No equivalence class table found at {}", ectab_path.display());
-                false
+                None
             }
         } else {
-            false
+            None
         };
 
         // 5. Derive encoding parameters from contig table
@@ -141,7 +151,7 @@ impl ReferenceIndex {
             contig_table,
             ref_info,
             encoding,
-            has_ec_table,
+            ec_table,
         })
     }
 
@@ -174,7 +184,16 @@ impl ReferenceIndex {
             .save(&mut refinfo_writer)
             .with_context(|| format!("failed to save {}", refinfo_path.display()))?;
 
-        // TODO: save EC table if present (Phase 1D)
+        // 4. Save EC table if present
+        if let Some(ref ec) = self.ec_table {
+            let ectab_path = with_ext(prefix, ECTAB_EXT);
+            info!("Saving equivalence class table to {}", ectab_path.display());
+            let ectab_file = std::fs::File::create(&ectab_path)
+                .with_context(|| format!("failed to create {}", ectab_path.display()))?;
+            let mut ectab_writer = std::io::BufWriter::new(ectab_file);
+            ec.save(&mut ectab_writer)
+                .with_context(|| format!("failed to save {}", ectab_path.display()))?;
+        }
 
         info!("Index saved to {}", prefix.display());
         Ok(())
@@ -235,7 +254,13 @@ impl ReferenceIndex {
     /// Whether an equivalence class table is available.
     #[inline]
     pub fn has_ec_table(&self) -> bool {
-        self.has_ec_table
+        self.ec_table.is_some()
+    }
+
+    /// The equivalence class table, if loaded.
+    #[inline]
+    pub fn ec_table(&self) -> Option<&EqClassMap> {
+        self.ec_table.as_ref()
     }
 
     /// Number of unitigs (contigs) in the index.
@@ -253,6 +278,7 @@ impl ReferenceIndex {
         dict: Dictionary,
         contig_table: ContigTable,
         ref_info: RefInfo,
+        ec_table: Option<EqClassMap>,
     ) -> Self {
         let encoding = contig_table.encoding();
         Self {
@@ -260,7 +286,7 @@ impl ReferenceIndex {
             contig_table,
             ref_info,
             encoding,
-            has_ec_table: false,
+            ec_table,
         }
     }
 }
@@ -271,7 +297,7 @@ impl std::fmt::Debug for ReferenceIndex {
             .field("k", &self.k())
             .field("num_contigs", &self.num_contigs())
             .field("num_refs", &self.num_refs())
-            .field("has_ec_table", &self.has_ec_table)
+            .field("has_ec_table", &self.has_ec_table())
             .field("encoding", &self.encoding)
             .finish()
     }

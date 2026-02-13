@@ -102,7 +102,7 @@ impl EntryEncoding {
 
 /// Minimum number of bits needed to represent values in `[0, n)`.
 /// Returns 0 when `n <= 1`.
-fn ceil_log2(n: u64) -> u64 {
+pub(crate) fn ceil_log2(n: u64) -> u64 {
     if n <= 1 {
         return 0;
     }

@@ -13,12 +13,12 @@ The full implementation plan with C++ → Rust type mappings, architectural note
 - **Phase 0**: Project bootstrap with CLI skeleton and parity harness scaffolding
 - **Phase 1A: ContigTable** (`src/index/contig_table.rs`) — Full implementation with Elias-Fano offsets (`cseq::elias_fano::Sequence`), packed entries (`sux::bits::BitFieldVec`), `EntryEncoding`, `ContigSpan`/`ContigSpanIter`, `ContigTableBuilder`, serialization (magic `PCTAB01\0`). 6 tests passing.
 - **Phase 1B: RefInfo** (`src/index/refinfo.rs`) — Reference metadata (names + lengths) with serialization (magic `PRFINF01`). 6 tests passing.
-- **Phase 1C: ReferenceIndex** (`src/index/reference_index.rs`) — Assembles `Dictionary` + `ContigTable` + `RefInfo` with `load(prefix, load_ec)`, `save(prefix)`, `from_parts()`, and accessors. Compiles clean, all 13 tests pass.
+- **Phase 1C: ReferenceIndex** (`src/index/reference_index.rs`) — Assembles `Dictionary` + `ContigTable` + `RefInfo` + optional `EqClassMap` with `load(prefix, load_ec)`, `save(prefix)`, `from_parts()`, and accessors.
+- **Phase 1D: EqClassMap** (`src/index/eq_classes.rs`) — Full implementation with `Orientation` enum, `EcSpan`/`EcSpanIter`, `EqClassMap` (tile → EC → label entries), `EqClassMapBuilder`, serialization (magic `PECTB01\0`). Integrated into `ReferenceIndex` as `Option<EqClassMap>`. 8 tests passing.
+- **Phase 1E: Index build pipeline** (`src/index/build.rs`) — Full end-to-end build from cuttlefish output (.cf_seg, .cf_seq, .json). `BuildConfig` + `build_index()` entry point. Parses segments via `sshash_lib::parse_cf_seg()`, builds SSHash dictionary via `DictionaryBuilder`, two-pass .cf_seq parsing (ref info + contig table population), EC table construction from contig entries, short reference handling from JSON. CLI wired up in `src/cli/build.rs`. 10 new tests, 31 total.
 
 ### Next Up
 
-- **Phase 1D: EqClassMap** (`src/index/eq_classes.rs`) — Currently a stub. Port `equivalence_class_map` with `tile_ec_ids`, `label_list_offsets`, `label_entries`.
-- **Phase 1E: Index build pipeline** — Build index from FASTA/cuttlefish input. Parses `.cf_seq` and `.json` files, walks unitigs, builds contig table.
 - **Phase 2**: Poison table
 - **Phase 3**: Core mapping kernel (PiscemStreamingQuery, ProjectedHits, HitSearcher, mapping cache)
 - **Phase 4**: Protocol support (scRNA → bulk → scATAC)
@@ -64,11 +64,12 @@ piscem-rs/
     lib.rs                      # Modules: cli, index, io, mapping, verify
     main.rs                     # Entry point
     index/
-      mod.rs                    # contig_table, eq_classes, poison_table, formats, reference_index, refinfo
+      mod.rs                    # build, contig_table, eq_classes, poison_table, formats, reference_index, refinfo
+      build.rs                  # DONE — End-to-end index build pipeline from cuttlefish output
       contig_table.rs           # DONE — EF offsets + BitFieldVec entries
       refinfo.rs                # DONE — reference names and lengths
       reference_index.rs        # DONE — assembles Dictionary + ContigTable + RefInfo
-      eq_classes.rs             # STUB — Phase 1D
+      eq_classes.rs             # DONE — EC map: tile → EC → (transcript_id, orientation)
       poison_table.rs           # STUB — Phase 2
       formats.rs                # ArtifactFormat enum
     cli/                        # CLI subcommands (scaffolded)
@@ -88,7 +89,7 @@ piscem-rs/
 ## Running Tests
 
 ```bash
-cargo test              # All 13 tests should pass
+cargo test              # All 31 tests should pass (1 ignored integration test)
 cargo check             # Should compile clean with no warnings
 RUST_LOG=info cargo run # Run with logging
 ```

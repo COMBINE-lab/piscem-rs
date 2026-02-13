@@ -1,3 +1,4 @@
+pub mod build;
 pub mod contig_table;
 pub mod eq_classes;
 pub mod formats;
