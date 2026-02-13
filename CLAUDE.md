@@ -13,13 +13,14 @@ The full implementation plan with C++ → Rust type mappings, architectural note
 - **Phase 0**: Project bootstrap with CLI skeleton and parity harness scaffolding
 - **Phase 1A: ContigTable** (`src/index/contig_table.rs`) — Full implementation with Elias-Fano offsets (`cseq::elias_fano::Sequence`), packed entries (`sux::bits::BitFieldVec`), `EntryEncoding`, `ContigSpan`/`ContigSpanIter`, `ContigTableBuilder`, serialization (magic `PCTAB01\0`). 6 tests passing.
 - **Phase 1B: RefInfo** (`src/index/refinfo.rs`) — Reference metadata (names + lengths) with serialization (magic `PRFINF01`). 6 tests passing.
-- **Phase 1C: ReferenceIndex** (`src/index/reference_index.rs`) — Assembles `Dictionary` + `ContigTable` + `RefInfo` + optional `EqClassMap` with `load(prefix, load_ec)`, `save(prefix)`, `from_parts()`, and accessors.
+- **Phase 1C: ReferenceIndex** (`src/index/reference_index.rs`) — Assembles `Dictionary` + `ContigTable` + `RefInfo` + optional `EqClassMap` + optional `PoisonTable` with `load(prefix, load_ec, load_poison)`, `save(prefix)`, `from_parts()`, and accessors.
 - **Phase 1D: EqClassMap** (`src/index/eq_classes.rs`) — Full implementation with `Orientation` enum, `EcSpan`/`EcSpanIter`, `EqClassMap` (tile → EC → label entries), `EqClassMapBuilder`, serialization (magic `PECTB01\0`). Integrated into `ReferenceIndex` as `Option<EqClassMap>`. 8 tests passing.
 - **Phase 1E: Index build pipeline** (`src/index/build.rs`) — Full end-to-end build from cuttlefish output (.cf_seg, .cf_seq, .json). `BuildConfig` + `build_index()` entry point. Parses segments via `sshash_lib::parse_cf_seg()`, builds SSHash dictionary via `DictionaryBuilder`, two-pass .cf_seq parsing (ref info + contig table population), EC table construction from contig entries, short reference handling from JSON. CLI wired up in `src/cli/build.rs`. 10 new tests, 31 total.
 
+- **Phase 2: PoisonTable** (`src/index/poison_table.rs`) — Full implementation with `AHashMap<u64, u64>` (fixed-seed `ahash::RandomState` for deterministic fast lookup), `PoisonOcc`/`LabeledPoisonOcc`, `build_from_occs()`, query methods (`key_exists`, `key_occurs_in_unitig`, `key_occurs_in_unitig_between`), serialization (magic `PPOIS01\0`), JSON stats output. Integrated into `ReferenceIndex` as `Option<PoisonTable>`. CLI stub awaits Phase 3 streaming query engine. 12 new tests, 43 total.
+
 ### Next Up
 
-- **Phase 2**: Poison table
 - **Phase 3**: Core mapping kernel (PiscemStreamingQuery, ProjectedHits, HitSearcher, mapping cache)
 - **Phase 4**: Protocol support (scRNA → bulk → scATAC)
 - **Phase 5**: Hardening and performance
@@ -70,7 +71,7 @@ piscem-rs/
       refinfo.rs                # DONE — reference names and lengths
       reference_index.rs        # DONE — assembles Dictionary + ContigTable + RefInfo
       eq_classes.rs             # DONE — EC map: tile → EC → (transcript_id, orientation)
-      poison_table.rs           # STUB — Phase 2
+      poison_table.rs           # DONE — Poison k-mer table with AHashMap, build_from_occs, queries
       formats.rs                # ArtifactFormat enum
     cli/                        # CLI subcommands (scaffolded)
     mapping/                    # Mapping engine (scaffolded, not yet implemented)
@@ -89,7 +90,7 @@ piscem-rs/
 ## Running Tests
 
 ```bash
-cargo test              # All 31 tests should pass (1 ignored integration test)
+cargo test              # All 43 tests should pass (1 ignored integration test)
 cargo check             # Should compile clean with no warnings
 RUST_LOG=info cargo run # Run with logging
 ```

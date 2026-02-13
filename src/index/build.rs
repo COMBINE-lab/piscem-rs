@@ -225,7 +225,7 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
 
     // Step 6: Assemble and save
     let ref_info = RefInfo::new(ref_names, ref_lens);
-    let index = ReferenceIndex::from_parts(dict, contig_table, ref_info, ec_table);
+    let index = ReferenceIndex::from_parts(dict, contig_table, ref_info, ec_table, None);
 
     // Create output directory if needed
     if let Some(parent) = config.output_prefix.parent() {
@@ -635,7 +635,7 @@ mod tests {
         build_index(&config).expect("build_index failed");
 
         // Verify we can load the index back
-        let index = ReferenceIndex::load(&config.output_prefix, true)
+        let index = ReferenceIndex::load(&config.output_prefix, true, false)
             .expect("failed to reload index");
 
         assert!(index.num_contigs() > 0);

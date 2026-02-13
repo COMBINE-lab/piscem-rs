@@ -13,6 +13,7 @@ use tracing::info;
 
 use super::contig_table::{ContigTable, EntryEncoding};
 use super::eq_classes::EqClassMap;
+use super::poison_table::PoisonTable;
 use super::refinfo::RefInfo;
 
 // ---------------------------------------------------------------------------
@@ -27,6 +28,10 @@ const CTAB_EXT: &str = "ctab";
 const REFINFO_EXT: &str = "refinfo";
 /// File extension for the equivalence class table (optional).
 const ECTAB_EXT: &str = "ectab";
+/// File extension for the poison table (optional).
+const POISON_EXT: &str = "poison";
+/// File extension for the poison stats JSON (optional).
+const POISON_JSON_EXT: &str = "poison.json";
 
 fn with_ext(prefix: &Path, ext: &str) -> PathBuf {
     let mut p = prefix.to_path_buf();
@@ -53,6 +58,7 @@ fn with_ext(prefix: &Path, ext: &str) -> PathBuf {
 /// - `/path/to/index.ctab` — contig table
 /// - `/path/to/index.refinfo` — reference names and lengths
 /// - `/path/to/index.ectab` — equivalence class table (optional)
+/// - `/path/to/index.poison` — poison k-mer table (optional)
 pub struct ReferenceIndex {
     /// SSHash compressed k-mer dictionary.
     dict: Dictionary,
@@ -64,15 +70,17 @@ pub struct ReferenceIndex {
     encoding: EntryEncoding,
     /// Optional equivalence class table (tile → EC → label entries).
     ec_table: Option<EqClassMap>,
+    /// Optional poison k-mer table for mapping specificity.
+    poison_table: Option<PoisonTable>,
 }
 
 impl ReferenceIndex {
     /// Load a reference index from files with the given path prefix.
     ///
     /// Loads the dictionary, contig table, and reference info. Optionally
-    /// loads the equivalence class table if `load_ec` is true and the file
-    /// exists.
-    pub fn load(prefix: &Path, load_ec: bool) -> Result<Self> {
+    /// loads the equivalence class table if `load_ec` is true and the
+    /// poison table if `load_poison` is true (and their files exist).
+    pub fn load(prefix: &Path, load_ec: bool, load_poison: bool) -> Result<Self> {
         // 1. Load SSHash dictionary
         let dict_path = with_ext(prefix, DICT_EXT);
         info!("Loading SSHash dictionary from {}", dict_path.display());
@@ -146,12 +154,37 @@ impl ReferenceIndex {
             encoding.ref_shift, encoding.pos_mask,
         );
 
+        // 6. Optionally load poison table
+        let poison_table = if load_poison {
+            let poison_path = with_ext(prefix, POISON_EXT);
+            if poison_path.exists() {
+                info!("Loading poison table from {}", poison_path.display());
+                let poison_file = std::fs::File::open(&poison_path)
+                    .with_context(|| format!("failed to open {}", poison_path.display()))?;
+                let mut poison_reader = std::io::BufReader::new(poison_file);
+                let pt = PoisonTable::load(&mut poison_reader)
+                    .with_context(|| format!("failed to load {}", poison_path.display()))?;
+                info!(
+                    "  {} poison k-mers, {} occurrences",
+                    pt.num_poison_kmers(),
+                    pt.num_poison_occs(),
+                );
+                Some(pt)
+            } else {
+                info!("No poison table found at {}", poison_path.display());
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             dict,
             contig_table,
             ref_info,
             encoding,
             ec_table,
+            poison_table,
         })
     }
 
@@ -193,6 +226,25 @@ impl ReferenceIndex {
             let mut ectab_writer = std::io::BufWriter::new(ectab_file);
             ec.save(&mut ectab_writer)
                 .with_context(|| format!("failed to save {}", ectab_path.display()))?;
+        }
+
+        // 5. Save poison table if present
+        if let Some(ref pt) = self.poison_table {
+            let poison_path = with_ext(prefix, POISON_EXT);
+            info!("Saving poison table to {}", poison_path.display());
+            let poison_file = std::fs::File::create(&poison_path)
+                .with_context(|| format!("failed to create {}", poison_path.display()))?;
+            let mut poison_writer = std::io::BufWriter::new(poison_file);
+            pt.save(&mut poison_writer)
+                .with_context(|| format!("failed to save {}", poison_path.display()))?;
+
+            let json_path = with_ext(prefix, POISON_JSON_EXT);
+            info!("Saving poison stats to {}", json_path.display());
+            let json_file = std::fs::File::create(&json_path)
+                .with_context(|| format!("failed to create {}", json_path.display()))?;
+            let mut json_writer = std::io::BufWriter::new(json_file);
+            pt.save_stats_json(&mut json_writer)
+                .with_context(|| format!("failed to save {}", json_path.display()))?;
         }
 
         info!("Index saved to {}", prefix.display());
@@ -263,6 +315,18 @@ impl ReferenceIndex {
         self.ec_table.as_ref()
     }
 
+    /// Whether a poison k-mer table is available.
+    #[inline]
+    pub fn has_poison_table(&self) -> bool {
+        self.poison_table.is_some()
+    }
+
+    /// The poison k-mer table, if loaded.
+    #[inline]
+    pub fn poison_table(&self) -> Option<&PoisonTable> {
+        self.poison_table.as_ref()
+    }
+
     /// Number of unitigs (contigs) in the index.
     #[inline]
     pub fn num_contigs(&self) -> usize {
@@ -279,6 +343,7 @@ impl ReferenceIndex {
         contig_table: ContigTable,
         ref_info: RefInfo,
         ec_table: Option<EqClassMap>,
+        poison_table: Option<PoisonTable>,
     ) -> Self {
         let encoding = contig_table.encoding();
         Self {
@@ -287,6 +352,7 @@ impl ReferenceIndex {
             ref_info,
             encoding,
             ec_table,
+            poison_table,
         }
     }
 }
@@ -298,6 +364,7 @@ impl std::fmt::Debug for ReferenceIndex {
             .field("num_contigs", &self.num_contigs())
             .field("num_refs", &self.num_refs())
             .field("has_ec_table", &self.has_ec_table())
+            .field("has_poison_table", &self.has_poison_table())
             .field("encoding", &self.encoding)
             .finish()
     }
