@@ -122,6 +122,7 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
         read1_paths: args.read1.clone(),
         read2_paths: args.read2.clone(),
         chunk_size: 5000,
+        ..Default::default()
     };
     let fastx = FastxSource::new(fastx_config)?;
 
@@ -242,7 +243,7 @@ where
         let mut cache_left = MappingCache::<SketchHitInfoSimple>::new(K);
         let mut cache_right = MappingCache::<SketchHitInfoSimple>::new(K);
         let mut poison_state = PoisonState::new(index.poison_table());
-        let mut rad_writer = RadWriter::new();
+        let mut rad_writer = RadWriter::with_capacity(150_000);
 
         let mut local_reads: u64 = 0;
         let mut local_mapped: u64 = 0;

@@ -32,6 +32,12 @@ where
     cache: Option<&'a UnitigEndCache>,
     /// Number of cache hits (for statistics).
     num_cache_hits: u64,
+    /// Position of the previous query in the read (for auto-reset detection).
+    /// When the next lookup is not at `prev_query_pos + 1`, the engine is
+    /// automatically reset, forcing a full k-mer parse. This mirrors the
+    /// C++ `m_prev_query_offset` tracking and allows the sshash-rs engine
+    /// to use its fast incremental k-mer update path for consecutive lookups.
+    prev_query_pos: i32,
 }
 
 impl<'a, const K: usize> PiscemStreamingQuery<'a, K>
@@ -46,6 +52,7 @@ where
             cache_end: false,
             cache: None,
             num_cache_hits: 0,
+            prev_query_pos: i32::MIN,
         }
     }
 
@@ -57,6 +64,7 @@ where
             cache_end: false,
             cache: Some(cache),
             num_cache_hits: 0,
+            prev_query_pos: i32::MIN,
         }
     }
 
@@ -66,18 +74,33 @@ where
     pub fn reset(&mut self) {
         self.engine.reset();
         self.cache_end = false;
+        self.prev_query_pos = i32::MIN;
     }
 
-    /// Look up a k-mer string in the dictionary.
+    /// Look up a k-mer at a specific read position.
+    ///
+    /// Tracks position to auto-detect non-consecutive lookups. If `read_pos`
+    /// is exactly `prev_query_pos + 1`, the sshash-rs engine reuses its
+    /// incremental k-mer state (fast). Otherwise, the engine is reset and
+    /// the k-mer is parsed from scratch.
+    ///
+    /// This mirrors the C++ `m_prev_query_offset` tracking in
+    /// `piscem::streaming_query`.
     ///
     /// If the unitig-end cache is enabled and we're at a unitig boundary,
     /// checks the cache first. On a cache miss, performs a full lookup and
     /// caches the result for future threads.
-    ///
-    /// Returns a `LookupResult` which can be checked with `is_found()` and
-    /// then passed to `ReferenceIndex::resolve_lookup()`.
     #[inline]
-    pub fn lookup(&mut self, kmer_str: &str) -> LookupResult {
+    pub fn lookup_at(&mut self, kmer_str: &str, read_pos: i32) -> LookupResult {
+        // Auto-detect non-consecutive position and reset engine if needed.
+        // This recovers the incremental k-mer update path for consecutive
+        // lookups (stride=1) while correctly handling jumps.
+        if read_pos != self.prev_query_pos.wrapping_add(1) {
+            self.engine.reset();
+            self.cache_end = false;
+        }
+        self.prev_query_pos = read_pos;
+
         // Try cache if we're at a unitig boundary
         if self.cache_end {
             if let Some(cache) = self.cache {
@@ -134,6 +157,17 @@ where
         }
 
         result
+    }
+
+    /// Look up a k-mer without position tracking (always resets engine).
+    ///
+    /// This is a convenience method for callers that don't track read position.
+    /// For optimal performance in the mapping pipeline, use `lookup_at()` instead.
+    #[inline]
+    pub fn lookup(&mut self, kmer_str: &str) -> LookupResult {
+        self.engine.reset();
+        self.prev_query_pos = i32::MIN;
+        self.lookup_at(kmer_str, 0)
     }
 
     /// Number of full dictionary searches performed (expensive path).

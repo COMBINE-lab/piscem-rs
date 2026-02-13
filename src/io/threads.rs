@@ -108,32 +108,28 @@ where
 {
     let num_threads = config.threads.max(1);
 
-    if num_threads <= 1 {
-        // Single-thread mode: no channels, process inline.
-        let mut chunk = Vec::new();
-        while fastx.next_chunk(&mut chunk)? {
-            let batch = std::mem::take(&mut chunk);
-            worker_fn(batch, output, stats);
+    // Always use producer-consumer pattern: 1 dedicated producer thread for
+    // FASTQ parsing/decompression + N worker threads for mapping.
+    // This matches C++ piscem which always uses a separate parser thread.
+    // At t=1: 1 producer + 1 worker = 2 OS threads (parallel I/O + mapping).
+    let (sender, receiver) = channel::bounded::<ReadChunk>(num_threads * 2);
+
+    let worker_ref = &worker_fn;
+    crossbeam::scope(|scope| {
+        // Spawn worker threads
+        for _ in 0..num_threads {
+            let recv = receiver.clone();
+            scope.spawn(move |_| {
+                while let Ok(chunk) = recv.recv() {
+                    worker_ref(chunk, output, stats);
+                }
+            });
         }
-    } else {
-        // Multi-thread mode: producer-consumer with bounded channel.
-        let (sender, receiver) = channel::bounded::<ReadChunk>(num_threads * 2);
+        // Drop the extra receiver clone so workers will exit when sender is dropped.
+        drop(receiver);
 
-        let worker_ref = &worker_fn;
-        crossbeam::scope(|scope| {
-            // Spawn worker threads
-            for _ in 0..num_threads {
-                let recv = receiver.clone();
-                scope.spawn(move |_| {
-                    while let Ok(chunk) = recv.recv() {
-                        worker_ref(chunk, output, stats);
-                    }
-                });
-            }
-            // Drop the extra receiver clone so workers will exit when sender is dropped.
-            drop(receiver);
-
-            // Producer: read chunks and send to workers.
+        // Producer thread: reads FASTX chunks and sends to workers.
+        scope.spawn(move |_| {
             let mut chunk = Vec::new();
             loop {
                 match fastx.next_chunk(&mut chunk) {
@@ -150,11 +146,10 @@ where
                     }
                 }
             }
-            // Drop sender to signal workers to exit.
-            drop(sender);
-        })
-        .map_err(|e| anyhow::anyhow!("thread panicked: {:?}", e))?;
-    }
+            // sender dropped here, signaling workers to exit.
+        });
+    })
+    .map_err(|e| anyhow::anyhow!("thread panicked: {:?}", e))?;
 
     Ok(())
 }

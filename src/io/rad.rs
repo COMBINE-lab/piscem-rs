@@ -37,10 +37,20 @@ pub struct RadWriter {
 }
 
 impl RadWriter {
-    /// Create a new empty writer.
+    /// Create a new empty writer with default 4KB capacity.
     pub fn new() -> Self {
         Self {
             buf: Vec::with_capacity(4096),
+        }
+    }
+
+    /// Create a new empty writer with the given byte capacity.
+    ///
+    /// Use this in worker threads where typical chunk size is known
+    /// to avoid repeated reallocation (e.g., 150KB for 5000 PE bulk reads).
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(cap),
         }
     }
 

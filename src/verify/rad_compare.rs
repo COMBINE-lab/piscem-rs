@@ -551,6 +551,227 @@ fn classify_detail_diff(a: &CanonicalBulkRecord, b: &CanonicalBulkRecord) -> &'s
 }
 
 // ---------------------------------------------------------------------------
+// SC record-level comparison
+// ---------------------------------------------------------------------------
+
+/// A canonicalized SC RAD record for multiset comparison.
+///
+/// Each alignment is (ref_id, direction). Sorted for deterministic comparison.
+#[cfg(any(test, feature = "parity-test"))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CanonicalScRecord {
+    pub bc: u64,
+    pub umi: u64,
+    pub alignments: Vec<(u32, bool)>, // (ref_id, forward)
+}
+
+#[cfg(any(test, feature = "parity-test"))]
+impl std::fmt::Display for CanonicalScRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bc={}, umi={}, alns=[", self.bc, self.umi)?;
+        for (i, (r, d)) in self.alignments.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "(ref={r}, fw={d})")?;
+        }
+        write!(f, "]")
+    }
+}
+
+/// Read all SC RAD records from a file using libradicl.
+#[cfg(any(test, feature = "parity-test"))]
+pub fn read_sc_rad_records(
+    path: &Path,
+) -> Result<(libradicl::header::RadPrelude, Vec<CanonicalScRecord>)> {
+    use libradicl::chunk::Chunk;
+    use libradicl::header::RadPrelude;
+    use libradicl::record::{AlevinFryReadRecord, AlevinFryRecordContext, MappedRecord, RecordContext};
+
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+
+    let prelude = RadPrelude::from_bytes(&mut reader)
+        .context("parsing RAD prelude")?;
+
+    // Parse file-level tags
+    let _file_tag_map = prelude.file_tags.try_parse_tags_from_bytes(&mut reader)
+        .context("parsing file-level tags")?;
+
+    // Get record parsing context
+    let ctx = AlevinFryRecordContext::get_context_from_tag_section(
+        &prelude.file_tags,
+        &prelude.read_tags,
+        &prelude.aln_tags,
+    ).context("getting SC record context")?;
+
+    let num_chunks = prelude.hdr.num_chunks;
+    let mut all_records = Vec::new();
+
+    for _ in 0..num_chunks {
+        let chunk = Chunk::<AlevinFryReadRecord>::from_bytes(&mut reader, &ctx);
+        for rec in &chunk.reads {
+            if rec.is_empty() {
+                continue;
+            }
+            let mut alignments: Vec<(u32, bool)> = rec.refs.iter()
+                .zip(rec.dirs.iter())
+                .map(|(&ref_id, &dir)| (ref_id, dir))
+                .collect();
+            alignments.sort();
+
+            all_records.push(CanonicalScRecord {
+                bc: rec.bc,
+                umi: rec.umi,
+                alignments,
+            });
+        }
+    }
+
+    Ok((prelude, all_records))
+}
+
+/// Compare two SC RAD files at the record level using multiset comparison.
+#[cfg(any(test, feature = "parity-test"))]
+pub fn compare_sc_rad_full(
+    path_a: &Path,
+    path_b: &Path,
+) -> Result<RecordComparisonSummary> {
+    let (prelude_a, records_a) = read_sc_rad_records(path_a)
+        .with_context(|| format!("reading {}", path_a.display()))?;
+    let (prelude_b, records_b) = read_sc_rad_records(path_b)
+        .with_context(|| format!("reading {}", path_b.display()))?;
+
+    // Compare headers
+    let paired_match = prelude_a.hdr.is_paired == prelude_b.hdr.is_paired;
+    let count_match = prelude_a.hdr.ref_count == prelude_b.hdr.ref_count;
+    let names_a: std::collections::HashSet<&str> =
+        prelude_a.hdr.ref_names.iter().map(|s| s.as_str()).collect();
+    let names_b: std::collections::HashSet<&str> =
+        prelude_b.hdr.ref_names.iter().map(|s| s.as_str()).collect();
+    let names_match = names_a == names_b;
+    let header_match = paired_match && count_match && names_match;
+
+    // Build ref ID translation: B's ref_id → A's ref_id (via ref name)
+    let name_to_id_a: std::collections::HashMap<&str, u32> = prelude_a
+        .hdr.ref_names.iter().enumerate()
+        .map(|(i, n)| (n.as_str(), i as u32))
+        .collect();
+    let b_to_a_id: Vec<u32> = prelude_b
+        .hdr.ref_names.iter()
+        .map(|name| name_to_id_a.get(name.as_str()).copied().unwrap_or(u32::MAX))
+        .collect();
+
+    let total_a = records_a.len();
+    let total_b = records_b.len();
+
+    // Build frequency map for A
+    let mut freq_a: std::collections::HashMap<CanonicalScRecord, u64> =
+        std::collections::HashMap::with_capacity(total_a);
+    for rec in &records_a {
+        *freq_a.entry(rec.clone()).or_insert(0) += 1;
+    }
+
+    // Build frequency map for B, translating ref IDs
+    let mut freq_b: std::collections::HashMap<CanonicalScRecord, u64> =
+        std::collections::HashMap::with_capacity(total_b);
+    for rec in &records_b {
+        let translated = translate_sc_record(rec, &b_to_a_id);
+        *freq_b.entry(translated).or_insert(0) += 1;
+    }
+
+    // Compare frequency maps
+    let mut matching: usize = 0;
+    let mut missing_in_a: usize = 0;
+    let mut missing_in_b: usize = 0;
+    let mut first_mismatches: Vec<String> = Vec::new();
+    let max_mismatch_report = 10;
+
+    for (rec, &count_a) in &freq_a {
+        let count_b = freq_b.get(rec).copied().unwrap_or(0);
+        if count_a == count_b {
+            matching += count_a as usize;
+        } else if count_a > count_b {
+            matching += count_b as usize;
+            let diff = (count_a - count_b) as usize;
+            missing_in_b += diff;
+            if first_mismatches.len() < max_mismatch_report {
+                first_mismatches.push(format!("in A but not B ({diff}x): {rec}"));
+            }
+        } else {
+            matching += count_a as usize;
+            let diff = (count_b - count_a) as usize;
+            missing_in_a += diff;
+            if first_mismatches.len() < max_mismatch_report {
+                first_mismatches.push(format!("in B but not A ({diff}x): {rec}"));
+            }
+        }
+    }
+    for (rec, &count_b) in &freq_b {
+        if !freq_a.contains_key(rec) {
+            missing_in_a += count_b as usize;
+            if first_mismatches.len() < max_mismatch_report {
+                first_mismatches.push(format!("in B but not A ({count_b}x): {rec}"));
+            }
+        }
+    }
+
+    let passed = header_match && missing_in_a == 0 && missing_in_b == 0 && total_a == total_b;
+
+    let mut notes_parts = Vec::new();
+    if !header_match {
+        if !paired_match { notes_parts.push("is_paired differs".to_string()); }
+        if !count_match {
+            notes_parts.push(format!(
+                "ref_count differs: {} vs {}", prelude_a.hdr.ref_count, prelude_b.hdr.ref_count
+            ));
+        }
+        if !names_match { notes_parts.push("ref_names differ".to_string()); }
+    }
+    if total_a != total_b {
+        notes_parts.push(format!("record count mismatch: {total_a} vs {total_b}"));
+    }
+    if missing_in_a > 0 { notes_parts.push(format!("{missing_in_a} records in B missing from A")); }
+    if missing_in_b > 0 { notes_parts.push(format!("{missing_in_b} records in A missing from B")); }
+    if passed { notes_parts.push(format!("all {matching} records match")); }
+
+    Ok(RecordComparisonSummary {
+        header_match,
+        total_records_a: total_a,
+        total_records_b: total_b,
+        matching_records: matching,
+        missing_in_a,
+        missing_in_b,
+        passed,
+        notes: notes_parts.join("; "),
+        first_mismatches,
+        // SC records don't have position/frag_len detail categories
+        same_targets_diff_detail: 0,
+        different_targets: 0,
+        diff_frag_len_only: 0,
+        diff_pos_only: 0,
+        diff_num_alns: 0,
+    })
+}
+
+/// Translate ref IDs in an SC record from one namespace to another.
+#[cfg(any(test, feature = "parity-test"))]
+fn translate_sc_record(
+    rec: &CanonicalScRecord,
+    id_map: &[u32],
+) -> CanonicalScRecord {
+    let mut translated = rec.clone();
+    for aln in &mut translated.alignments {
+        if (aln.0 as usize) < id_map.len() {
+            aln.0 = id_map[aln.0 as usize];
+        }
+    }
+    translated.alignments.sort();
+    translated
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

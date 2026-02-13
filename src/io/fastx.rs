@@ -42,6 +42,9 @@ pub struct FastxConfig {
     pub read1_paths: Vec<String>,
     pub read2_paths: Vec<String>,
     pub chunk_size: usize,
+    /// Whether to copy quality strings into `ReadPair`. Default `false`.
+    /// Quality is currently unused by all mapping modes.
+    pub copy_quality: bool,
 }
 
 impl Default for FastxConfig {
@@ -50,6 +53,7 @@ impl Default for FastxConfig {
             read1_paths: Vec::new(),
             read2_paths: Vec::new(),
             chunk_size: 1000,
+            copy_quality: false,
         }
     }
 }
@@ -126,6 +130,7 @@ impl FastxSource {
 
             let mut iter1 = self.record_set1.iter();
             let mut iter2 = rs2.iter();
+            let copy_qual = self.config.copy_quality;
 
             loop {
                 let r1 = iter1.next();
@@ -133,11 +138,19 @@ impl FastxSource {
                 match (r1, r2) {
                     (Some(Ok(rec1)), Some(Ok(rec2))) => {
                         chunk.push(ReadPair {
-                            name: rec1.id().to_vec(),
+                            name: Vec::new(),
                             seq1: rec1.seq().into_owned(),
-                            qual1: rec1.qual().map(|q| q.to_vec()).unwrap_or_default(),
+                            qual1: if copy_qual {
+                                rec1.qual().map(|q| q.to_vec()).unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            },
                             seq2: Some(rec2.seq().into_owned()),
-                            qual2: Some(rec2.qual().map(|q| q.to_vec()).unwrap_or_default()),
+                            qual2: if copy_qual {
+                                Some(rec2.qual().map(|q| q.to_vec()).unwrap_or_default())
+                            } else {
+                                Some(Vec::new())
+                            },
                         });
                     }
                     (None, None) => break,
@@ -153,12 +166,18 @@ impl FastxSource {
                 return Ok(false);
             }
 
+            let copy_qual = self.config.copy_quality;
+
             for rec in self.record_set1.iter() {
                 let rec = rec?;
                 chunk.push(ReadPair {
-                    name: rec.id().to_vec(),
+                    name: Vec::new(),
                     seq1: rec.seq().into_owned(),
-                    qual1: rec.qual().map(|q| q.to_vec()).unwrap_or_default(),
+                    qual1: if copy_qual {
+                        rec.qual().map(|q| q.to_vec()).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
                     seq2: None,
                     qual2: None,
                 });
@@ -246,6 +265,7 @@ mod tests {
             read1_paths: vec!["r1.fq".to_string()],
             read2_paths: vec!["r2.fq".to_string()],
             chunk_size: 500,
+            ..Default::default()
         };
         assert!(config.is_paired());
     }

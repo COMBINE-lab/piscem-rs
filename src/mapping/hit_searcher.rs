@@ -366,18 +366,11 @@ impl<'idx> HitSearcher<'idx> {
                 continue;
             }
 
-            // Query the index.
-            // Reset the streaming query before each lookup in PERMISSIVE mode.
-            // PERMISSIVE skips may advance many positions without calling the
-            // streaming query (using check_direct_match instead), leaving the
-            // engine's incremental k-mer state stale.  A stale engine would
-            // shift-and-append a single character, producing a wrong chimeric
-            // k-mer and causing the subsequent seed() to miss the real hit.
-            // The C++ streaming query auto-detects offset jumps and resets;
-            // we reset explicitly here instead.
-            query.reset();
+            // Query the index. Position tracking in PiscemStreamingQuery
+            // auto-detects non-consecutive jumps and resets the engine,
+            // while allowing the fast incremental path for stride-1 lookups.
             let kmer_str = unsafe { std::str::from_utf8_unchecked(kmer_bytes) };
-            let result = query.lookup(kmer_str);
+            let result = query.lookup_at(kmer_str, read_pos);
 
             if let Some(phit) = index.resolve_lookup(&result) {
                 if phit.is_empty() {
@@ -485,11 +478,10 @@ impl<'idx> HitSearcher<'idx> {
                     }
 
                     // --- Index query at target ---
-                    query.reset();
                     let alt_kmer_bytes = iter.kmer_bytes();
                     let alt_str =
                         unsafe { std::str::from_utf8_unchecked(alt_kmer_bytes) };
-                    let alt_result = query.lookup(alt_str);
+                    let alt_result = query.lookup_at(alt_str, iter.pos());
                     let alt_phit = index.resolve_lookup(&alt_result);
                     let alt_found = alt_phit
                         .as_ref()
@@ -524,11 +516,10 @@ impl<'idx> HitSearcher<'idx> {
                         mid_iter.advance_by(half_skip);
 
                         if !mid_iter.is_exhausted() {
-                            query.reset();
                             let mid_bytes = mid_iter.kmer_bytes();
                             let mid_str =
                                 unsafe { std::str::from_utf8_unchecked(mid_bytes) };
-                            let mid_result = query.lookup(mid_str);
+                            let mid_result = query.lookup_at(mid_str, mid_iter.pos());
                             if let Some(mid_phit) =
                                 index.resolve_lookup(&mid_result)
                             {
@@ -635,15 +626,10 @@ impl<'idx> HitSearcher<'idx> {
                 continue;
             }
 
-            // Reset the streaming query before each lookup in walk_safely_until.
-            // After walking along a contig via SPSS comparison (kmer_at_pos),
-            // the streaming query's internal k-mer state is stale — it still
-            // holds the k-mer from the last query.lookup() call, not from the
-            // current read position.  Without reset, the incremental update
-            // produces a wrong chimeric k-mer and misses the real hit.
-            query.reset();
+            // Position tracking in PiscemStreamingQuery auto-detects jumps
+            // (e.g., after SPSS-based contig walks) and resets the engine.
             let kmer_str = unsafe { std::str::from_utf8_unchecked(kmer_bytes) };
-            let result = query.lookup(kmer_str);
+            let result = query.lookup_at(kmer_str, iter.pos());
 
             if let Some(phit_info) = index.resolve_lookup(&result) {
                 if phit_info.is_empty() {
