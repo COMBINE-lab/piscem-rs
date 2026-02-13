@@ -16,6 +16,9 @@ use super::eq_classes::EqClassMap;
 use super::poison_table::PoisonTable;
 use super::refinfo::RefInfo;
 
+use crate::mapping::projected_hits::ProjectedHits;
+use sshash_lib::LookupResult;
+
 // ---------------------------------------------------------------------------
 // File extension helpers
 // ---------------------------------------------------------------------------
@@ -331,6 +334,37 @@ impl ReferenceIndex {
     #[inline]
     pub fn num_contigs(&self) -> usize {
         self.contig_table.num_contigs()
+    }
+
+    // -----------------------------------------------------------------------
+    // Query / resolution
+    // -----------------------------------------------------------------------
+
+    /// Resolve an sshash-rs `LookupResult` against the contig table.
+    ///
+    /// Returns `None` if the k-mer was not found in the dictionary.
+    /// Returns `Some(hits)` where `hits.is_empty()` is possible if the k-mer
+    /// was found but the contig has no reference occurrences.
+    pub fn resolve_lookup(&self, result: &LookupResult) -> Option<ProjectedHits<'_>> {
+        if !result.is_found() {
+            return None;
+        }
+        let k = self.k() as u32;
+        let contig_id = result.string_id as u32;
+        let contig_pos = result.kmer_id_in_string as u32;
+        let contig_len = result.string_length() as u32;
+        let is_forward = result.kmer_orientation == 1;
+        let global_pos = result.kmer_id + result.string_id * (k as u64 - 1);
+        let ref_range = self.contig_table.contig_entries(result.string_id);
+        Some(ProjectedHits::new(
+            contig_id,
+            contig_pos,
+            is_forward,
+            contig_len,
+            global_pos,
+            k,
+            ref_range,
+        ))
     }
 
     // -----------------------------------------------------------------------

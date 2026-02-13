@@ -4,4 +4,6 @@ pub mod engine;
 pub mod filters;
 pub mod hits;
 pub mod merge_pairs;
+pub mod projected_hits;
 pub mod protocols;
+pub mod streaming_query;

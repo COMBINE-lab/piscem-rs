@@ -19,9 +19,11 @@ The full implementation plan with C++ → Rust type mappings, architectural note
 
 - **Phase 2: PoisonTable** (`src/index/poison_table.rs`) — Full implementation with `AHashMap<u64, u64>` (fixed-seed `ahash::RandomState` for deterministic fast lookup), `PoisonOcc`/`LabeledPoisonOcc`, `build_from_occs()`, query methods (`key_exists`, `key_occurs_in_unitig`, `key_occurs_in_unitig_between`), serialization (magic `PPOIS01\0`), JSON stats output. Integrated into `ReferenceIndex` as `Option<PoisonTable>`. CLI stub awaits Phase 3 streaming query engine. 12 new tests, 43 total.
 
+- **Phase 3A+3B: ProjectedHits + PiscemStreamingQuery** — `ProjectedHits<'a>` (`src/mapping/projected_hits.rs`) with `RefPos`, 4-case `decode_hit()` orientation logic, accessors, `resulted_from_open_search` flag. `PiscemStreamingQuery<'a, K>` (`src/mapping/streaming_query.rs`) thin wrapper around sshash-rs `StreamingQueryEngine`. `ReferenceIndex::resolve_lookup()` bridges `LookupResult` → `Option<ProjectedHits>`. 8 new tests, 51 total.
+
 ### Next Up
 
-- **Phase 3**: Core mapping kernel (PiscemStreamingQuery, ProjectedHits, HitSearcher, mapping cache)
+- **Phase 3C**: HitSearcher — `get_raw_hits_sketch` with PERMISSIVE mode, mapping cache
 - **Phase 4**: Protocol support (scRNA → bulk → scATAC)
 - **Phase 5**: Hardening and performance
 
@@ -74,7 +76,9 @@ piscem-rs/
       poison_table.rs           # DONE — Poison k-mer table with AHashMap, build_from_occs, queries
       formats.rs                # ArtifactFormat enum
     cli/                        # CLI subcommands (scaffolded)
-    mapping/                    # Mapping engine (scaffolded, not yet implemented)
+    mapping/
+      projected_hits.rs         # DONE — RefPos, ProjectedHits<'a>, decode_hit()
+      streaming_query.rs        # DONE — PiscemStreamingQuery<'a, K> wrapper
     io/                         # I/O utilities (scaffolded)
     verify/                     # Parity verification (scaffolded)
 ```
@@ -90,7 +94,7 @@ piscem-rs/
 ## Running Tests
 
 ```bash
-cargo test              # All 43 tests should pass (1 ignored integration test)
+cargo test              # All 51 tests should pass (1 ignored integration test)
 cargo check             # Should compile clean with no warnings
 RUST_LOG=info cargo run # Run with logging
 ```
