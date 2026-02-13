@@ -22,10 +22,12 @@ use crate::mapping::filters::PoisonState;
 use crate::mapping::hit_searcher::{HitSearcher, SkippingStrategy};
 use crate::mapping::hits::MappingType;
 use crate::mapping::map_fragment::{map_pe_fragment, map_se_fragment};
+use crate::mapping::protocols::custom::parse_custom_geometry;
 use crate::mapping::protocols::scrna::{ChromiumProtocol, count_ns, recover_barcode};
 use crate::mapping::protocols::Protocol;
 use crate::mapping::sketch_hit_simple::SketchHitInfoSimple;
 use crate::mapping::streaming_query::PiscemStreamingQuery;
+use crate::mapping::unitig_end_cache::UnitigEndCache;
 
 #[derive(Args, Debug)]
 pub struct MapScrnaArgs {
@@ -67,9 +69,20 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
         other => anyhow::bail!("unknown skipping strategy: {}", other),
     };
 
-    // Parse protocol geometry
-    let protocol = ChromiumProtocol::from_name(&args.geometry)
-        .ok_or_else(|| anyhow::anyhow!("unknown geometry: {}", args.geometry))?;
+    // Parse protocol geometry: try built-in names first, then custom geometry
+    let protocol: Box<dyn Protocol> =
+        if let Some(chromium) = ChromiumProtocol::from_name(&args.geometry) {
+            Box::new(chromium)
+        } else {
+            match parse_custom_geometry(&args.geometry) {
+                Ok(custom) => Box::new(custom),
+                Err(e) => anyhow::bail!(
+                    "unknown geometry '{}' (not a built-in name, and custom parse failed: {})",
+                    args.geometry,
+                    e,
+                ),
+            }
+        };
     info!(
         "Protocol: {} (bc_len={}, umi_len={})",
         protocol.name(),
@@ -130,13 +143,14 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
 
     let k = index.k();
     let with_position = args.with_position;
+    let end_cache = UnitigEndCache::new(5_000_000);
 
     // Dispatch on K and run the pipeline
     dispatch_on_k!(k, K => {
         run_scrna_pipeline::<K>(
             fastx, thread_config, &output_info, &stats,
-            &index, strat, &protocol, bc_len, umi_len,
-            with_position, &read_length_samples,
+            &index, strat, protocol.as_ref(), bc_len, umi_len,
+            with_position, &read_length_samples, &end_cache,
         )?;
     });
 
@@ -208,11 +222,12 @@ fn run_scrna_pipeline<const K: usize>(
     stats: &MappingStats,
     index: &ReferenceIndex,
     strat: SkippingStrategy,
-    protocol: &ChromiumProtocol,
+    protocol: &dyn Protocol,
     bc_len: u16,
     umi_len: u16,
     with_position: bool,
     read_length_samples: &Mutex<Vec<u32>>,
+    end_cache: &UnitigEndCache,
 ) -> Result<()>
 where
     Kmer<K>: KmerBits,
@@ -222,7 +237,7 @@ where
     let worker_fn = |chunk: ReadChunk, output: &OutputInfo, stats: &MappingStats| {
         // Per-thread state
         let mut hs = HitSearcher::new(index);
-        let mut query = PiscemStreamingQuery::<K>::new(index.dict());
+        let mut query = PiscemStreamingQuery::<K>::with_cache(index.dict(), end_cache);
         let mut cache_out = MappingCache::<SketchHitInfoSimple>::new(K);
         let mut cache_left = MappingCache::<SketchHitInfoSimple>::new(K);
         let mut cache_right = MappingCache::<SketchHitInfoSimple>::new(K);

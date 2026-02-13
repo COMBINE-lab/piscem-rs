@@ -23,6 +23,7 @@ use crate::mapping::hits::MappingType;
 use crate::mapping::map_fragment::{map_pe_fragment, map_se_fragment};
 use crate::mapping::sketch_hit_simple::SketchHitInfoSimple;
 use crate::mapping::streaming_query::PiscemStreamingQuery;
+use crate::mapping::unitig_end_cache::UnitigEndCache;
 
 #[derive(Args, Debug)]
 pub struct MapBulkArgs {
@@ -114,12 +115,13 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
     };
 
     let k = index.k();
+    let end_cache = UnitigEndCache::new(5_000_000);
 
     // Dispatch on K and run the pipeline
     dispatch_on_k!(k, K => {
         run_bulk_pipeline::<K>(
             fastx, thread_config, &output_info, &stats,
-            &index, strat, is_paired,
+            &index, strat, is_paired, &end_cache,
         )?;
     });
 
@@ -160,6 +162,7 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_bulk_pipeline<const K: usize>(
     fastx: FastxSource,
     thread_config: ThreadConfig,
@@ -168,6 +171,7 @@ fn run_bulk_pipeline<const K: usize>(
     index: &ReferenceIndex,
     strat: SkippingStrategy,
     is_paired: bool,
+    end_cache: &UnitigEndCache,
 ) -> Result<()>
 where
     Kmer<K>: KmerBits,
@@ -175,7 +179,7 @@ where
     let worker_fn = |chunk: ReadChunk, output: &OutputInfo, stats: &MappingStats| {
         // Per-thread state
         let mut hs = HitSearcher::new(index);
-        let mut query = PiscemStreamingQuery::<K>::new(index.dict());
+        let mut query = PiscemStreamingQuery::<K>::with_cache(index.dict(), end_cache);
         let mut cache_out = MappingCache::<SketchHitInfoSimple>::new(K);
         let mut cache_left = MappingCache::<SketchHitInfoSimple>::new(K);
         let mut cache_right = MappingCache::<SketchHitInfoSimple>::new(K);

@@ -230,10 +230,10 @@ impl EqClassMap {
     /// Approximate size in bytes of the in-memory representation.
     pub fn size_bytes(&self) -> usize {
         let tile_bits = self.tile_ec_ids.len() * self.tile_ec_ids.bit_width();
-        let tile_bytes = (tile_bits + 7) / 8;
+        let tile_bytes = tile_bits.div_ceil(8);
         let ef_bytes = self.label_list_offsets.size_bytes();
         let label_bits = self.label_entries.len() * self.label_entries.bit_width();
-        let label_bytes = (label_bits + 7) / 8;
+        let label_bytes = label_bits.div_ceil(8);
         tile_bytes + ef_bytes + label_bytes + std::mem::size_of::<Self>()
     }
 

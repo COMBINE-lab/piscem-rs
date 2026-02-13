@@ -82,8 +82,8 @@ fn parse_tile(tok: &str) -> Result<Tile> {
             Ok(Tile::Segment { id, is_fw: false })
         }
         _ => {
-            if tok.starts_with('N') {
-                let count: u64 = tok[1..].parse()
+            if let Some(rest) = tok.strip_prefix('N') {
+                let count: u64 = rest.parse()
                     .with_context(|| format!("invalid N-tile count in '{tok}'"))?;
                 Ok(Tile::Gap { count })
             } else {

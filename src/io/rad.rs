@@ -409,6 +409,156 @@ pub fn write_bulk_record(
 }
 
 // ---------------------------------------------------------------------------
+// ATAC RAD header + record writers
+// ---------------------------------------------------------------------------
+
+/// Write a RAD header for scATAC mode.
+///
+/// Returns `chunk_count_offset` for backpatching.
+///
+/// ATAC header format:
+/// - is_paired (u8, always 1 for ATAC)
+/// - num_refs (u64) + ref_names
+/// - num_chunks placeholder (u64)
+/// - File-level tags: cblen (u16), known_rad_type (string), ref_lengths (array u32)
+/// - Read-level tags: barcode (u32 or u64)
+/// - Alignment-level tags: ref (u32), type (u8), start_pos (u32), frag_len (u16)
+pub fn write_rad_header_atac<W: Write>(
+    writer: &mut W,
+    num_refs: u64,
+    ref_names: &[&str],
+    ref_lengths: &[u32],
+    bc_len: u16,
+) -> Result<u64> {
+    let mut buf = RadWriter::new();
+
+    // is_paired=1 (ATAC is always paired)
+    buf.write_u8(1);
+
+    // Reference count and names
+    buf.write_u64(num_refs);
+    for name in ref_names {
+        buf.write_string(name);
+    }
+
+    // num_chunks placeholder
+    let chunk_count_offset = buf.len() as u64;
+    buf.write_u64(0);
+
+    // --- Tag descriptions ---
+
+    // File-level tags: 3 (cblen + known_rad_type + ref_lengths)
+    buf.write_u16(3);
+    buf.write_tag_desc("cblen", TAG_U16);
+    buf.write_tag_desc("known_rad_type", TAG_STRING);
+    buf.write_array_tag_desc("ref_lengths", TAG_U32, TAG_U32);
+
+    // Read-level tags: 1 (barcode)
+    buf.write_u16(1);
+    let bc_tag_type = if bc_len <= 16 { TAG_U32 } else { TAG_U64 };
+    buf.write_tag_desc("b", bc_tag_type);
+
+    // Alignment-level tags: 4 (ref, type, start_pos, frag_len)
+    buf.write_u16(4);
+    buf.write_tag_desc("ref", TAG_U32);
+    buf.write_tag_desc("type", TAG_U8);
+    buf.write_tag_desc("start_pos", TAG_U32);
+    buf.write_tag_desc("frag_len", TAG_U16);
+
+    // --- File-level tag values ---
+    buf.write_u16(bc_len);
+    buf.write_string("sc_atac");
+    // ref_lengths array
+    buf.write_u32(ref_lengths.len() as u32);
+    for &len in ref_lengths {
+        buf.write_u32(len);
+    }
+
+    buf.flush_to(writer)?;
+    Ok(chunk_count_offset)
+}
+
+/// ATAC mapping type codes (written as u8 in the RAD record).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy)]
+pub enum AtacMappingCode {
+    Single = 1,
+    FirstOrphan = 2,
+    SecondOrphan = 3,
+    Pair = 4,
+    Unmapped = 8,
+}
+
+impl From<MappingType> for AtacMappingCode {
+    fn from(mt: MappingType) -> Self {
+        match mt {
+            MappingType::SingleMapped => AtacMappingCode::Single,
+            MappingType::MappedFirstOrphan => AtacMappingCode::FirstOrphan,
+            MappingType::MappedSecondOrphan => AtacMappingCode::SecondOrphan,
+            MappingType::MappedPair => AtacMappingCode::Pair,
+            MappingType::Unmapped => AtacMappingCode::Unmapped,
+        }
+    }
+}
+
+/// Write a scATAC RAD record.
+///
+/// Includes Tn5 shift (+4 to position, -9 from fragment length) when enabled.
+pub fn write_atac_record(
+    bc_packed: u64,
+    bc_len: u16,
+    map_type: MappingType,
+    accepted_hits: &[SimpleHit],
+    tn5_shift: bool,
+    writer: &mut RadWriter,
+) {
+    // Number of mappings
+    writer.write_u32(accepted_hits.len() as u32);
+
+    // Barcode (u32 or u64)
+    if bc_len <= 16 {
+        writer.write_u32(bc_packed as u32);
+    } else {
+        writer.write_u64(bc_packed);
+    }
+
+    let atac_type = AtacMappingCode::from(map_type) as u8;
+
+    for hit in accepted_hits {
+        // ref id
+        writer.write_u32(hit.tid);
+        // type
+        writer.write_u8(atac_type);
+
+        let mut leftmost_pos: i32;
+        let mut frag_len: u16;
+
+        match map_type {
+            MappingType::MappedPair => {
+                leftmost_pos = hit.pos.min(hit.mate_pos);
+                frag_len = hit.frag_len() as u16;
+                if leftmost_pos < 0 {
+                    frag_len = (hit.frag_len() + leftmost_pos) as u16;
+                    leftmost_pos = 0;
+                }
+            }
+            _ => {
+                leftmost_pos = hit.pos.max(0);
+                frag_len = u16::MAX; // placeholder for non-pairs
+            }
+        }
+
+        if tn5_shift {
+            leftmost_pos += 4;
+            frag_len = frag_len.saturating_sub(9);
+        }
+
+        writer.write_u32(leftmost_pos as u32);
+        writer.write_u16(frag_len);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -670,6 +820,65 @@ mod tests {
         // No RAD magic
         assert_ne!(&buf[0..4], b"RAD\x01");
         assert!(chunk_off > 0);
+    }
+
+    #[test]
+    fn test_atac_header() {
+        let mut buf = Vec::new();
+        let names = vec!["chr1", "chr2"];
+        let ref_lens = vec![248956422u32, 242193529u32];
+        let chunk_off =
+            write_rad_header_atac(&mut buf, 2, &names, &ref_lens, 16).unwrap();
+
+        // First byte: is_paired=1
+        assert_eq!(buf[0], 1);
+        assert!(chunk_off > 0);
+    }
+
+    #[test]
+    fn test_atac_record_basic() {
+        let mut w = RadWriter::new();
+        let hits = vec![SimpleHit {
+            is_fw: true,
+            tid: 0,
+            pos: 1000,
+            ..SimpleHit::default()
+        }];
+        write_atac_record(0xABCD, 16, MappingType::SingleMapped, &hits, false, &mut w);
+
+        let b = w.as_bytes();
+        // num_mappings (4) + bc u32 (4) + ref (4) + type (1) + pos (4) + frag_len (2) = 19
+        assert_eq!(b.len(), 19);
+
+        // type = 1 (Single)
+        assert_eq!(b[12], 1);
+
+        // pos = 1000
+        let pos = u32::from_le_bytes([b[13], b[14], b[15], b[16]]);
+        assert_eq!(pos, 1000);
+    }
+
+    #[test]
+    fn test_atac_record_tn5_shift() {
+        let mut w = RadWriter::new();
+        let hits = vec![SimpleHit {
+            is_fw: true,
+            tid: 0,
+            pos: 100,
+            mate_pos: 300,
+            fragment_length: 250,
+            ..SimpleHit::default()
+        }];
+        write_atac_record(0, 16, MappingType::MappedPair, &hits, true, &mut w);
+
+        let b = w.as_bytes();
+        // leftmost = min(100, 300) = 100, + Tn5 shift 4 = 104
+        let pos = u32::from_le_bytes([b[13], b[14], b[15], b[16]]);
+        assert_eq!(pos, 104);
+
+        // frag_len = 250 - 9 = 241
+        let frag = u16::from_le_bytes([b[17], b[18]]);
+        assert_eq!(frag, 241);
     }
 
     #[test]

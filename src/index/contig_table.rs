@@ -259,7 +259,7 @@ impl ContigTable {
     pub fn size_bytes(&self) -> usize {
         let ef_bytes = self.ctg_offsets.size_bytes();
         let entries_bits = self.ctg_entries.len() * self.ctg_entries.bit_width();
-        let entries_bytes = (entries_bits + 7) / 8;
+        let entries_bytes = entries_bits.div_ceil(8);
         ef_bytes + entries_bytes + std::mem::size_of::<Self>()
     }
 

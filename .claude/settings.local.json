@@ -8,7 +8,12 @@
       "Bash(git -C /Users/rob/software_src/piscem-rs log --oneline -5)",
       "Bash(git -C /Users/rob/software_src/piscem-rs status -u)",
       "Bash(grep:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "WebFetch(domain:docs.rs)",
+      "Bash(cargo clippy:*)",
+      "Bash(wc:*)",
+      "Bash(cargo search:*)",
+      "Bash(cargo info:*)"
     ]
   }
 }

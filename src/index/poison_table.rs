@@ -146,12 +146,12 @@ impl PoisonTable {
         poison_map.insert(range_start_kmer, offsets.len() as u64);
         offsets.push(0);
 
-        for i in 1..occs.len() {
-            if occs[i].canonical_kmer != range_start_kmer {
+        for (i, occ) in occs.iter().enumerate().skip(1) {
+            if occ.canonical_kmer != range_start_kmer {
                 // New k-mer range starts at position i
                 offsets.push(i as u32);
-                poison_map.insert(occs[i].canonical_kmer, (offsets.len() - 1) as u64);
-                range_start_kmer = occs[i].canonical_kmer;
+                poison_map.insert(occ.canonical_kmer, (offsets.len() - 1) as u64);
+                range_start_kmer = occ.canonical_kmer;
             }
         }
 

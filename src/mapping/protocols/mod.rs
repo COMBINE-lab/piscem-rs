@@ -7,6 +7,7 @@
 //! mapping pipeline.
 
 pub mod bulk;
+pub mod custom;
 pub mod scatac;
 pub mod scrna;
 

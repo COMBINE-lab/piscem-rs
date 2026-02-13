@@ -38,6 +38,7 @@ pub enum SkippingStrategy {
 
 /// Result of comparing a read k-mer against a reference k-mer from the SPSS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum KmerMatchType {
     /// No match: k-mers are distinct.
     NoMatch,
@@ -128,8 +129,8 @@ impl<'a> ReadKmerIter<'a> {
         };
         // Scan the first k-1 bases for invalid characters.
         let scan_end = k.saturating_sub(1).min(read.len());
-        for i in 0..scan_end {
-            if !is_valid_base(read[i]) {
+        for (i, &base) in read.iter().enumerate().take(scan_end) {
+            if !is_valid_base(base) {
                 iter.last_invalid = i as i32;
             }
         }
@@ -481,7 +482,7 @@ impl<'idx> HitSearcher<'idx> {
                     let alt_phit = index.resolve_lookup(&alt_result);
                     let alt_found = alt_phit
                         .as_ref()
-                        .map_or(false, |p| !p.is_empty());
+                        .is_some_and(|p| !p.is_empty());
 
                     if let Some(ref check_phit) = alt_phit {
                         if !check_phit.is_empty() {
@@ -742,6 +743,7 @@ impl<'idx> HitSearcher<'idx> {
     ///
     /// **Side effect**: `c_curr_pos` is always modified (+=direction*dist),
     /// regardless of whether the match succeeds.
+    #[allow(clippy::too_many_arguments)]
     fn check_direct_match<const K: usize>(
         index: &'idx ReferenceIndex,
         iter: &ReadKmerIter<'_>,

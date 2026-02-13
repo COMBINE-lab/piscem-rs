@@ -47,9 +47,26 @@ The full implementation plan with C++ → Rust type mappings, architectural note
   - `src/cli/map_scrna.rs` — Full scRNA mapping CLI: geometry parsing, BC/UMI extraction + N recovery, `--with-position` read length sampling + backpatching
   - New dev-dep: `tempfile`
 
+- **Phase 6: Hardening + Remaining Features** — Unitig-end cache, scATAC protocol, custom geometry, parity harness. 33 new tests, 173 total.
+  - `src/mapping/unitig_end_cache.rs` — `UnitigEndCache` with DashMap, capacity-bounded, orientation-aware cache for unitig boundary k-mers shared across threads
+  - `src/mapping/streaming_query.rs` — REWRITTEN: Added `cache_end` tracking, `with_cache()` constructor, automatic cache lookup/insert at unitig boundaries
+  - `src/mapping/overlap.rs` — Mate overlap detection: `find_overlap()` with dovetail/regular overlap + seed-based alignment with error tolerance
+  - `src/mapping/binning.rs` — `BinPos` genome binning for scATAC with overlap regions
+  - `src/mapping/protocols/custom.rs` — Hand-written recursive descent parser for custom read geometries (`1{b[16]u[12]x:}2{r:}` format), `CustomProtocol` implementing `Protocol` trait
+  - `src/mapping/protocols/scatac.rs` — REWRITTEN: Full `ScatacProtocol` implementing `Protocol` trait
+  - `src/io/rad.rs` — Added `write_rad_header_atac()`, `AtacMappingCode` enum, `write_atac_record()` with Tn5 shift
+  - `src/cli/map_scatac.rs` — REWRITTEN: Full scATAC CLI with overlap detection, Tn5 shift, genome binning
+  - `src/cli/map_scrna.rs` — Updated: custom geometry fallback via `parse_custom_geometry()`, `Box<dyn Protocol>` for polymorphic protocol dispatch
+  - `src/verify/index_compare.rs` — REWRITTEN: Real index semantic comparison with `compare_ref_metadata()`
+  - `src/verify/rad_compare.rs` — REWRITTEN: RAD file comparison with binary header parser, `compare_rad_files()`, `validate_rad_file()`
+  - `src/verify/parity.rs` — REWRITTEN: Parity orchestration with index + RAD comparison, JSON report output
+  - `tests/parity_smoke.rs` — REWRITTEN: RAD header roundtrip tests (bulk, SC, ATAC) + ignored integration test
+  - New dep: `dashmap = "6"`
+
 ### Next Up
 
-- **Phase 6**: Hardening and performance (unitig-end cache, scATAC protocol, etc.)
+- Performance benchmarking and optimization
+- libradicl integration for record-level RAD comparison (currently header-only)
 
 ## Key Design Decisions
 
@@ -103,11 +120,12 @@ piscem-rs/
       build.rs                  # DONE — Index build CLI
       map_bulk.rs               # DONE — Bulk mapping CLI (SE + PE)
       map_scrna.rs              # DONE — scRNA mapping CLI (Chromium protocols, --with-position)
-      map_scatac.rs             # Stub (Phase 6)
+      map_scatac.rs             # DONE — scATAC mapping CLI (overlap detection, Tn5 shift, binning)
     mapping/
+      unitig_end_cache.rs       # DONE — UnitigEndCache with DashMap, orientation-aware
       hit_searcher.rs           # DONE — HitSearcher, ReadKmerIter, PERMISSIVE/STRICT modes
       projected_hits.rs         # DONE — RefPos, ProjectedHits<'a>, decode_hit()
-      streaming_query.rs        # DONE — PiscemStreamingQuery<'a, K> wrapper
+      streaming_query.rs        # DONE — PiscemStreamingQuery<'a, K> wrapper + unitig-end cache integration
       hits.rs                   # DONE — MappingType, HitDirection, SimpleHit, SketchHitInfo trait
       sketch_hit_simple.rs      # DONE — SketchHitInfoSimple (no-constraint default)
       chain_state.rs            # DONE — SketchHitInfoChained (optional structural constraints)
@@ -116,16 +134,24 @@ piscem-rs/
       engine.rs                 # DONE — map_read<K,S>() kernel
       merge_pairs.rs            # DONE — merge_se_mappings() paired-end merge
       map_fragment.rs           # DONE — map_se_fragment / map_pe_fragment helpers
+      overlap.rs                # DONE — Mate overlap detection (dovetail/regular + seed-based alignment)
+      binning.rs                # DONE — BinPos genome binning for scATAC
       protocols/
         mod.rs                  # DONE — Protocol trait + AlignableReads + TechSeqs
         bulk.rs                 # DONE — BulkProtocol
         scrna.rs                # DONE — ChromiumProtocol (V2/V2_5p/V3/V3_5p/V4_3p) + barcode recovery
+        scatac.rs               # DONE — ScatacProtocol for scATAC-seq
+        custom.rs               # DONE — CustomProtocol + geometry parser (recursive descent)
     io/
       rad.rs                    # DONE — RadWriter + RAD headers/records (SC + bulk, with_position)
       fastx.rs                  # DONE — FastxSource wrapping paraseq
       threads.rs                # DONE — run_mapping_pipeline() with crossbeam scoped threads
       map_info.rs               # DONE — map_info.json writer
-    verify/                     # Parity verification (scaffolded)
+    verify/
+      mod.rs                    # DONE — Module declarations
+      index_compare.rs          # DONE — Index semantic comparison (ref metadata)
+      rad_compare.rs            # DONE — RAD file comparison (binary header parser)
+      parity.rs                 # DONE — Parity orchestration + JSON report
 ```
 
 ## Terminology Bridge
@@ -139,14 +165,14 @@ piscem-rs/
 ## Running Tests
 
 ```bash
-cargo test              # All 140 tests should pass (1 ignored integration test)
+cargo test              # All 173 tests should pass (2 ignored integration tests)
 cargo check             # Should compile clean with no warnings
 RUST_LOG=info cargo run # Run with logging
 ```
 
 ## C++ Reference Code
 
-The C++ piscem codebase should be available at `../piscem-cpp/` for cross-reference. Key files:
+The C++ piscem codebase should be available in `piscem-cpp/` in the current directory for cross-reference. Key files:
 - `include/reference_index.hpp` — C++ ReferenceIndex
 - `include/basic_contig_table.hpp` — C++ contig table
 - `include/hit_searcher.hpp` / `src/hit_searcher.cpp` — Hit collection (~1400 lines)

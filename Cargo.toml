@@ -19,6 +19,7 @@ sshash-lib = { path = "./sshash-rs/crates/sshash-lib" }
 ahash = "0.8"
 
 # Phase 4 dependencies
+dashmap = "6"
 smallvec = "1.13"
 nohash-hasher = "0.2"
 crossbeam = "0.8"

@@ -1,3 +1,4 @@
+pub mod binning;
 pub mod cache;
 pub mod chain_state;
 pub mod engine;
@@ -6,7 +7,9 @@ pub mod hit_searcher;
 pub mod hits;
 pub mod map_fragment;
 pub mod merge_pairs;
+pub mod overlap;
 pub mod projected_hits;
 pub mod protocols;
 pub mod sketch_hit_simple;
 pub mod streaming_query;
+pub mod unitig_end_cache;
