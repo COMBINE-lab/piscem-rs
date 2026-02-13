@@ -4,6 +4,7 @@ pub mod engine;
 pub mod filters;
 pub mod hit_searcher;
 pub mod hits;
+pub mod map_fragment;
 pub mod merge_pairs;
 pub mod projected_hits;
 pub mod protocols;

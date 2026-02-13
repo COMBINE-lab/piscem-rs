@@ -37,10 +37,19 @@ The full implementation plan with C++ → Rust type mappings, architectural note
   - `src/mapping/protocols/mod.rs` — `Protocol` trait + `AlignableReads` + `TechSeqs`
   - New deps: `smallvec`, `nohash-hasher`, `crossbeam`, `paraseq`
 
+- **Phase 5: Protocol Implementations + CLI Wiring** — End-to-end mapping from FASTQ to RAD. 17 new tests, 140 total.
+  - `src/io/rad.rs` — REWRITTEN: Correct RAD format (no magic bytes, tag descriptions, file/read/alignment-level tags), `pack_bases_2bit()` (A=0,C=1,G=2,T=3 MSB-first), SC header with `with_position` support, packed BC/UMI (u32/u64), `MappedSecondOrphan` orientation inversion, bulk record with `leftmost_pos` clamping + `u16 frag_len`
+  - `src/io/map_info.rs` — `write_map_info()` JSON stats output
+  - `src/mapping/map_fragment.rs` — `map_se_fragment()` / `map_pe_fragment()` helpers
+  - `src/mapping/protocols/bulk.rs` — `BulkProtocol` with `Protocol` trait impl
+  - `src/mapping/protocols/scrna.rs` — `ChromiumProtocol` (V2/V2_5p/V3/V3_5p/V4_3p), `from_name()`, `recover_barcode()`, `barcode_has_n()`, `count_ns()`
+  - `src/cli/map_bulk.rs` — Full bulk mapping CLI: load index, write RAD header, `dispatch_on_k!` → `run_bulk_pipeline()`, chunk backpatching, `map_info.json`
+  - `src/cli/map_scrna.rs` — Full scRNA mapping CLI: geometry parsing, BC/UMI extraction + N recovery, `--with-position` read length sampling + backpatching
+  - New dev-dep: `tempfile`
+
 ### Next Up
 
-- **Phase 5**: Protocol implementations (scRNA → bulk → scATAC) + CLI wiring
-- **Phase 6**: Hardening and performance (unitig-end cache, etc.)
+- **Phase 6**: Hardening and performance (unitig-end cache, scATAC protocol, etc.)
 
 ## Key Design Decisions
 
@@ -90,7 +99,11 @@ piscem-rs/
       eq_classes.rs             # DONE — EC map: tile → EC → (transcript_id, orientation)
       poison_table.rs           # DONE — Poison k-mer table with AHashMap, build_from_occs, queries
       formats.rs                # ArtifactFormat enum
-    cli/                        # CLI subcommands (scaffolded)
+    cli/
+      build.rs                  # DONE — Index build CLI
+      map_bulk.rs               # DONE — Bulk mapping CLI (SE + PE)
+      map_scrna.rs              # DONE — scRNA mapping CLI (Chromium protocols, --with-position)
+      map_scatac.rs             # Stub (Phase 6)
     mapping/
       hit_searcher.rs           # DONE — HitSearcher, ReadKmerIter, PERMISSIVE/STRICT modes
       projected_hits.rs         # DONE — RefPos, ProjectedHits<'a>, decode_hit()
@@ -102,11 +115,16 @@ piscem-rs/
       cache.rs                  # DONE — MappingCache<S> generic mapping state
       engine.rs                 # DONE — map_read<K,S>() kernel
       merge_pairs.rs            # DONE — merge_se_mappings() paired-end merge
-      protocols/mod.rs          # DONE — Protocol trait + AlignableReads + TechSeqs
+      map_fragment.rs           # DONE — map_se_fragment / map_pe_fragment helpers
+      protocols/
+        mod.rs                  # DONE — Protocol trait + AlignableReads + TechSeqs
+        bulk.rs                 # DONE — BulkProtocol
+        scrna.rs                # DONE — ChromiumProtocol (V2/V2_5p/V3/V3_5p/V4_3p) + barcode recovery
     io/
-      rad.rs                    # DONE — RadWriter + RAD header/record functions
+      rad.rs                    # DONE — RadWriter + RAD headers/records (SC + bulk, with_position)
       fastx.rs                  # DONE — FastxSource wrapping paraseq
       threads.rs                # DONE — run_mapping_pipeline() with crossbeam scoped threads
+      map_info.rs               # DONE — map_info.json writer
     verify/                     # Parity verification (scaffolded)
 ```
 
@@ -121,7 +139,7 @@ piscem-rs/
 ## Running Tests
 
 ```bash
-cargo test              # All 123 tests should pass (1 ignored integration test)
+cargo test              # All 140 tests should pass (1 ignored integration test)
 cargo check             # Should compile clean with no warnings
 RUST_LOG=info cargo run # Run with logging
 ```
