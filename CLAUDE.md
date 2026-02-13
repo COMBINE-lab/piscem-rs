@@ -23,10 +23,24 @@ The full implementation plan with C++ → Rust type mappings, architectural note
 
 - **Phase 3C: HitSearcher** (`src/mapping/hit_searcher.rs`) — Core k-mer hit collection engine. `SkippingStrategy` enum (Strict/Permissive), `KmerMatchType` enum, `ReadKmerIter` (N-skipping, Clone for save/restore), `HitSearcher` struct with `get_raw_hits_sketch<K>()`. PERMISSIVE mode: skip along contigs using SPSS verification (`check_direct_match`), binary search midpoint recovery, index query fallback. STRICT mode: delegates to `walk_safely_until` which queries every position and extends along contigs via SPSS comparison. Added `Dictionary::kmer_at_pos()` to sshash-rs for SPSS k-mer access. Added `ProjectedHits` setter methods (`set_global_pos`, `set_contig_pos`, `set_contig_orientation`). Unitig-end cache deferred to Phase 5. 18 new tests, 69 total.
 
+- **Phase 4: Core Mapping Infrastructure** — Full mapping pipeline from hit collection to RAD output. 54 new tests, 123 total.
+  - `src/mapping/hits.rs` — `MappingType`, `HitDirection`, `FragmentEnd`, `SimpleHit`, `SketchHitInfo` trait
+  - `src/mapping/sketch_hit_simple.rs` — `SketchHitInfoSimple` (default no-constraint hit tracking)
+  - `src/mapping/chain_state.rs` — `ChainState` + `SketchHitInfoChained` (optional structural constraints via SmallVec chains)
+  - `src/mapping/filters.rs` — `PoisonState` + `CanonicalKmerIter` + `scan_raw_hits()` (3-phase poison scanning)
+  - `src/mapping/cache.rs` — `MappingCache<S: SketchHitInfo>` with `nohash_hasher::BuildNoHashHasher<u32>`
+  - `src/mapping/engine.rs` — `map_read<K, S>()` kernel + `collect_mappings_from_hits()` + EC-based ambiguous hit filtering
+  - `src/mapping/merge_pairs.rs` — `merge_se_mappings()` paired-end merge (sort + two-pointer + fragment length check)
+  - `src/io/rad.rs` — `RadWriter` binary buffer + RAD header/record writers for SC and bulk modes
+  - `src/io/fastx.rs` — `FastxSource` wrapping `paraseq` for chunked FASTQ reading (single-end + paired-end)
+  - `src/io/threads.rs` — `run_mapping_pipeline()` with crossbeam scoped threads + bounded channel
+  - `src/mapping/protocols/mod.rs` — `Protocol` trait + `AlignableReads` + `TechSeqs`
+  - New deps: `smallvec`, `nohash-hasher`, `crossbeam`, `paraseq`
+
 ### Next Up
 
-- **Phase 4**: Protocol support (scRNA → bulk → scATAC)
-- **Phase 5**: Hardening and performance (unitig-end cache, etc.)
+- **Phase 5**: Protocol implementations (scRNA → bulk → scATAC) + CLI wiring
+- **Phase 6**: Hardening and performance (unitig-end cache, etc.)
 
 ## Key Design Decisions
 
@@ -81,7 +95,18 @@ piscem-rs/
       hit_searcher.rs           # DONE — HitSearcher, ReadKmerIter, PERMISSIVE/STRICT modes
       projected_hits.rs         # DONE — RefPos, ProjectedHits<'a>, decode_hit()
       streaming_query.rs        # DONE — PiscemStreamingQuery<'a, K> wrapper
-    io/                         # I/O utilities (scaffolded)
+      hits.rs                   # DONE — MappingType, HitDirection, SimpleHit, SketchHitInfo trait
+      sketch_hit_simple.rs      # DONE — SketchHitInfoSimple (no-constraint default)
+      chain_state.rs            # DONE — SketchHitInfoChained (optional structural constraints)
+      filters.rs                # DONE — PoisonState, scan_raw_hits, CanonicalKmerIter
+      cache.rs                  # DONE — MappingCache<S> generic mapping state
+      engine.rs                 # DONE — map_read<K,S>() kernel
+      merge_pairs.rs            # DONE — merge_se_mappings() paired-end merge
+      protocols/mod.rs          # DONE — Protocol trait + AlignableReads + TechSeqs
+    io/
+      rad.rs                    # DONE — RadWriter + RAD header/record functions
+      fastx.rs                  # DONE — FastxSource wrapping paraseq
+      threads.rs                # DONE — run_mapping_pipeline() with crossbeam scoped threads
     verify/                     # Parity verification (scaffolded)
 ```
 
@@ -96,7 +121,7 @@ piscem-rs/
 ## Running Tests
 
 ```bash
-cargo test              # All 69 tests should pass (1 ignored integration test)
+cargo test              # All 123 tests should pass (1 ignored integration test)
 cargo check             # Should compile clean with no warnings
 RUST_LOG=info cargo run # Run with logging
 ```

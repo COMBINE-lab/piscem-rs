@@ -7,4 +7,5 @@ pub mod hits;
 pub mod merge_pairs;
 pub mod projected_hits;
 pub mod protocols;
+pub mod sketch_hit_simple;
 pub mod streaming_query;

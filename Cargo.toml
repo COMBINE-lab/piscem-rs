@@ -18,6 +18,12 @@ sshash-lib = { path = "./sshash-rs/crates/sshash-lib" }
 # Fast hashing with deterministic seeding (same version as sshash-rs)
 ahash = "0.8"
 
+# Phase 4 dependencies
+smallvec = "1.13"
+nohash-hasher = "0.2"
+crossbeam = "0.8"
+paraseq = "0.4"
+
 # Succinct data structures (same versions as sshash-rs)
 sux = { version = "0.11", features = ["epserde"] }
 cseq = "0.1"
