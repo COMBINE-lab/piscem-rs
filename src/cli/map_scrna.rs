@@ -363,6 +363,7 @@ where
         if num_reads_in_chunk > 0 {
             let mut file = output.rad_file.lock().unwrap();
             rad_writer.flush_to(&mut *file).ok();
+            output.num_chunks.fetch_add(1, Ordering::Relaxed);
         }
 
         stats.num_reads.fetch_add(local_reads, Ordering::Relaxed);

@@ -310,6 +310,7 @@ impl<'idx> HitSearcher<'idx> {
         } else {
             &mut self.right_hits
         };
+        raw_hits.clear();
 
         let index = self.index;
         let k = self.k;
@@ -366,6 +367,15 @@ impl<'idx> HitSearcher<'idx> {
             }
 
             // Query the index.
+            // Reset the streaming query before each lookup in PERMISSIVE mode.
+            // PERMISSIVE skips may advance many positions without calling the
+            // streaming query (using check_direct_match instead), leaving the
+            // engine's incremental k-mer state stale.  A stale engine would
+            // shift-and-append a single character, producing a wrong chimeric
+            // k-mer and causing the subsequent seed() to miss the real hit.
+            // The C++ streaming query auto-detects offset jumps and resets;
+            // we reset explicitly here instead.
+            query.reset();
             let kmer_str = unsafe { std::str::from_utf8_unchecked(kmer_bytes) };
             let result = query.lookup(kmer_str);
 
@@ -475,6 +485,7 @@ impl<'idx> HitSearcher<'idx> {
                     }
 
                     // --- Index query at target ---
+                    query.reset();
                     let alt_kmer_bytes = iter.kmer_bytes();
                     let alt_str =
                         unsafe { std::str::from_utf8_unchecked(alt_kmer_bytes) };
@@ -513,6 +524,7 @@ impl<'idx> HitSearcher<'idx> {
                         mid_iter.advance_by(half_skip);
 
                         if !mid_iter.is_exhausted() {
+                            query.reset();
                             let mid_bytes = mid_iter.kmer_bytes();
                             let mid_str =
                                 unsafe { std::str::from_utf8_unchecked(mid_bytes) };
@@ -623,7 +635,13 @@ impl<'idx> HitSearcher<'idx> {
                 continue;
             }
 
-            // Query the index.
+            // Reset the streaming query before each lookup in walk_safely_until.
+            // After walking along a contig via SPSS comparison (kmer_at_pos),
+            // the streaming query's internal k-mer state is stale — it still
+            // holds the k-mer from the last query.lookup() call, not from the
+            // current read position.  Without reset, the incremental update
+            // produces a wrong chimeric k-mer and misses the real hit.
+            query.reset();
             let kmer_str = unsafe { std::str::from_utf8_unchecked(kmer_bytes) };
             let result = query.lookup(kmer_str);
 

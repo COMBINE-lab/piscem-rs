@@ -7,7 +7,7 @@
 //! borrow the index and are created as separate per-thread locals alongside
 //! the cache.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use nohash_hasher::BuildNoHashHasher;
 
@@ -45,6 +45,9 @@ pub struct MappingCache<S: SketchHitInfo> {
     pub has_matching_kmers: bool,
     /// Indices of raw hits that exceeded the occurrence threshold (for EC filtering).
     pub ambiguous_hit_indices: Vec<u32>,
+    /// Reusable set for tracking observed ECs during ambiguous hit filtering.
+    /// Kept here to avoid per-read allocation.
+    pub observed_ecs: HashSet<u64>,
 }
 
 impl<S: SketchHitInfo> MappingCache<S> {
@@ -64,6 +67,7 @@ impl<S: SketchHitInfo> MappingCache<S> {
             max_ec_card: 4096,
             has_matching_kmers: false,
             ambiguous_hit_indices: Vec::new(),
+            observed_ecs: HashSet::new(),
         }
     }
 
@@ -74,6 +78,7 @@ impl<S: SketchHitInfo> MappingCache<S> {
         self.accepted_hits.clear();
         self.has_matching_kmers = false;
         self.ambiguous_hit_indices.clear();
+        self.observed_ecs.clear();
     }
 }
 

@@ -114,7 +114,6 @@ where
         while fastx.next_chunk(&mut chunk)? {
             let batch = std::mem::take(&mut chunk);
             worker_fn(batch, output, stats);
-            output.num_chunks.fetch_add(1, Ordering::Relaxed);
         }
     } else {
         // Multi-thread mode: producer-consumer with bounded channel.
@@ -128,7 +127,6 @@ where
                 scope.spawn(move |_| {
                     while let Ok(chunk) = recv.recv() {
                         worker_ref(chunk, output, stats);
-                        output.num_chunks.fetch_add(1, Ordering::Relaxed);
                     }
                 });
             }

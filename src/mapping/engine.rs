@@ -9,8 +9,6 @@
 //! 5. Optionally applies EC-based ambiguous hit filtering
 //! 6. Produces the final accepted hit list
 
-use std::collections::HashSet;
-
 use sshash_lib::{Kmer, KmerBits};
 
 use crate::index::eq_classes::ec_entry_transcript_id;
@@ -122,7 +120,7 @@ where
             && !cache.ambiguous_hit_indices.is_empty()
         {
             let ec_table = index.ec_table().unwrap();
-            let mut observed_ecs: HashSet<u64> = HashSet::new();
+            cache.observed_ecs.clear();
             let mut min_cardinality_ec_size = usize::MAX;
             let mut min_cardinality_ec: u64 = u64::MAX;
             let mut min_cardinality_index: u32 = 0;
@@ -169,10 +167,10 @@ where
                 let ec = ec_table.ec_for_tile(contig_id as u64);
                 let ec_key = ec | if fw_on_contig { 0 } else { 0x8000000000000000 };
 
-                if observed_ecs.contains(&ec_key) {
+                if cache.observed_ecs.contains(&ec_key) {
                     continue;
                 }
-                observed_ecs.insert(ec_key);
+                cache.observed_ecs.insert(ec_key);
 
                 let ec_entries = ec_table.entries_for_ec(ec);
                 if ec_entries.len() < min_cardinality_ec_size {

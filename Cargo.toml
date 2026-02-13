@@ -6,6 +6,9 @@ rust-version = "1.85"
 license = "MIT"
 description = "Rust implementation of piscem with semantic parity harness"
 
+[features]
+parity-test = ["dep:libradicl"]
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
@@ -24,6 +27,7 @@ smallvec = "1.13"
 nohash-hasher = "0.2"
 crossbeam = "0.8"
 paraseq = "0.4"
+niffler = "2"
 
 # Succinct data structures (same versions as sshash-rs)
 sux = { version = "0.11", features = ["epserde"] }
@@ -32,5 +36,19 @@ epserde = "0.11"
 value-traits = "0.2"
 dyn_size_of = "0.4"
 
+# RAD file parsing — optional, enabled by parity-test feature
+libradicl = { git = "https://github.com/COMBINE-lab/libradicl.git", branch = "develop", optional = true }
+
 [dev-dependencies]
 tempfile = "3"
+flate2 = "1"
+libradicl = { git = "https://github.com/COMBINE-lab/libradicl.git", branch = "develop" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+
+[profile.bench]
+inherits = "release"
+debug = true

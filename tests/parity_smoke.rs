@@ -3,6 +3,7 @@
 //! These tests validate that RAD file headers are well-formed when written
 //! by our RAD writer and that we can read them back.
 
+use paraseq::Record;
 use piscem_rs::io::rad::{
     write_rad_header_bulk, write_rad_header_sc, write_rad_header_atac,
 };
@@ -43,34 +44,92 @@ fn parity_smoke_atac_header_roundtrip() {
     assert_eq!(buf[0], 1); // is_paired=true for ATAC
 }
 
-/// Integration test: build + map pipeline.
+/// Integration test: load Rust-format index and verify k-mer lookup works.
 ///
-/// This test is ignored by default since it requires test_data/ to be present.
-/// Run with: `cargo test --test parity_smoke -- --ignored`
+/// Run with: `cargo test --test parity_smoke -- --ignored --nocapture`
 #[test]
 #[ignore]
-fn integration_build_and_map() {
+fn integration_rust_index_lookup() {
     use std::path::Path;
 
-    let index_prefix = Path::new("test_data/gencode_pc_v44_index_nopoison/gencode_pc_v44_index");
-    if !index_prefix.with_extension("sshash").exists() {
-        eprintln!("Skipping: test_data index not found");
+    let index_prefix = Path::new("test_data/gencode_pc_v44_index_rust/gencode_pc_v44_index");
+    if !index_prefix.with_extension("ssi").exists() {
+        eprintln!("Skipping: Rust index not found at {}", index_prefix.display());
         return;
     }
 
-    // Try loading the index
     let index = piscem_rs::index::reference_index::ReferenceIndex::load(
-        index_prefix, false, false,
-    );
-    assert!(index.is_ok(), "Failed to load index: {:?}", index.err());
+        index_prefix, true, false,
+    )
+    .expect("failed to load Rust index");
 
-    let idx = index.unwrap();
-    assert!(idx.num_refs() > 0, "Index has no references");
-    assert!(idx.k() > 0, "Index has invalid k");
+    let dict = index.dict();
+    eprintln!(
+        "Index loaded: k={}, {} refs, {} strings, canonical={}",
+        index.k(), index.num_refs(), dict.num_strings(), dict.canonical()
+    );
+
+    // Read first read from test FASTQ
+    let read1 = Path::new("test_data/sim_1M_1.fq.gz");
+    if !read1.exists() {
+        eprintln!("Skipping: {} not found", read1.display());
+        return;
+    }
+
+    let (reader, _) = niffler::send::from_path(read1).unwrap();
+    let mut rdr = paraseq::fastq::Reader::new(reader);
+    let mut rset = rdr.new_record_set();
+    rset.fill(&mut rdr).unwrap();
+
+    let k = index.k();
+    let mut total_kmers = 0usize;
+    let mut found_kmers = 0usize;
+
+    use sshash_lib::dispatch_on_k;
+    dispatch_on_k!(k, K => {
+        let mut query = dict.create_streaming_query::<K>();
+
+        for (i, rec) in rset.iter().enumerate() {
+            if i >= 10 { break; }
+            let rec = rec.unwrap();
+            let seq = rec.seq();
+            if seq.len() < K { continue; }
+
+            query.reset();
+            let mut read_found = 0;
+            let mut read_total = 0;
+            for start in 0..=(seq.len() - K) {
+                let kb = &seq[start..start+K];
+                if kb.contains(&b'N') {
+                    query.reset();
+                    continue;
+                }
+                let ks = std::str::from_utf8(kb).unwrap();
+                let result = query.lookup(ks);
+                read_total += 1;
+                if result.is_found() {
+                    read_found += 1;
+                }
+            }
+            total_kmers += read_total;
+            found_kmers += read_found;
+            if i < 3 {
+                eprintln!(
+                    "  Read {}: {} bases, {}/{} k-mers found",
+                    i, seq.len(), read_found, read_total
+                );
+            }
+        }
+    });
 
     eprintln!(
-        "Index loaded: k={}, {} refs",
-        idx.k(),
-        idx.num_refs(),
+        "Total: {}/{} k-mers found ({:.1}%)",
+        found_kmers, total_kmers,
+        if total_kmers > 0 { found_kmers as f64 / total_kmers as f64 * 100.0 } else { 0.0 }
+    );
+
+    assert!(
+        found_kmers > 0,
+        "No k-mers found in first 10 reads — dictionary lookup broken"
     );
 }
