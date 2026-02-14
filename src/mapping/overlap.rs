@@ -98,6 +98,9 @@ fn reverse_complement(seq: &[u8]) -> Vec<u8> {
 }
 
 /// Core overlap detection: seed-based alignment.
+///
+/// C++ swaps reads so the shorter is always `read1` and RC of longer is
+/// `negative_read2`. We must match this for parity.
 fn get_overlap(
     seq1: &[u8],
     seq2: &[u8],
@@ -106,12 +109,18 @@ fn get_overlap(
     min_overlap_length: i32,
     error_threshold: i32,
 ) {
-    let _rc1 = reverse_complement(seq1);
+    let rc1 = reverse_complement(seq1);
     let rc2 = reverse_complement(seq2);
 
-    // Determine which read is shorter
+    // C++ assigns read1 = shorter, negative_read2 = RC(longer)
     let read1_shorter = seq1.len() <= seq2.len();
     mate_ov.frag_fw = read1_shorter;
+
+    let (read1, negative_read2): (&[u8], &[u8]) = if read1_shorter {
+        (seq1, &rc2)
+    } else {
+        (seq2, &rc1)
+    };
 
     let seed_length = (min_overlap_length / 2) as usize;
     if seed_length == 0 {
@@ -120,9 +129,9 @@ fn get_overlap(
 
     // Assign roles based on dovetail mode
     let (suffix_read, prefix_read): (&[u8], &[u8]) = if dovetail {
-        (&rc2, seq1)
+        (negative_read2, read1)
     } else {
-        (seq1, &rc2)
+        (read1, negative_read2)
     };
 
     let suff_length = suffix_read.len();

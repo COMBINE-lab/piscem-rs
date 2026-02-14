@@ -11,70 +11,103 @@ use crate::index::reference_index::ReferenceIndex;
 // BinPos
 // ---------------------------------------------------------------------------
 
-/// Genome binning helper.
+/// Genome binning helper matching C++ `bin_pos`.
 ///
-/// Divides the concatenated reference genome into fixed-size bins with
-/// optional overlap. Each genomic position maps to one or two bins.
+/// Divides each reference into fixed-size bins. Bin IDs are cumulative
+/// across references: reference 0 gets bins 0..N0-1, reference 1 gets
+/// bins N0..N0+N1-1, etc.
 pub struct BinPos {
-    /// Cumulative reference lengths (prefix sums).
-    cum_ref_lens: Vec<u64>,
+    /// cum_bin_ids[i] = cumulative number of bins for refs 0..i.
+    /// Length = num_refs + 1.
+    cum_bin_ids: Vec<u64>,
     /// Size of each bin in bases.
-    _bin_size: u64,
+    bin_size: u64,
     /// Overlap between adjacent bins in bases.
-    bin_overlap: u64,
-    /// Effective stride = bin_size - bin_overlap.
-    stride: u64,
+    overlap: u64,
+    /// Hit threshold fraction (e.g., 0.7).
+    thr: f32,
 }
+
+/// Sentinel for an invalid bin ID.
+pub const INVALID_BIN_ID: u64 = u64::MAX;
 
 impl BinPos {
     /// Create a new binning scheme from the reference index.
-    pub fn new(index: &ReferenceIndex, bin_size: u64, bin_overlap: u64) -> Self {
+    ///
+    /// Matches C++ `bin_pos::compute_cum_rank()`.
+    pub fn new(index: &ReferenceIndex, bin_size: u64, overlap: u64, thr: f32) -> Self {
         let num_refs = index.num_refs();
-        let mut cum_ref_lens = Vec::with_capacity(num_refs + 1);
-        cum_ref_lens.push(0);
-        let mut total = 0u64;
+        let mut cum_bin_ids = Vec::with_capacity(num_refs + 1);
+        cum_bin_ids.push(0);
         for i in 0..num_refs {
-            total += index.ref_len(i);
-            cum_ref_lens.push(total);
+            let rlen = index.ref_len(i);
+            let mut bins_in_ref = rlen / bin_size;
+            if bins_in_ref * bin_size < rlen {
+                bins_in_ref += 1;
+            }
+            cum_bin_ids.push(cum_bin_ids[i] + bins_in_ref);
         }
-        let stride = bin_size.saturating_sub(bin_overlap).max(1);
         Self {
-            cum_ref_lens,
-            _bin_size: bin_size,
-            bin_overlap,
-            stride,
+            cum_bin_ids,
+            bin_size,
+            overlap,
+            thr,
         }
     }
 
-    /// Get the bin ID(s) for a (transcript_id, position) pair.
+    /// Get the bin ID(s) for a (tid, pos) pair.
     ///
-    /// Returns `(primary_bin, optional_secondary_bin)`. A secondary bin is
-    /// returned when the position falls in an overlap region between bins.
-    pub fn get_bin_id(&self, tid: u64, pos: u64) -> (u64, Option<u64>) {
-        let global_pos = self.cum_ref_lens[tid as usize] + pos;
-        let primary = global_pos / self.stride;
+    /// Returns `(primary_bin, secondary_bin)` where secondary is
+    /// `INVALID_BIN_ID` if the position is not in an overlap region.
+    ///
+    /// Matches C++ `bin_pos::get_bin_id()`.
+    #[inline]
+    pub fn get_bin_id(&self, tid: u32, pos: u64) -> (u64, u64) {
+        let first_bin_id = self.cum_bin_ids[tid as usize];
+        let first_bin_id_in_next = self.cum_bin_ids[tid as usize + 1];
+        debug_assert!(self.bin_size > self.overlap);
 
-        // Check if position falls in overlap region
-        let pos_in_bin = global_pos % self.stride;
-        let secondary = if self.bin_overlap > 0
-            && pos_in_bin < self.bin_overlap
-            && primary > 0
-        {
-            Some(primary - 1)
+        let rel_bin = pos / self.bin_size;
+        let bin1 = first_bin_id + rel_bin;
+
+        let bin2_on_same_ref = (bin1 + 1) < first_bin_id_in_next;
+        let bin2_rel_start_pos = (rel_bin + 1) * self.bin_size;
+        let bin2 = if bin2_on_same_ref && pos > bin2_rel_start_pos.saturating_sub(self.overlap) {
+            bin1 + 1
         } else {
-            None
+            INVALID_BIN_ID
         };
 
-        (primary, secondary)
+        (bin1, bin2)
     }
 
-    /// Total number of bins covering the genome.
+    /// Whether a bin ID is valid (not the sentinel).
+    #[inline]
+    pub fn is_valid(bin_id: u64) -> bool {
+        bin_id != INVALID_BIN_ID
+    }
+
+    /// Hit threshold fraction.
+    #[inline]
+    pub fn thr(&self) -> f32 {
+        self.thr
+    }
+
+    /// Bin size in bases.
+    #[inline]
+    pub fn bin_size(&self) -> u64 {
+        self.bin_size
+    }
+
+    /// Overlap in bases.
+    #[inline]
+    pub fn overlap(&self) -> u64 {
+        self.overlap
+    }
+
+    /// Total number of bins across all references.
     pub fn num_bins(&self) -> u64 {
-        let total_len = *self.cum_ref_lens.last().unwrap_or(&0);
-        if total_len == 0 {
-            return 0;
-        }
-        total_len.div_ceil(self.stride)
+        *self.cum_bin_ids.last().unwrap_or(&0)
     }
 }
 
@@ -87,32 +120,33 @@ mod tests {
     use super::*;
 
     // Helper: create a mock BinPos without needing a real index
-    fn make_bin_pos(ref_lens: &[u64], bin_size: u64, bin_overlap: u64) -> BinPos {
+    fn make_bin_pos(ref_lens: &[u64], bin_size: u64, overlap: u64, thr: f32) -> BinPos {
         let mut cum = Vec::with_capacity(ref_lens.len() + 1);
-        cum.push(0);
-        let mut total = 0u64;
-        for &len in ref_lens {
-            total += len;
-            cum.push(total);
+        cum.push(0u64);
+        for &rlen in ref_lens {
+            let mut bins_in_ref = rlen / bin_size;
+            if bins_in_ref * bin_size < rlen {
+                bins_in_ref += 1;
+            }
+            cum.push(cum.last().unwrap() + bins_in_ref);
         }
-        let stride = bin_size.saturating_sub(bin_overlap).max(1);
         BinPos {
-            cum_ref_lens: cum,
-            _bin_size: bin_size,
-            bin_overlap,
-            stride,
+            cum_bin_ids: cum,
+            bin_size,
+            overlap,
+            thr,
         }
     }
 
     #[test]
     fn test_bin_pos_basic() {
-        // 2 refs, each 1000bp, bin_size=500, no overlap
-        let bp = make_bin_pos(&[1000, 1000], 500, 0);
-        assert_eq!(bp.num_bins(), 4); // 2000 / 500 = 4
+        // 2 refs: 1000bp each, bin_size=500, no overlap
+        let bp = make_bin_pos(&[1000, 1000], 500, 0, 0.7);
+        assert_eq!(bp.num_bins(), 4); // 2 + 2
 
-        let (bin, secondary) = bp.get_bin_id(0, 0);
+        let (bin, sec) = bp.get_bin_id(0, 0);
         assert_eq!(bin, 0);
-        assert!(secondary.is_none());
+        assert_eq!(sec, INVALID_BIN_ID);
 
         let (bin, _) = bp.get_bin_id(0, 499);
         assert_eq!(bin, 0);
@@ -121,33 +155,75 @@ mod tests {
         assert_eq!(bin, 1);
 
         let (bin, _) = bp.get_bin_id(1, 0);
-        assert_eq!(bin, 2); // global pos = 1000, bin = 1000/500 = 2
+        assert_eq!(bin, 2);
+
+        let (bin, _) = bp.get_bin_id(1, 500);
+        assert_eq!(bin, 3);
     }
 
     #[test]
     fn test_bin_pos_overlap_region() {
-        // bin_size=1000, bin_overlap=300, stride=700
-        let bp = make_bin_pos(&[10000], 1000, 300);
-        assert_eq!(bp.stride, 700);
+        // bin_size=1000, overlap=300
+        // Ref 0: 5000bp → 5 bins (0..4)
+        let bp = make_bin_pos(&[5000], 1000, 300, 0.7);
+        assert_eq!(bp.num_bins(), 5);
 
         // Position 0: bin 0, no secondary
-        let (bin, secondary) = bp.get_bin_id(0, 0);
+        let (bin, sec) = bp.get_bin_id(0, 0);
         assert_eq!(bin, 0);
-        assert!(secondary.is_none()); // bin 0, no previous bin
+        assert_eq!(sec, INVALID_BIN_ID);
 
-        // Position 700: bin 1, in overlap (pos_in_bin = 0 < 300), secondary = bin 0
-        let (bin, secondary) = bp.get_bin_id(0, 700);
-        assert_eq!(bin, 1);
-        assert_eq!(secondary, Some(0));
+        // Position 699: bin 0, no secondary (699 <= 1000-300=700, no: 699 > 700? No.)
+        let (bin, sec) = bp.get_bin_id(0, 699);
+        assert_eq!(bin, 0);
+        assert_eq!(sec, INVALID_BIN_ID);
 
-        // Position 800: bin 1, in overlap (pos_in_bin = 100 < 300), secondary = bin 0
-        let (bin, secondary) = bp.get_bin_id(0, 800);
-        assert_eq!(bin, 1);
-        assert_eq!(secondary, Some(0));
+        // Position 701: bin 0, secondary = bin 1 (701 > 1000-300=700)
+        let (bin, sec) = bp.get_bin_id(0, 701);
+        assert_eq!(bin, 0);
+        assert_eq!(sec, 1);
 
-        // Position 1000: bin 1, not in overlap (pos_in_bin = 300 >= 300)
-        let (bin, secondary) = bp.get_bin_id(0, 1000);
+        // Position 999: bin 0, secondary = bin 1
+        let (bin, sec) = bp.get_bin_id(0, 999);
+        assert_eq!(bin, 0);
+        assert_eq!(sec, 1);
+
+        // Position 1000: bin 1, no secondary (1000 <= 2000-300=1700, not > 1700)
+        let (bin, sec) = bp.get_bin_id(0, 1000);
         assert_eq!(bin, 1);
-        assert!(secondary.is_none());
+        assert_eq!(sec, INVALID_BIN_ID);
+    }
+
+    #[test]
+    fn test_bin_pos_multi_ref() {
+        // Ref 0: 2500bp → ceil(2500/1000) = 3 bins (0,1,2)
+        // Ref 1: 1500bp → ceil(1500/1000) = 2 bins (3,4)
+        let bp = make_bin_pos(&[2500, 1500], 1000, 300, 0.7);
+        assert_eq!(bp.num_bins(), 5);
+
+        // Ref 1, pos 0 → bin 3
+        let (bin, _) = bp.get_bin_id(1, 0);
+        assert_eq!(bin, 3);
+
+        // Ref 1, pos 1000 → bin 4
+        let (bin, _) = bp.get_bin_id(1, 1000);
+        assert_eq!(bin, 4);
+    }
+
+    #[test]
+    fn test_bin_pos_last_ref_boundary() {
+        // Ref with exactly bin_size length: 1 bin
+        let bp = make_bin_pos(&[1000], 1000, 300, 0.7);
+        assert_eq!(bp.num_bins(), 1);
+
+        // Position 0: bin 0, no secondary (no next bin)
+        let (bin, sec) = bp.get_bin_id(0, 0);
+        assert_eq!(bin, 0);
+        assert_eq!(sec, INVALID_BIN_ID);
+
+        // Position 900: bin 0, no secondary (bin1+1=1 not < 1)
+        let (bin, sec) = bp.get_bin_id(0, 900);
+        assert_eq!(bin, 0);
+        assert_eq!(sec, INVALID_BIN_ID);
     }
 }

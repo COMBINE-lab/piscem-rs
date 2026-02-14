@@ -75,6 +75,8 @@ pub struct SimpleHit {
     pub tid: u32,
     pub mate_pos: i32,
     pub fragment_length: i32,
+    /// Bin ID for scATAC binned mapping. `u64::MAX` = invalid/unused.
+    pub bin_id: u64,
 }
 
 impl Default for SimpleHit {
@@ -88,6 +90,7 @@ impl Default for SimpleHit {
             tid: u32::MAX,
             mate_pos: INVALID_MATE_POS,
             fragment_length: INVALID_FRAG_LEN,
+            bin_id: u64::MAX,
         }
     }
 }
@@ -252,6 +255,7 @@ mod tests {
             tid: 42,
             mate_pos: 200,
             fragment_length: 150,
+            ..SimpleHit::default()
         };
         assert!(hit.has_mate());
         assert_eq!(hit.frag_len(), 150);

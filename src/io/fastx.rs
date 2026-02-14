@@ -33,6 +33,28 @@ pub struct ReadPair {
 pub type ReadChunk = Vec<ReadPair>;
 
 // ---------------------------------------------------------------------------
+// ReadTriplet (for scATAC triple-file input)
+// ---------------------------------------------------------------------------
+
+/// A read triplet for scATAC: two genomic reads + one barcode read.
+#[derive(Debug, Clone)]
+pub struct ReadTriplet {
+    pub name: Vec<u8>,
+    /// R1 (left genomic read).
+    pub seq1: Vec<u8>,
+    pub qual1: Vec<u8>,
+    /// R2 (right genomic read, from the R3 file).
+    pub seq2: Vec<u8>,
+    pub qual2: Vec<u8>,
+    /// Barcode read (from the R2/barcode file).
+    pub barcode: Vec<u8>,
+    pub barcode_qual: Vec<u8>,
+}
+
+/// A chunk of triplet reads for batch processing.
+pub type ReadTripletChunk = Vec<ReadTriplet>;
+
+// ---------------------------------------------------------------------------
 // FastxConfig
 // ---------------------------------------------------------------------------
 
@@ -184,6 +206,114 @@ impl FastxSource {
                 if chunk.len() >= self.config.chunk_size {
                     break;
                 }
+            }
+        }
+
+        Ok(!chunk.is_empty())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FastxTripleSource (for scATAC triple-file input)
+// ---------------------------------------------------------------------------
+
+/// Sequential reader for three-file FASTQ input (R1 + barcode + R2).
+///
+/// Produces chunks of `ReadTriplet` for the scATAC mapping pipeline.
+pub struct FastxTripleSource {
+    reader1: fastq::Reader<Box<dyn std::io::Read + Send>>,
+    reader_bc: fastq::Reader<Box<dyn std::io::Read + Send>>,
+    reader2: fastq::Reader<Box<dyn std::io::Read + Send>>,
+    record_set1: fastq::RecordSet,
+    record_set_bc: fastq::RecordSet,
+    record_set2: fastq::RecordSet,
+    chunk_size: usize,
+    copy_quality: bool,
+}
+
+impl FastxTripleSource {
+    /// Open three FASTQ file sets: R1 (genomic), barcode, R2 (genomic).
+    pub fn new(
+        read1_paths: &[String],
+        barcode_paths: &[String],
+        read2_paths: &[String],
+        chunk_size: usize,
+        copy_quality: bool,
+    ) -> Result<Self> {
+        let r1 = open_concatenated_readers(read1_paths)?;
+        let reader1 = fastq::Reader::new(r1);
+        let rs1 = reader1.new_record_set();
+
+        let rbc = open_concatenated_readers(barcode_paths)?;
+        let reader_bc = fastq::Reader::new(rbc);
+        let rs_bc = reader_bc.new_record_set();
+
+        let r2 = open_concatenated_readers(read2_paths)?;
+        let reader2 = fastq::Reader::new(r2);
+        let rs2 = reader2.new_record_set();
+
+        Ok(Self {
+            reader1,
+            reader_bc,
+            reader2,
+            record_set1: rs1,
+            record_set_bc: rs_bc,
+            record_set2: rs2,
+            chunk_size,
+            copy_quality,
+        })
+    }
+
+    /// Read the next chunk of triplet reads.
+    ///
+    /// Returns `Ok(true)` if reads were produced, `Ok(false)` at EOF.
+    pub fn next_chunk(&mut self, chunk: &mut ReadTripletChunk) -> Result<bool> {
+        chunk.clear();
+
+        let has1 = self.record_set1.fill(&mut self.reader1)?;
+        let has_bc = self.record_set_bc.fill(&mut self.reader_bc)?;
+        let has2 = self.record_set2.fill(&mut self.reader2)?;
+        if !has1 || !has_bc || !has2 {
+            return Ok(false);
+        }
+
+        let mut iter1 = self.record_set1.iter();
+        let mut iter_bc = self.record_set_bc.iter();
+        let mut iter2 = self.record_set2.iter();
+        let copy_qual = self.copy_quality;
+
+        loop {
+            let r1 = iter1.next();
+            let rbc = iter_bc.next();
+            let r2 = iter2.next();
+            match (r1, rbc, r2) {
+                (Some(Ok(rec1)), Some(Ok(rec_bc)), Some(Ok(rec2))) => {
+                    chunk.push(ReadTriplet {
+                        name: Vec::new(),
+                        seq1: rec1.seq().into_owned(),
+                        qual1: if copy_qual {
+                            rec1.qual().map(|q| q.to_vec()).unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        },
+                        seq2: rec2.seq().into_owned(),
+                        qual2: if copy_qual {
+                            rec2.qual().map(|q| q.to_vec()).unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        },
+                        barcode: rec_bc.seq().into_owned(),
+                        barcode_qual: if copy_qual {
+                            rec_bc.qual().map(|q| q.to_vec()).unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        },
+                    });
+                }
+                _ => break,
+            }
+            if chunk.len() >= self.chunk_size {
+                break;
             }
         }
 

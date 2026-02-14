@@ -772,6 +772,484 @@ fn translate_sc_record(
 }
 
 // ---------------------------------------------------------------------------
+// ATAC record-level comparison (custom parser — libradicl lacks ATAC support)
+// ---------------------------------------------------------------------------
+
+/// A canonicalized ATAC RAD record for multiset comparison.
+///
+/// Each alignment is (ref_id, type_code, start_pos, frag_len).
+/// Sorted for deterministic comparison.
+#[cfg(any(test, feature = "parity-test"))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CanonicalAtacRecord {
+    pub bc: u64,
+    pub alignments: Vec<(u32, u8, u32, u16)>, // (ref_id, type, start_pos, frag_len)
+}
+
+#[cfg(any(test, feature = "parity-test"))]
+impl std::fmt::Display for CanonicalAtacRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bc={}, alns=[", self.bc)?;
+        for (i, (r, t, p, fl)) in self.alignments.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "(ref={r}, type={t}, pos={p}, flen={fl})")?;
+        }
+        write!(f, "]")
+    }
+}
+
+/// Parsed ATAC RAD header with tag type metadata needed for record parsing.
+#[cfg(any(test, feature = "parity-test"))]
+#[derive(Debug)]
+pub struct AtacRadHeader {
+    pub is_paired: bool,
+    pub num_refs: u64,
+    pub ref_names: Vec<String>,
+    pub num_chunks: u64,
+    pub bc_tag_type: u8, // TAG_U32=3 or TAG_U64=4
+}
+
+/// Read an ATAC RAD header, including tag descriptions and file-level tag values.
+///
+/// This is a custom parser because libradicl doesn't support ATAC records.
+/// Handles both C++ (v_u64 ref_lengths) and Rust (array_u32 ref_lengths) formats.
+#[cfg(any(test, feature = "parity-test"))]
+fn read_atac_rad_header<R: Read>(reader: &mut R) -> Result<AtacRadHeader> {
+    // is_paired (u8)
+    let mut buf1 = [0u8; 1];
+    reader.read_exact(&mut buf1).context("reading is_paired")?;
+    let is_paired = buf1[0] != 0;
+
+    // num_refs (u64)
+    let mut buf8 = [0u8; 8];
+    reader.read_exact(&mut buf8).context("reading num_refs")?;
+    let num_refs = u64::from_le_bytes(buf8);
+
+    // ref_names
+    let mut ref_names = Vec::with_capacity(num_refs as usize);
+    let mut buf2 = [0u8; 2];
+    for _ in 0..num_refs {
+        reader.read_exact(&mut buf2).context("reading ref name length")?;
+        let name_len = u16::from_le_bytes(buf2) as usize;
+        let mut name_buf = vec![0u8; name_len];
+        reader.read_exact(&mut name_buf).context("reading ref name")?;
+        ref_names.push(String::from_utf8_lossy(&name_buf).to_string());
+    }
+
+    // num_chunks (u64)
+    reader.read_exact(&mut buf8).context("reading num_chunks")?;
+    let num_chunks = u64::from_le_bytes(buf8);
+
+    // --- Tag descriptions ---
+    // We need to parse these to know the barcode type and to skip past them.
+
+    // File-level tags
+    reader.read_exact(&mut buf2).context("reading num_file_tags")?;
+    let num_file_tags = u16::from_le_bytes(buf2);
+    let mut file_tag_descs = Vec::new();
+    for _ in 0..num_file_tags {
+        let (name, type_id) = read_tag_desc(reader)?;
+        file_tag_descs.push((name, type_id));
+    }
+
+    // Read-level tags
+    reader.read_exact(&mut buf2).context("reading num_read_tags")?;
+    let num_read_tags = u16::from_le_bytes(buf2);
+    let mut bc_tag_type = 3u8; // default TAG_U32
+    for _ in 0..num_read_tags {
+        let (name, type_id) = read_tag_desc(reader)?;
+        if name == "b" {
+            bc_tag_type = type_id;
+        }
+    }
+
+    // Alignment-level tags
+    reader.read_exact(&mut buf2).context("reading num_aln_tags")?;
+    let num_aln_tags = u16::from_le_bytes(buf2);
+    for _ in 0..num_aln_tags {
+        let (_name, _type_id) = read_tag_desc(reader)?;
+    }
+
+    // --- File-level tag values ---
+    // We need to skip these. Parse based on the tag types we collected.
+    for (_name, type_id) in &file_tag_descs {
+        skip_tag_value(reader, *type_id)?;
+    }
+
+    Ok(AtacRadHeader {
+        is_paired,
+        num_refs,
+        ref_names,
+        num_chunks,
+        bc_tag_type,
+    })
+}
+
+/// Read a tag description: name (u16 len + bytes) + type_id (u8).
+/// For array tags (type=7), also reads len_type (u8) + elem_type (u8).
+#[cfg(any(test, feature = "parity-test"))]
+fn read_tag_desc<R: Read>(reader: &mut R) -> Result<(String, u8)> {
+    let mut buf2 = [0u8; 2];
+    reader.read_exact(&mut buf2).context("reading tag name length")?;
+    let name_len = u16::from_le_bytes(buf2) as usize;
+    let mut name_buf = vec![0u8; name_len];
+    reader.read_exact(&mut name_buf).context("reading tag name")?;
+    let name = String::from_utf8_lossy(&name_buf).to_string();
+
+    let mut buf1 = [0u8; 1];
+    reader.read_exact(&mut buf1).context("reading tag type")?;
+    let type_id = buf1[0];
+
+    // Array tags (TAG_ARRAY=7) have two additional bytes: len_type + elem_type
+    if type_id == 7 {
+        let mut extra = [0u8; 2];
+        reader.read_exact(&mut extra).context("reading array len/elem types")?;
+        let _len_type = extra[0]; // type of count field (unused, always u32 in practice)
+        let elem_type = extra[1]; // type of each element
+        // We mark this as type 100+elem_type for internal tracking
+        return Ok((name, 100 + elem_type));
+    }
+
+    Ok((name, type_id))
+}
+
+/// Skip a tag value based on its type.
+#[cfg(any(test, feature = "parity-test"))]
+fn skip_tag_value<R: Read>(reader: &mut R, type_id: u8) -> Result<()> {
+    let mut buf = [0u8; 8];
+    match type_id {
+        1 => { reader.read_exact(&mut buf[..1])?; } // u8
+        2 => { reader.read_exact(&mut buf[..2])?; } // u16
+        3 => { reader.read_exact(&mut buf[..4])?; } // u32
+        4 => { reader.read_exact(&mut buf[..8])?; } // u64
+        8 => {
+            // string: u16 len + bytes
+            let mut buf2 = [0u8; 2];
+            reader.read_exact(&mut buf2)?;
+            let len = u16::from_le_bytes(buf2) as usize;
+            let mut skip = vec![0u8; len];
+            reader.read_exact(&mut skip)?;
+        }
+        t if t >= 100 => {
+            // Array: the count field size depends on the len_type from the tag desc.
+            // C++ libradicl uses u64 for v_u64 count: `add(Type::u64(val.val().size()))`
+            // Rust uses u32 count: `write_u32(ref_lengths.len() as u32)`
+            // We read the len_type to determine count size, but since we encoded
+            // len_type into type_id too, we can't distinguish here. Instead, try
+            // the element type as a proxy: if elements are u64, count is u64 (C++ style).
+            let elem_type = t - 100;
+            let elem_size = match elem_type {
+                1 => 1usize, // u8
+                2 => 2,      // u16
+                3 => 4,      // u32
+                4 => 8,      // u64
+                _ => anyhow::bail!("unknown array element type {}", elem_type),
+            };
+            // C++ v_u64 uses u64 count; Rust uses u32 count.
+            // Determine based on elem_type: u64 elements => u64 count (C++ pattern)
+            let count = if elem_type == 4 {
+                let mut buf8 = [0u8; 8];
+                reader.read_exact(&mut buf8)?;
+                u64::from_le_bytes(buf8) as usize
+            } else {
+                let mut buf4 = [0u8; 4];
+                reader.read_exact(&mut buf4)?;
+                u32::from_le_bytes(buf4) as usize
+            };
+            let mut skip = vec![0u8; count * elem_size];
+            reader.read_exact(&mut skip)?;
+        }
+        _ => anyhow::bail!("unknown tag type {}", type_id),
+    }
+    Ok(())
+}
+
+/// Read all ATAC RAD records from a file using a custom parser.
+///
+/// Returns the header info and a Vec of canonicalized records.
+#[cfg(any(test, feature = "parity-test"))]
+pub fn read_atac_rad_records(
+    path: &Path,
+) -> Result<(AtacRadHeader, Vec<CanonicalAtacRecord>)> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+
+    let header = read_atac_rad_header(&mut reader)?;
+
+    let bc_is_u64 = header.bc_tag_type == 4; // TAG_U64
+
+    let mut all_records = Vec::new();
+
+    // num_chunks=0 means "unknown" (C++ libradicl never backpatches it).
+    // In that case, read until EOF.
+    let known_chunks = header.num_chunks > 0;
+    let mut chunks_read: u64 = 0;
+
+    loop {
+        if known_chunks && chunks_read >= header.num_chunks {
+            break;
+        }
+
+        // Chunk header: num_bytes (u32) + num_reads (u32)
+        // C++ chunk_sz includes the 8-byte header itself.
+        let mut buf4 = [0u8; 4];
+        match reader.read_exact(&mut buf4) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e).context("reading chunk num_bytes"),
+        }
+        let num_bytes = u32::from_le_bytes(buf4) as usize;
+
+        reader.read_exact(&mut buf4)
+            .with_context(|| format!("reading chunk {} num_reads", chunks_read))?;
+        let num_reads = u32::from_le_bytes(buf4);
+
+        // Read the entire chunk data as a byte buffer (num_bytes - 8 for header)
+        let data_len = num_bytes.saturating_sub(8);
+        let mut chunk_data = vec![0u8; data_len];
+        reader.read_exact(&mut chunk_data)
+            .with_context(|| format!("reading chunk {} data ({} bytes)", chunks_read, data_len))?;
+
+        // Parse records from the chunk buffer
+        let mut cursor = std::io::Cursor::new(&chunk_data);
+        for _ in 0..num_reads {
+            use std::io::Read as _;
+            let mut b4 = [0u8; 4];
+
+            // num_mappings (u32)
+            cursor.read_exact(&mut b4)?;
+            let num_mappings = u32::from_le_bytes(b4);
+
+            // barcode
+            let bc: u64 = if bc_is_u64 {
+                let mut b8 = [0u8; 8];
+                cursor.read_exact(&mut b8)?;
+                u64::from_le_bytes(b8)
+            } else {
+                cursor.read_exact(&mut b4)?;
+                u32::from_le_bytes(b4) as u64
+            };
+
+            // Per-alignment: ref (u32) + type (u8) + start_pos (u32) + frag_len (u16)
+            let mut alignments = Vec::with_capacity(num_mappings as usize);
+            for _ in 0..num_mappings {
+                cursor.read_exact(&mut b4)?;
+                let ref_id = u32::from_le_bytes(b4);
+
+                let mut b1 = [0u8; 1];
+                cursor.read_exact(&mut b1)?;
+                let atype = b1[0];
+
+                cursor.read_exact(&mut b4)?;
+                let start_pos = u32::from_le_bytes(b4);
+
+                let mut b2 = [0u8; 2];
+                cursor.read_exact(&mut b2)?;
+                let frag_len = u16::from_le_bytes(b2);
+
+                alignments.push((ref_id, atype, start_pos, frag_len));
+            }
+
+            if num_mappings > 0 {
+                alignments.sort();
+                all_records.push(CanonicalAtacRecord { bc, alignments });
+            }
+        }
+
+        chunks_read += 1;
+    }
+
+    Ok((header, all_records))
+}
+
+/// Compare two ATAC RAD files at the record level using multiset comparison.
+///
+/// Since thread interleaving produces non-deterministic chunk ordering, records
+/// are compared as multisets. Handles different reference orderings.
+#[cfg(any(test, feature = "parity-test"))]
+pub fn compare_atac_rad_full(
+    path_a: &Path,
+    path_b: &Path,
+) -> Result<RecordComparisonSummary> {
+    let (header_a, records_a) = read_atac_rad_records(path_a)
+        .with_context(|| format!("reading {}", path_a.display()))?;
+    let (header_b, records_b) = read_atac_rad_records(path_b)
+        .with_context(|| format!("reading {}", path_b.display()))?;
+
+    // Compare headers
+    let paired_match = header_a.is_paired == header_b.is_paired;
+    let count_match = header_a.num_refs == header_b.num_refs;
+    let names_a: std::collections::HashSet<&str> =
+        header_a.ref_names.iter().map(|s| s.as_str()).collect();
+    let names_b: std::collections::HashSet<&str> =
+        header_b.ref_names.iter().map(|s| s.as_str()).collect();
+    let names_match = names_a == names_b;
+    let header_match = paired_match && count_match && names_match;
+
+    // Build ref ID translation: B's ref_id → A's ref_id
+    let name_to_id_a: std::collections::HashMap<&str, u32> = header_a
+        .ref_names.iter().enumerate()
+        .map(|(i, n)| (n.as_str(), i as u32))
+        .collect();
+    let b_to_a_id: Vec<u32> = header_b
+        .ref_names.iter()
+        .map(|name| name_to_id_a.get(name.as_str()).copied().unwrap_or(u32::MAX))
+        .collect();
+
+    let total_a = records_a.len();
+    let total_b = records_b.len();
+
+    // Build frequency map for A
+    let mut freq_a: std::collections::HashMap<CanonicalAtacRecord, u64> =
+        std::collections::HashMap::with_capacity(total_a);
+    for rec in &records_a {
+        *freq_a.entry(rec.clone()).or_insert(0) += 1;
+    }
+
+    // Build frequency map for B, translating ref IDs
+    let mut freq_b: std::collections::HashMap<CanonicalAtacRecord, u64> =
+        std::collections::HashMap::with_capacity(total_b);
+    for rec in &records_b {
+        let translated = translate_atac_record(rec, &b_to_a_id);
+        *freq_b.entry(translated).or_insert(0) += 1;
+    }
+
+    // Compare frequency maps
+    let mut matching: usize = 0;
+    let mut missing_in_a: usize = 0;
+    let mut missing_in_b: usize = 0;
+    let mut first_mismatches: Vec<String> = Vec::new();
+    let max_mismatch_report = 10;
+
+    for (rec, &count_a) in &freq_a {
+        let count_b = freq_b.get(rec).copied().unwrap_or(0);
+        if count_a == count_b {
+            matching += count_a as usize;
+        } else if count_a > count_b {
+            matching += count_b as usize;
+            let diff = (count_a - count_b) as usize;
+            missing_in_b += diff;
+            if first_mismatches.len() < max_mismatch_report {
+                first_mismatches.push(format!("in A but not B ({diff}x): {rec}"));
+            }
+        } else {
+            matching += count_a as usize;
+            let diff = (count_b - count_a) as usize;
+            missing_in_a += diff;
+            if first_mismatches.len() < max_mismatch_report {
+                first_mismatches.push(format!("in B but not A ({diff}x): {rec}"));
+            }
+        }
+    }
+    for (rec, &count_b) in &freq_b {
+        if !freq_a.contains_key(rec) {
+            missing_in_a += count_b as usize;
+            if first_mismatches.len() < max_mismatch_report {
+                first_mismatches.push(format!("in B but not A ({count_b}x): {rec}"));
+            }
+        }
+    }
+
+    let passed = header_match && missing_in_a == 0 && missing_in_b == 0 && total_a == total_b;
+
+    // Detailed mismatch categorization
+    let mut b_by_targets: std::collections::HashMap<Vec<u32>, Vec<&CanonicalAtacRecord>> =
+        std::collections::HashMap::new();
+    for (rec, &count_b) in &freq_b {
+        let count_a = freq_a.get(rec).copied().unwrap_or(0);
+        if count_b > count_a {
+            let fp: Vec<u32> = rec.alignments.iter().map(|a| a.0).collect();
+            b_by_targets.entry(fp).or_default().push(rec);
+        }
+    }
+
+    let mut same_targets_diff_detail: usize = 0;
+    let mut different_targets: usize = 0;
+    let mut diff_frag_len_only: usize = 0;
+    let mut diff_pos_only: usize = 0;
+    let mut diff_num_alns: usize = 0;
+
+    for (rec_a, &count_a) in &freq_a {
+        let count_b = freq_b.get(rec_a).copied().unwrap_or(0);
+        if count_a > count_b {
+            let excess = (count_a - count_b) as usize;
+            let fp: Vec<u32> = rec_a.alignments.iter().map(|a| a.0).collect();
+            if let Some(b_recs) = b_by_targets.get(&fp) {
+                same_targets_diff_detail += excess;
+                for b_rec in b_recs.iter().take(1) {
+                    if rec_a.alignments.len() != b_rec.alignments.len() {
+                        diff_num_alns += excess;
+                    } else {
+                        let pos_differ = rec_a.alignments.iter().zip(b_rec.alignments.iter())
+                            .any(|(a, b)| a.2 != b.2);
+                        let flen_differ = rec_a.alignments.iter().zip(b_rec.alignments.iter())
+                            .any(|(a, b)| a.3 != b.3);
+                        if pos_differ && !flen_differ {
+                            diff_pos_only += excess;
+                        } else if flen_differ && !pos_differ {
+                            diff_frag_len_only += excess;
+                        }
+                    }
+                }
+            } else {
+                different_targets += excess;
+            }
+        }
+    }
+
+    let mut notes_parts = Vec::new();
+    if !header_match {
+        if !paired_match { notes_parts.push("is_paired differs".to_string()); }
+        if !count_match {
+            notes_parts.push(format!("ref_count differs: {} vs {}", header_a.num_refs, header_b.num_refs));
+        }
+        if !names_match { notes_parts.push("ref_names differ".to_string()); }
+    }
+    if total_a != total_b {
+        notes_parts.push(format!("record count mismatch: {total_a} vs {total_b}"));
+    }
+    if missing_in_a > 0 { notes_parts.push(format!("{missing_in_a} records in B missing from A")); }
+    if missing_in_b > 0 { notes_parts.push(format!("{missing_in_b} records in A missing from B")); }
+    if passed { notes_parts.push(format!("all {matching} records match")); }
+
+    Ok(RecordComparisonSummary {
+        header_match,
+        total_records_a: total_a,
+        total_records_b: total_b,
+        matching_records: matching,
+        missing_in_a,
+        missing_in_b,
+        passed,
+        notes: notes_parts.join("; "),
+        first_mismatches,
+        same_targets_diff_detail,
+        different_targets,
+        diff_frag_len_only,
+        diff_pos_only,
+        diff_num_alns,
+    })
+}
+
+/// Translate ref IDs in an ATAC record from one namespace to another.
+#[cfg(any(test, feature = "parity-test"))]
+fn translate_atac_record(
+    rec: &CanonicalAtacRecord,
+    id_map: &[u32],
+) -> CanonicalAtacRecord {
+    let mut translated = rec.clone();
+    for aln in &mut translated.alignments {
+        if (aln.0 as usize) < id_map.len() {
+            aln.0 = id_map[aln.0 as usize];
+        }
+    }
+    translated.alignments.sort();
+    translated
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use anyhow::Result;
 use crossbeam::channel;
 
-use crate::io::fastx::{FastxSource, ReadChunk};
+use crate::io::fastx::{FastxSource, FastxTripleSource, ReadChunk, ReadTripletChunk};
 
 // ---------------------------------------------------------------------------
 // ThreadConfig
@@ -147,6 +147,65 @@ where
                 }
             }
             // sender dropped here, signaling workers to exit.
+        });
+    })
+    .map_err(|e| anyhow::anyhow!("thread panicked: {:?}", e))?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// run_mapping_pipeline_triple (for scATAC triple-file input)
+// ---------------------------------------------------------------------------
+
+/// Run the mapping pipeline with triple-file FASTQ input (R1 + barcode + R2).
+///
+/// Same producer-consumer pattern as `run_mapping_pipeline`, but uses
+/// `FastxTripleSource` and `ReadTripletChunk`.
+pub fn run_mapping_pipeline_triple<F>(
+    mut fastx: FastxTripleSource,
+    config: ThreadConfig,
+    output: &OutputInfo,
+    stats: &MappingStats,
+    worker_fn: F,
+) -> Result<()>
+where
+    F: Fn(ReadTripletChunk, &OutputInfo, &MappingStats) + Send + Sync,
+{
+    let num_threads = config.threads.max(1);
+    let (sender, receiver) = channel::bounded::<ReadTripletChunk>(num_threads * 2);
+
+    let worker_ref = &worker_fn;
+    crossbeam::scope(|scope| {
+        // Spawn worker threads
+        for _ in 0..num_threads {
+            let recv = receiver.clone();
+            scope.spawn(move |_| {
+                while let Ok(chunk) = recv.recv() {
+                    worker_ref(chunk, output, stats);
+                }
+            });
+        }
+        drop(receiver);
+
+        // Producer thread
+        scope.spawn(move |_| {
+            let mut chunk = Vec::new();
+            loop {
+                match fastx.next_chunk(&mut chunk) {
+                    Ok(true) => {
+                        let batch = std::mem::take(&mut chunk);
+                        if sender.send(batch).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(false) => break,
+                    Err(e) => {
+                        tracing::error!("Error reading FASTX: {}", e);
+                        break;
+                    }
+                }
+            }
         });
     })
     .map_err(|e| anyhow::anyhow!("thread panicked: {:?}", e))?;

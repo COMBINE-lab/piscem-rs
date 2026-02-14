@@ -288,6 +288,55 @@ impl<'idx> HitSearcher<'idx> {
         self.index
     }
 
+    /// Collect raw k-mer hits by querying every valid k-mer position.
+    ///
+    /// Unlike STRICT/PERMISSIVE modes, this queries the index at every single
+    /// k-mer position independently — no contig-walking or SPSS verification.
+    /// Used by scATAC mapping (matching C++ `get_raw_hits_sketch_everykmer`).
+    ///
+    /// Populates either `left_hits` or `right_hits` depending on `is_left`.
+    /// Returns `true` if at least one hit was found.
+    pub fn get_raw_hits_sketch_everykmer<const K: usize>(
+        &mut self,
+        read: &[u8],
+        query: &mut PiscemStreamingQuery<'_, K>,
+        is_left: bool,
+    ) -> bool
+    where
+        Kmer<K>: KmerBits,
+    {
+        query.reset();
+
+        let raw_hits = if is_left {
+            &mut self.left_hits
+        } else {
+            &mut self.right_hits
+        };
+        raw_hits.clear();
+
+        let index = self.index;
+        let k = self.k;
+        let mut iter = ReadKmerIter::new(read, k);
+
+        while !iter.is_exhausted() {
+            let kmer_bytes = iter.kmer_bytes();
+            let read_pos = iter.pos();
+
+            let kmer_str = unsafe { std::str::from_utf8_unchecked(kmer_bytes) };
+            let result = query.lookup_at(kmer_str, read_pos);
+
+            if let Some(phit) = index.resolve_lookup(&result) {
+                if !phit.is_empty() {
+                    raw_hits.push((read_pos, phit));
+                }
+            }
+
+            iter.advance();
+        }
+
+        !raw_hits.is_empty()
+    }
+
     /// Collect raw k-mer hits from `read` using the given strategy.
     ///
     /// Populates either `left_hits` or `right_hits` depending on `is_left`.
