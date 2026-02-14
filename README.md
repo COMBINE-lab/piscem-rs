@@ -84,4 +84,4 @@ piscem-rs uses a modular architecture:
 
 ## License
 
-MIT
+BSD 3-Clause
