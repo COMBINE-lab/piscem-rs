@@ -74,22 +74,31 @@ The full implementation plan with C++ → Rust type mappings, architectural note
   - `tests/rad_parity_bulk.rs` — Added: `bulk_pe_rad_parity_with_poison` test (99.68% match rate)
   - Poison table parity: C++ 3,764,601 k-mers / Rust 3,764,549 k-mers (~99.999%)
 
-- **Phase 8: scATAC Parity** — Fix ATAC mapper to match C++ behavior. 7 new tests, 180 total.
+- **Phase 8: scATAC Parity** — Fix ATAC mapper to match C++ behavior. 100% record-level parity achieved. 7 new tests, 184 total.
   - `src/io/fastx.rs` — Added `ReadTriplet`, `ReadTripletChunk`, `FastxTripleSource` for triple-file FASTQ (R1 + barcode + R2)
   - `src/io/threads.rs` — Added `run_mapping_pipeline_triple()` for triple-file producer-consumer pipeline
   - `src/mapping/hit_searcher.rs` — Added `get_raw_hits_sketch_everykmer()`: queries every k-mer position independently (no contig-walking)
   - `src/mapping/binning.rs` — REWRITTEN: `BinPos` with cumulative per-reference bin IDs matching C++ `bin_pos`, `get_bin_id(tid, pos)` returns `(bin1, bin2)` with overlap region secondary bin
   - `src/mapping/hits.rs` — Added `bin_id: u64` field to `SimpleHit` (default `u64::MAX`)
   - `src/mapping/engine.rs` — Added `map_read_atac<K, S>()`: bin-based hit accumulation with threshold filtering (`ceil(num_valid * thr)`)
-  - `src/mapping/merge_pairs.rs` — Added `merge_se_mappings_binned()`: bin-aware PE merge (compatible bins = same or adjacent), `remove_duplicate_hits()` canonicalization, `simple_hit_cmp_bins` comparator
+  - `src/mapping/merge_pairs.rs` — Added `merge_se_mappings_binned()`: bin-aware PE merge (compatible bins = same or adjacent), `remove_duplicate_hits()` canonicalization, `simple_hit_cmp_bins` comparator, `max_num_hits` post-filter matching C++ `utils.hpp:2018-2027`
   - `src/mapping/map_fragment.rs` — Added `map_se_fragment_atac()` / `map_pe_fragment_atac()` using bin-based mapping + binned merge
   - `src/cli/map_scatac.rs` — REWRITTEN: triple-file input, `--no-poison` defaults true, `--bin-size`/`--bin-overlap`/`--thr` args, every-kmer mode (ignores `--skipping-strategy`), mate overlap → bin-based SE map, no overlap → bin-based PE map + binned merge
+  - `examples/atac_mismatch_diag.rs` — Diagnostic tool for categorizing ATAC RAD mismatches
+  - `examples/index_stats.rs` — Index statistics dumper (refs, contigs, entries)
+
+### Parity Status
+
+| Mode | Dataset | Mapping Rate | Record-Level Parity |
+|------|---------|-------------|-------------------|
+| Bulk PE | gencode_pc_v44 (with poison) | 100% match | 99.68% |
+| scRNA | SRR12623882 (Chromium V3) | 100% match | 100% |
+| scATAC | 5M ATAC reads (hg38 k25) | 100% match (98.33%) | 100% (4,916,721/4,916,721) |
 
 ### Next Up
 
-- scATAC parity testing (compare Rust vs C++ RAD output on test data)
 - Performance benchmarking and optimization
-- libradicl integration for record-level RAD comparison (currently header-only)
+- Investigate remaining bulk PE parity gap (0.32% — likely tie-breaking in STRICT/PERMISSIVE mode)
 
 ## Key Design Decisions
 
@@ -191,7 +200,7 @@ piscem-rs/
 ## Running Tests
 
 ```bash
-cargo test              # All 183 tests should pass (2 ignored integration tests)
+cargo test              # All 184 tests should pass (12 ignored integration tests)
 cargo check             # Should compile clean with no warnings
 RUST_LOG=info cargo run # Run with logging
 ```
