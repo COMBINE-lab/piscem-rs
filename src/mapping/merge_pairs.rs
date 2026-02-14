@@ -141,12 +141,17 @@ pub fn merge_se_mappings_binned<S: SketchHitInfo>(
     let num_accepted_left = cache_left.accepted_hits.len();
     let num_accepted_right = cache_right.accepted_hits.len();
 
+    // C++ tracks max_num_hits across all output hits, then filters to keep
+    // only hits with num_hits >= max_num_hits (utils.hpp lines 2018-2027).
+    let mut max_num_hits: u32 = 0;
+
     if num_accepted_left > 0 && num_accepted_right > 0 {
         // Sort by (orientation desc, tid asc, pos asc, num_hits asc, bin_id asc)
         cache_left.accepted_hits.sort_by(simple_hit_cmp_bins);
         cache_right.accepted_hits.sort_by(simple_hit_cmp_bins);
 
         // Remove duplicate hits (canonicalize bin_id to minimum, deduplicate)
+        // C++ passes discard=0 for PE path
         remove_duplicate_hits(&mut cache_left.accepted_hits);
         remove_duplicate_hits(&mut cache_right.accepted_hits);
 
@@ -176,12 +181,14 @@ pub fn merge_se_mappings_binned<S: SketchHitInfo>(
         merge_lists_binned(
             left_fw, right_rc, left_len, right_len,
             &mut cache_out.accepted_hits,
+            &mut max_num_hits,
         );
 
         // Merge left_RC × right_FW
         merge_lists_binned(
             left_rc, right_fw, left_len, right_len,
             &mut cache_out.accepted_hits,
+            &mut max_num_hits,
         );
 
         cache_out.map_type = if !cache_out.accepted_hits.is_empty() {
@@ -193,6 +200,8 @@ pub fn merge_se_mappings_binned<S: SketchHitInfo>(
         // C++ with check_kmers_orphans=false: always emit orphan
         // (doesn't check had_matching_kmers_right)
         cache_left.accepted_hits.sort_by(simple_hit_cmp_bins);
+        // C++ sets max_num_hits = front().num_hits before remove_duplicate_hits
+        max_num_hits = cache_left.accepted_hits[0].num_hits;
         remove_duplicate_hits(&mut cache_left.accepted_hits);
         std::mem::swap(
             &mut cache_left.accepted_hits,
@@ -206,6 +215,8 @@ pub fn merge_se_mappings_binned<S: SketchHitInfo>(
     } else if num_accepted_right > 0 {
         // C++ with check_kmers_orphans=false: always emit orphan
         cache_right.accepted_hits.sort_by(simple_hit_cmp_bins);
+        // C++ sets max_num_hits = front().num_hits before remove_duplicate_hits
+        max_num_hits = cache_right.accepted_hits[0].num_hits;
         remove_duplicate_hits(&mut cache_right.accepted_hits);
         std::mem::swap(
             &mut cache_right.accepted_hits,
@@ -216,6 +227,17 @@ pub fn merge_se_mappings_binned<S: SketchHitInfo>(
         } else {
             MappingType::Unmapped
         };
+    }
+
+    // C++ final filter: keep only hits with num_hits >= max_num_hits
+    // (utils.hpp lines 2018-2027)
+    if !cache_out.accepted_hits.is_empty() && max_num_hits > 0 {
+        cache_out
+            .accepted_hits
+            .retain(|h| h.num_hits >= max_num_hits);
+        if cache_out.accepted_hits.is_empty() {
+            cache_out.map_type = MappingType::Unmapped;
+        }
     }
 }
 
@@ -273,6 +295,7 @@ fn merge_lists_binned(
     left_len: i32,
     right_len: i32,
     out: &mut Vec<SimpleHit>,
+    max_num_hits: &mut u32,
 ) {
     for f1 in list1 {
         for f2 in list2 {
@@ -297,6 +320,7 @@ fn merge_lists_binned(
                         };
 
                         let nhits = f1.num_hits + f2.num_hits;
+                        *max_num_hits = (*max_num_hits).max(nhits);
                         out.push(SimpleHit {
                             is_fw: f1.is_fw,
                             mate_is_fw: f2.is_fw,
