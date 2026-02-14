@@ -109,7 +109,7 @@ The full implementation plan with C++ → Rust type mappings, architectural note
 3. **Default mapping strategy**: `get_raw_hits_sketch` with PERMISSIVE mode, no structural constraints initially
 4. **C++ global mutable state → Rust struct fields**: `ref_shift`/`pos_mask` stored in `EntryEncoding`, passed by reference (not global)
 5. **sshash-rs const-generic K**: Use `dispatch_on_k!(k, K => { ... })` at mapping entry point
-6. **Succinct data structure crates**: `sux` (with epserde feature), `cseq`, NOT `sucds`
+6. **Succinct data structure crates**: `sux` 0.12 git main (with epserde feature), NOT `cseq` or `sucds`
 7. **Test data**: Pre-built C++ indices expected in `test_data/` directory
 8. **libradicl**: Use git dependency to `develop` branch for RAD comparison
 
@@ -125,8 +125,13 @@ use value_traits::slices::{SliceByValue, SliceByValueMut};
 use epserde::ser::Serialize;
 use epserde::deser::Deserialize;
 
-// CseqSequence size_bytes() requires:
-use dyn_size_of::GetSize;
+// Elias-Fano (sux-rs):
+use sux::dict::elias_fano::{EliasFanoBuilder, EfSeq, EfSeqDict};
+use sux::traits::{IndexedSeq, Succ};
+
+// mem_size() for sux-rs types (sux 0.12 / mem_dbg 0.4):
+use mem_dbg::{MemSize, SizeFlags};
+// ef.mem_size(SizeFlags::default())
 ```
 
 ## Project Structure

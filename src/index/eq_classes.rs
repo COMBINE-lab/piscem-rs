@@ -18,11 +18,12 @@
 //! This corresponds to the C++ `equivalence_class_map` class.
 
 use anyhow::{Context, Result, bail};
-use cseq::elias_fano::Sequence as CseqSequence;
-use dyn_size_of::GetSize;
 use epserde::deser::Deserialize;
 use epserde::ser::Serialize;
+use mem_dbg::{MemSize, SizeFlags};
 use sux::bits::bit_field_vec::BitFieldVec;
+use sux::dict::elias_fano::{EliasFanoBuilder, EfSeq};
+use sux::traits::IndexedSeq;
 use value_traits::slices::{SliceByValue, SliceByValueMut};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -177,7 +178,7 @@ pub struct EqClassMap {
     tile_ec_ids: BitFieldVec<usize>,
     /// Elias-Fano encoded cumulative offsets into `label_entries`.
     /// Length = num_ecs + 1.
-    label_list_offsets: CseqSequence,
+    label_list_offsets: EfSeq,
     /// Packed label entries: `(transcript_id << 2) | orientation_bits`.
     label_entries: BitFieldVec<usize>,
 }
@@ -209,9 +210,9 @@ impl EqClassMap {
     #[inline]
     pub fn entries_for_ec(&self, ec_id: u64) -> EcSpan<'_> {
         let start =
-            unsafe { self.label_list_offsets.get_unchecked(ec_id as usize) } as usize;
+            unsafe { self.label_list_offsets.get_unchecked(ec_id as usize) };
         let end =
-            unsafe { self.label_list_offsets.get_unchecked(ec_id as usize + 1) } as usize;
+            unsafe { self.label_list_offsets.get_unchecked(ec_id as usize + 1) };
         EcSpan {
             entries: &self.label_entries,
             start,
@@ -231,7 +232,7 @@ impl EqClassMap {
     pub fn size_bytes(&self) -> usize {
         let tile_bits = self.tile_ec_ids.len() * self.tile_ec_ids.bit_width();
         let tile_bytes = tile_bits.div_ceil(8);
-        let ef_bytes = self.label_list_offsets.size_bytes();
+        let ef_bytes = self.label_list_offsets.mem_size(SizeFlags::default());
         let label_bits = self.label_entries.len() * self.label_entries.bit_width();
         let label_bytes = label_bits.div_ceil(8);
         tile_bytes + ef_bytes + label_bytes + std::mem::size_of::<Self>()
@@ -245,9 +246,9 @@ impl EqClassMap {
     ///
     /// Format:
     /// ```text
-    /// [magic: 8 bytes "PECTB01\0"]
+    /// [magic: 8 bytes "PECTB02\0"]
     /// [tile_ec_ids: epserde BitFieldVec binary]
-    /// [label_list_offsets: cseq EF binary]
+    /// [label_list_offsets: epserde EfSeq binary]
     /// [label_entries: epserde BitFieldVec binary]
     /// ```
     pub fn save<W: Write>(&self, writer: &mut W) -> Result<()> {
@@ -258,9 +259,12 @@ impl EqClassMap {
                 .map_err(std::io::Error::other)
                 .context("failed to serialize tile_ec_ids")?;
         }
-        self.label_list_offsets
-            .write(writer)
-            .context("failed to serialize label_list_offsets")?;
+        unsafe {
+            self.label_list_offsets
+                .serialize(writer)
+                .map_err(std::io::Error::other)
+                .context("failed to serialize label_list_offsets")?;
+        }
         unsafe {
             self.label_entries
                 .serialize(writer)
@@ -290,8 +294,11 @@ impl EqClassMap {
                 .context("failed to deserialize tile_ec_ids")?
         };
 
-        let label_list_offsets =
-            CseqSequence::read(reader).context("failed to deserialize label_list_offsets")?;
+        let label_list_offsets = unsafe {
+            EfSeq::deserialize_full(reader)
+                .map_err(std::io::Error::other)
+                .context("failed to deserialize label_list_offsets")?
+        };
 
         let label_entries = unsafe {
             BitFieldVec::deserialize_full(reader)
@@ -307,7 +314,7 @@ impl EqClassMap {
     }
 }
 
-const EC_TABLE_MAGIC: &[u8; 8] = b"PECTB01\0";
+const EC_TABLE_MAGIC: &[u8; 8] = b"PECTB02\0";
 
 impl std::fmt::Debug for EqClassMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -407,7 +414,13 @@ impl EqClassMapBuilder {
             offsets.push(cumulative);
         }
 
-        let label_list_offsets = CseqSequence::with_items_from_slice(&offsets);
+        let ef_n = offsets.len();
+        let ef_u = if ef_n > 0 { offsets[ef_n - 1] as usize + 1 } else { 1 };
+        let mut ef_builder = EliasFanoBuilder::new(ef_n, ef_u);
+        for &v in &offsets {
+            ef_builder.push(v as usize);
+        }
+        let label_list_offsets = ef_builder.build_with_seq();
 
         EqClassMap {
             tile_ec_ids,

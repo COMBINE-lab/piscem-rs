@@ -69,8 +69,10 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
     // Load index
     let index_prefix = Path::new(&args.index);
     info!("Loading index from {}", index_prefix.display());
+    let load_start = Instant::now();
     let index = ReferenceIndex::load(index_prefix, true, !args.no_poison)?;
-    info!("Index loaded: k={}, {} refs", index.k(), index.num_refs());
+    let load_secs = load_start.elapsed().as_secs_f64();
+    info!("Index loaded: k={}, {} refs ({:.2}s)", index.k(), index.num_refs(), load_secs);
 
     // Create output directory and RAD file
     let out_dir = PathBuf::from(&args.output);
@@ -136,8 +138,9 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
     let elapsed = start.elapsed().as_secs_f64();
     let (num_reads, num_mapped, num_poisoned) = stats.summary();
 
+    let mapping_secs = elapsed - load_secs;
     info!(
-        "Mapped {}/{} reads ({:.1}%), {} poisoned, {:.1}s",
+        "Mapped {}/{} reads ({:.1}%), {} poisoned, {:.2}s total ({:.2}s index load + {:.2}s mapping)",
         num_mapped,
         num_reads,
         if num_reads > 0 {
@@ -147,6 +150,8 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
         },
         num_poisoned,
         elapsed,
+        load_secs,
+        mapping_secs,
     );
 
     // Write map_info.json

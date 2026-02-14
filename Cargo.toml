@@ -30,11 +30,10 @@ paraseq = "0.4"
 niffler = "2"
 
 # Succinct data structures (same versions as sshash-rs)
-sux = { version = "0.11", features = ["epserde"] }
-cseq = "0.1"
-epserde = "0.11"
+sux = { git = "https://github.com/vigna/sux-rs", features = ["epserde"] }
+epserde = "0.12"
 value-traits = "0.2"
-dyn_size_of = "0.4"
+mem_dbg = "0.4.0"
 
 # RAD file parsing — optional, enabled by parity-test feature
 libradicl = { git = "https://github.com/COMBINE-lab/libradicl.git", branch = "develop", optional = true }

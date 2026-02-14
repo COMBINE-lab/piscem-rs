@@ -13,16 +13,17 @@
 //! - **reference_id** (bits ref_len_bits+1..): which reference transcript
 //!
 //! The posting lists are stored in a compact bit-packed vector (`BitFieldVec`)
-//! with boundaries encoded as a monotone Elias-Fano sequence (`cseq::Sequence`).
+//! with boundaries encoded as a monotone Elias-Fano sequence (sux-rs `EfSeq`).
 //!
 //! This corresponds to the C++ `basic_contig_table` class.
 
 use anyhow::{Context, Result, bail};
-use cseq::elias_fano::Sequence as CseqSequence;
-use dyn_size_of::GetSize;
 use epserde::deser::Deserialize;
 use epserde::ser::Serialize;
+use mem_dbg::{MemSize, SizeFlags};
 use sux::bits::bit_field_vec::BitFieldVec;
+use sux::dict::elias_fano::{EliasFanoBuilder, EfSeq};
+use sux::traits::IndexedSeq;
 use value_traits::slices::SliceByValue;
 use value_traits::slices::SliceByValueMut;
 use std::io::{Read, Write};
@@ -208,7 +209,7 @@ pub struct ContigTable {
     /// Elias-Fano encoded cumulative offsets into `ctg_entries`.
     /// Length = num_contigs + 1. The entries for contig `i` span
     /// `[ctg_offsets[i], ctg_offsets[i+1])`.
-    ctg_offsets: CseqSequence,
+    ctg_offsets: EfSeq,
     /// Bit-packed entry vector. Each entry is `ref_len_bits + num_ref_bits + 1` bits.
     ctg_entries: BitFieldVec<usize>,
 }
@@ -246,8 +247,8 @@ impl ContigTable {
     /// Use `EntryEncoding` to decode each entry.
     #[inline]
     pub fn contig_entries(&self, contig_id: u64) -> ContigSpan<'_> {
-        let start = unsafe { self.ctg_offsets.get_unchecked(contig_id as usize) } as usize;
-        let end = unsafe { self.ctg_offsets.get_unchecked(contig_id as usize + 1) } as usize;
+        let start = unsafe { self.ctg_offsets.get_unchecked(contig_id as usize) };
+        let end = unsafe { self.ctg_offsets.get_unchecked(contig_id as usize + 1) };
         ContigSpan {
             entries: &self.ctg_entries,
             start,
@@ -257,7 +258,7 @@ impl ContigTable {
 
     /// Approximate size in bytes of the in-memory representation.
     pub fn size_bytes(&self) -> usize {
-        let ef_bytes = self.ctg_offsets.size_bytes();
+        let ef_bytes = self.ctg_offsets.mem_size(SizeFlags::default());
         let entries_bits = self.ctg_entries.len() * self.ctg_entries.bit_width();
         let entries_bytes = entries_bits.div_ceil(8);
         ef_bytes + entries_bytes + std::mem::size_of::<Self>()
@@ -271,18 +272,22 @@ impl ContigTable {
     ///
     /// Format:
     /// ```text
-    /// [magic: 8 bytes "PCTAB01\0"]
+    /// [magic: 8 bytes "PCTAB02\0"]
     /// [ref_len_bits: u64 LE]
     /// [num_ref_bits: u64 LE]
-    /// [ctg_offsets: cseq EF binary]
+    /// [ctg_offsets: epserde EfSeq binary]
     /// [ctg_entries: epserde BitFieldVec binary]
     /// ```
     pub fn save<W: Write>(&self, writer: &mut W) -> Result<()> {
         writer.write_all(CONTIG_TABLE_MAGIC)?;
         writer.write_all(&self.ref_len_bits.to_le_bytes())?;
         writer.write_all(&self.num_ref_bits.to_le_bytes())?;
-        self.ctg_offsets.write(writer)
-            .context("failed to serialize contig offsets")?;
+        unsafe {
+            self.ctg_offsets
+                .serialize(writer)
+                .map_err(std::io::Error::other)
+                .context("failed to serialize contig offsets")?;
+        }
         unsafe {
             self.ctg_entries
                 .serialize(writer)
@@ -305,8 +310,11 @@ impl ContigTable {
         let ref_len_bits = read_u64_le(reader).context("failed to read ref_len_bits")?;
         let num_ref_bits = read_u64_le(reader).context("failed to read num_ref_bits")?;
 
-        let ctg_offsets = CseqSequence::read(reader)
-            .context("failed to deserialize contig offsets")?;
+        let ctg_offsets = unsafe {
+            EfSeq::deserialize_full(reader)
+                .map_err(std::io::Error::other)
+                .context("failed to deserialize contig offsets")?
+        };
 
         let ctg_entries = unsafe {
             BitFieldVec::deserialize_full(reader)
@@ -323,7 +331,7 @@ impl ContigTable {
     }
 }
 
-const CONTIG_TABLE_MAGIC: &[u8; 8] = b"PCTAB01\0";
+const CONTIG_TABLE_MAGIC: &[u8; 8] = b"PCTAB02\0";
 
 fn read_u64_le<R: Read>(reader: &mut R) -> std::io::Result<u64> {
     let mut buf = [0u8; 8];
@@ -406,7 +414,13 @@ impl ContigTableBuilder {
         }
 
         // Build Elias-Fano from offsets
-        let ctg_offsets = CseqSequence::with_items_from_slice(&offsets);
+        let n = offsets.len();
+        let u = if n > 0 { offsets[n - 1] as usize + 1 } else { 1 };
+        let mut ef_builder = EliasFanoBuilder::new(n, u);
+        for &v in &offsets {
+            ef_builder.push(v as usize);
+        }
+        let ctg_offsets = ef_builder.build_with_seq();
 
         // Build BitFieldVec with packed entries
         let entry_width = self.encoding.entry_width as usize;
