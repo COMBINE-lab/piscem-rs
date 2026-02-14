@@ -92,7 +92,7 @@ where
     /// checks the cache first. On a cache miss, performs a full lookup and
     /// caches the result for future threads.
     #[inline]
-    pub fn lookup_at(&mut self, kmer_str: &str, read_pos: i32) -> LookupResult {
+    pub fn lookup_at(&mut self, kmer_bytes: &[u8], read_pos: i32) -> LookupResult {
         // Auto-detect non-consecutive position and reset engine if needed.
         // This recovers the incremental k-mer update path for consecutive
         // lookups (stride=1) while correctly handling jumps.
@@ -105,19 +105,18 @@ where
         // Try cache if we're at a unitig boundary
         if self.cache_end {
             if let Some(cache) = self.cache {
-                if let Ok(kmer) = Kmer::<K>::from_str(kmer_str) {
-                    let canonical = kmer.canonical();
-                    let canonical_hash =
-                        CanonicalKmer::new(<Kmer<K> as KmerBits>::to_u64(canonical.bits()));
-                    let fw_is_canonical = kmer.bits() == canonical.bits();
+                let kmer = Kmer::<K>::from_ascii_unchecked(kmer_bytes);
+                let canonical = kmer.canonical();
+                let canonical_hash =
+                    CanonicalKmer::new(<Kmer<K> as KmerBits>::to_u64(canonical.bits()));
+                let fw_is_canonical = kmer.bits() == canonical.bits();
 
-                    if let Some(result) = cache.get(canonical_hash, fw_is_canonical) {
-                        self.num_cache_hits += 1;
-                        self.cache_end = false;
-                        // Reset engine state since we bypassed it
-                        self.engine.reset();
-                        return result;
-                    }
+                if let Some(result) = cache.get(canonical_hash, fw_is_canonical) {
+                    self.num_cache_hits += 1;
+                    self.cache_end = false;
+                    // Reset engine state since we bypassed it
+                    self.engine.reset();
+                    return result;
                 }
             }
         }
@@ -126,18 +125,17 @@ where
         self.cache_end = false;
 
         // Full lookup via streaming query engine
-        let result = self.engine.lookup(kmer_str);
+        let result = self.engine.lookup(kmer_bytes);
 
         // If the lookup succeeded and we were at a unitig boundary, cache it
         if was_cache_end && result.is_found() {
             if let Some(cache) = self.cache {
-                if let Ok(kmer) = Kmer::<K>::from_str(kmer_str) {
-                    let canonical = kmer.canonical();
-                    let canonical_hash =
-                        CanonicalKmer::new(<Kmer<K> as KmerBits>::to_u64(canonical.bits()));
-                    let fw_is_canonical = kmer.bits() == canonical.bits();
-                    cache.insert(canonical_hash, &result, fw_is_canonical);
-                }
+                let kmer = Kmer::<K>::from_ascii_unchecked(kmer_bytes);
+                let canonical = kmer.canonical();
+                let canonical_hash =
+                    CanonicalKmer::new(<Kmer<K> as KmerBits>::to_u64(canonical.bits()));
+                let fw_is_canonical = kmer.bits() == canonical.bits();
+                cache.insert(canonical_hash, &result, fw_is_canonical);
             }
         }
 
@@ -165,10 +163,10 @@ where
     /// This is a convenience method for callers that don't track read position.
     /// For optimal performance in the mapping pipeline, use `lookup_at()` instead.
     #[inline]
-    pub fn lookup(&mut self, kmer_str: &str) -> LookupResult {
+    pub fn lookup(&mut self, kmer_bytes: &[u8]) -> LookupResult {
         self.engine.reset();
         self.prev_query_pos = i32::MIN;
-        self.lookup_at(kmer_str, 0)
+        self.lookup_at(kmer_bytes, 0)
     }
 
     /// Number of full dictionary searches performed (expensive path).

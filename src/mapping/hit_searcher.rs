@@ -87,16 +87,17 @@ pub(crate) fn is_homopolymer(kmer: &[u8]) -> bool {
     kmer.iter().all(|&b| b == first)
 }
 
-/// Parse a read k-mer from a byte slice. Returns `None` if the slice contains
-/// invalid characters (should not happen if ReadKmerIter is used correctly).
+/// Parse a read k-mer from a byte slice.
+/// ReadKmerIter guarantees only valid uppercase DNA bases in the window.
 #[inline]
 fn parse_read_kmer<const K: usize>(bytes: &[u8]) -> Option<Kmer<K>>
 where
     Kmer<K>: KmerBits,
 {
-    // Safety: ReadKmerIter guarantees only valid DNA bases in the window.
-    let s = std::str::from_utf8(bytes).ok()?;
-    Kmer::<K>::from_str(s).ok()
+    if bytes.len() != K {
+        return None;
+    }
+    Some(Kmer::<K>::from_ascii_unchecked(bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -322,8 +323,7 @@ impl<'idx> HitSearcher<'idx> {
             let kmer_bytes = iter.kmer_bytes();
             let read_pos = iter.pos();
 
-            let kmer_str = unsafe { std::str::from_utf8_unchecked(kmer_bytes) };
-            let result = query.lookup_at(kmer_str, read_pos);
+            let result = query.lookup_at(kmer_bytes, read_pos);
 
             if let Some(phit) = index.resolve_lookup(&result) {
                 if !phit.is_empty() {
@@ -418,8 +418,7 @@ impl<'idx> HitSearcher<'idx> {
             // Query the index. Position tracking in PiscemStreamingQuery
             // auto-detects non-consecutive jumps and resets the engine,
             // while allowing the fast incremental path for stride-1 lookups.
-            let kmer_str = unsafe { std::str::from_utf8_unchecked(kmer_bytes) };
-            let result = query.lookup_at(kmer_str, read_pos);
+            let result = query.lookup_at(kmer_bytes, read_pos);
 
             if let Some(phit) = index.resolve_lookup(&result) {
                 if phit.is_empty() {
@@ -528,9 +527,7 @@ impl<'idx> HitSearcher<'idx> {
 
                     // --- Index query at target ---
                     let alt_kmer_bytes = iter.kmer_bytes();
-                    let alt_str =
-                        unsafe { std::str::from_utf8_unchecked(alt_kmer_bytes) };
-                    let alt_result = query.lookup_at(alt_str, iter.pos());
+                    let alt_result = query.lookup_at(alt_kmer_bytes, iter.pos());
                     let alt_phit = index.resolve_lookup(&alt_result);
                     let alt_found = alt_phit
                         .as_ref()
@@ -566,9 +563,7 @@ impl<'idx> HitSearcher<'idx> {
 
                         if !mid_iter.is_exhausted() {
                             let mid_bytes = mid_iter.kmer_bytes();
-                            let mid_str =
-                                unsafe { std::str::from_utf8_unchecked(mid_bytes) };
-                            let mid_result = query.lookup_at(mid_str, mid_iter.pos());
+                            let mid_result = query.lookup_at(mid_bytes, mid_iter.pos());
                             if let Some(mid_phit) =
                                 index.resolve_lookup(&mid_result)
                             {
@@ -677,8 +672,7 @@ impl<'idx> HitSearcher<'idx> {
 
             // Position tracking in PiscemStreamingQuery auto-detects jumps
             // (e.g., after SPSS-based contig walks) and resets the engine.
-            let kmer_str = unsafe { std::str::from_utf8_unchecked(kmer_bytes) };
-            let result = query.lookup_at(kmer_str, iter.pos());
+            let result = query.lookup_at(kmer_bytes, iter.pos());
 
             if let Some(phit_info) = index.resolve_lookup(&result) {
                 if phit_info.is_empty() {

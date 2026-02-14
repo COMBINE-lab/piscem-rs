@@ -64,13 +64,13 @@ piscem-rs is validated against C++ piscem using record-level RAD output comparis
 
 ## Performance
 
-Single-threaded mapping performance on 1M paired-end reads (gencode v44, Apple Silicon):
+Mapping performance on 1M paired-end reads (gencode v44, Apple Silicon M2 Max):
 
 | Threads | C++ | Rust | Ratio |
 |--------:|----:|-----:|------:|
-| 1 | 13.9s | 14.7s | 1.06x |
-| 4 | 3.8s | 3.7s | 0.98x |
-| 8 | 3.3s | 3.1s | 0.94x |
+| 1 | 13.7s | 12.5s | 0.91x |
+| 4 | 3.9s | 3.2s | 0.83x |
+| 8 | 3.3s | 3.1s | 0.92x |
 
 ## Architecture
 

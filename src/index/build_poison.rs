@@ -199,9 +199,7 @@ fn scan_sequence_for_poison<'a, const K: usize>(
             let read_pos = i + 1 - k;
             let canonical = CanonicalKmer::new(fw_kmer.min(rc_kmer));
 
-            // Get string slice for streaming query lookup
-            let kmer_str = std::str::from_utf8(&seq[read_pos..read_pos + k]).unwrap();
-            let result = query.lookup_at(kmer_str, read_pos as i32);
+            let result = query.lookup_at(&seq[read_pos..read_pos + k], read_pos as i32);
             let phits = index.resolve_lookup(&result);
 
             state.inspect_and_update(canonical, phits, k32, occs);
@@ -329,16 +327,16 @@ where
     let mut checked = 0usize;
 
     for &kmer in table.keys() {
-        // Convert packed canonical k-mer to a string
+        // Convert packed canonical k-mer to bytes
         let raw = kmer.as_u64();
-        let mut s = String::with_capacity(k);
+        let mut s: Vec<u8> = Vec::with_capacity(k);
         for i in (0..k).rev() {
             let bits = (raw >> (2 * i)) & 3;
             s.push(match bits {
-                0 => 'A',
-                1 => 'C',
-                2 => 'G',
-                3 => 'T',
+                0 => b'A',
+                1 => b'C',
+                2 => b'G',
+                3 => b'T',
                 _ => unreachable!(),
             });
         }
@@ -353,7 +351,7 @@ where
             if found_in_dict <= 10 {
                 info!(
                     "WARNING: poison k-mer {} (canonical={}) FOUND in dictionary!",
-                    s, raw,
+                    std::str::from_utf8(&s).unwrap_or("???"), raw,
                 );
             }
         }

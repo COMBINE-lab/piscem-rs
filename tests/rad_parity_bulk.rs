@@ -569,7 +569,7 @@ fn kmer_dump_inner<const K: usize>(
             let kmer_str = std::str::from_utf8(kmer_bytes).unwrap();
 
             // Streaming lookup (the normal path)
-            let result = query.lookup(kmer_str);
+            let result = query.lookup(kmer_bytes);
             let streaming_found = result.is_found();
 
             // Non-streaming (direct) lookup — bypasses state machine
