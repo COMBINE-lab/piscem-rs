@@ -18,6 +18,8 @@ use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
 use tracing::info;
 
+use crate::mapping::kmer_value::CanonicalKmer;
+
 // ---------------------------------------------------------------------------
 // Fixed hash state for deterministic AHashMap
 // ---------------------------------------------------------------------------
@@ -34,7 +36,7 @@ fn fixed_hash_state() -> RandomState {
 }
 
 /// Type alias for the poison k-mer hash map.
-type PoisonMap = HashMap<u64, u64, RandomState>;
+type PoisonMap = HashMap<CanonicalKmer, u64, RandomState>;
 
 // ---------------------------------------------------------------------------
 // Occurrence types
@@ -56,7 +58,7 @@ pub struct PoisonOcc {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LabeledPoisonOcc {
     /// The canonical form of the poison k-mer.
-    pub canonical_kmer: u64,
+    pub canonical_kmer: CanonicalKmer,
     /// Unitig (contig) where this poison k-mer occurs.
     pub unitig_id: u32,
     /// Position within the unitig.
@@ -209,13 +211,13 @@ impl PoisonTable {
 
     /// Returns `true` if `km` is a poison k-mer.
     #[inline]
-    pub fn key_exists(&self, km: u64) -> bool {
+    pub fn key_exists(&self, km: CanonicalKmer) -> bool {
         self.poison_map.contains_key(&km)
     }
 
     /// Returns `true` if poison k-mer `km` occurs on unitig `unitig_id`.
     #[inline]
-    pub fn key_occurs_in_unitig(&self, km: u64, unitig_id: u32) -> bool {
+    pub fn key_occurs_in_unitig(&self, km: CanonicalKmer, unitig_id: u32) -> bool {
         if let Some(&idx) = self.poison_map.get(&km) {
             let start = self.offsets[idx as usize] as usize;
             let end = self.offsets[idx as usize + 1] as usize;
@@ -232,7 +234,7 @@ impl PoisonTable {
     #[inline]
     pub fn key_occurs_in_unitig_between(
         &self,
-        km: u64,
+        km: CanonicalKmer,
         unitig_id: u32,
         lb: u32,
         ub: u32,
@@ -246,6 +248,11 @@ impl PoisonTable {
         } else {
             false
         }
+    }
+
+    /// Iterator over all canonical k-mer keys in the poison table.
+    pub fn keys(&self) -> impl Iterator<Item = &CanonicalKmer> {
+        self.poison_map.keys()
     }
 
     /// Maximum number of occurrences for any single poison k-mer.
@@ -299,10 +306,10 @@ impl PoisonTable {
         }
 
         // Hash map entries (sorted by key for deterministic output)
-        let mut entries: Vec<(&u64, &u64)> = self.poison_map.iter().collect();
+        let mut entries: Vec<(&CanonicalKmer, &u64)> = self.poison_map.iter().collect();
         entries.sort_unstable_by_key(|&(k, _)| *k);
         for (&kmer, &idx) in entries {
-            w.write_all(&kmer.to_le_bytes())?;
+            w.write_all(&kmer.as_u64().to_le_bytes())?;
             w.write_all(&idx.to_le_bytes())?;
         }
 
@@ -350,7 +357,7 @@ impl PoisonTable {
         let mut poison_map: PoisonMap =
             HashMap::with_capacity_and_hasher(num_kmers, fixed_hash_state());
         for _ in 0..num_kmers {
-            let kmer = read_u64_le(&mut r)?;
+            let kmer = CanonicalKmer::new(read_u64_le(&mut r)?);
             let idx = read_u64_le(&mut r)?;
             poison_map.insert(kmer, idx);
         }
@@ -413,34 +420,34 @@ mod tests {
         vec![
             // K-mer 100: occurs on unitig 0 at pos 5, unitig 1 at pos 10
             LabeledPoisonOcc {
-                canonical_kmer: 100,
+                canonical_kmer: CanonicalKmer::new(100),
                 unitig_id: 0,
                 unitig_pos: 5,
             },
             LabeledPoisonOcc {
-                canonical_kmer: 100,
+                canonical_kmer: CanonicalKmer::new(100),
                 unitig_id: 1,
                 unitig_pos: 10,
             },
             // K-mer 200: occurs on unitig 2 at pos 0
             LabeledPoisonOcc {
-                canonical_kmer: 200,
+                canonical_kmer: CanonicalKmer::new(200),
                 unitig_id: 2,
                 unitig_pos: 0,
             },
             // K-mer 300: occurs on unitig 0 at pos 20, pos 25, pos 30
             LabeledPoisonOcc {
-                canonical_kmer: 300,
+                canonical_kmer: CanonicalKmer::new(300),
                 unitig_id: 0,
                 unitig_pos: 20,
             },
             LabeledPoisonOcc {
-                canonical_kmer: 300,
+                canonical_kmer: CanonicalKmer::new(300),
                 unitig_id: 0,
                 unitig_pos: 25,
             },
             LabeledPoisonOcc {
-                canonical_kmer: 300,
+                canonical_kmer: CanonicalKmer::new(300),
                 unitig_id: 0,
                 unitig_pos: 30,
             },
@@ -462,12 +469,12 @@ mod tests {
         let mut occs = make_test_occs();
         // Add duplicates
         occs.push(LabeledPoisonOcc {
-            canonical_kmer: 100,
+            canonical_kmer: CanonicalKmer::new(100),
             unitig_id: 0,
             unitig_pos: 5,
         });
         occs.push(LabeledPoisonOcc {
-            canonical_kmer: 200,
+            canonical_kmer: CanonicalKmer::new(200),
             unitig_id: 2,
             unitig_pos: 0,
         });
@@ -483,11 +490,11 @@ mod tests {
     fn test_key_exists() {
         let table = PoisonTable::build_from_occs(make_test_occs()).unwrap();
 
-        assert!(table.key_exists(100));
-        assert!(table.key_exists(200));
-        assert!(table.key_exists(300));
-        assert!(!table.key_exists(999));
-        assert!(!table.key_exists(0));
+        assert!(table.key_exists(CanonicalKmer::new(100)));
+        assert!(table.key_exists(CanonicalKmer::new(200)));
+        assert!(table.key_exists(CanonicalKmer::new(300)));
+        assert!(!table.key_exists(CanonicalKmer::new(999)));
+        assert!(!table.key_exists(CanonicalKmer::new(0)));
     }
 
     #[test]
@@ -495,20 +502,20 @@ mod tests {
         let table = PoisonTable::build_from_occs(make_test_occs()).unwrap();
 
         // K-mer 100 occurs on unitigs 0 and 1
-        assert!(table.key_occurs_in_unitig(100, 0));
-        assert!(table.key_occurs_in_unitig(100, 1));
-        assert!(!table.key_occurs_in_unitig(100, 2));
+        assert!(table.key_occurs_in_unitig(CanonicalKmer::new(100), 0));
+        assert!(table.key_occurs_in_unitig(CanonicalKmer::new(100), 1));
+        assert!(!table.key_occurs_in_unitig(CanonicalKmer::new(100), 2));
 
         // K-mer 200 occurs only on unitig 2
-        assert!(!table.key_occurs_in_unitig(200, 0));
-        assert!(table.key_occurs_in_unitig(200, 2));
+        assert!(!table.key_occurs_in_unitig(CanonicalKmer::new(200), 0));
+        assert!(table.key_occurs_in_unitig(CanonicalKmer::new(200), 2));
 
         // K-mer 300 occurs only on unitig 0
-        assert!(table.key_occurs_in_unitig(300, 0));
-        assert!(!table.key_occurs_in_unitig(300, 1));
+        assert!(table.key_occurs_in_unitig(CanonicalKmer::new(300), 0));
+        assert!(!table.key_occurs_in_unitig(CanonicalKmer::new(300), 1));
 
         // Non-existent k-mer
-        assert!(!table.key_occurs_in_unitig(999, 0));
+        assert!(!table.key_occurs_in_unitig(CanonicalKmer::new(999), 0));
     }
 
     #[test]
@@ -516,19 +523,20 @@ mod tests {
         let table = PoisonTable::build_from_occs(make_test_occs()).unwrap();
 
         // K-mer 300 on unitig 0: positions 20, 25, 30
-        assert!(table.key_occurs_in_unitig_between(300, 0, 20, 30));
-        assert!(table.key_occurs_in_unitig_between(300, 0, 20, 20));
-        assert!(table.key_occurs_in_unitig_between(300, 0, 25, 25));
-        assert!(table.key_occurs_in_unitig_between(300, 0, 24, 26));
-        assert!(!table.key_occurs_in_unitig_between(300, 0, 21, 24));
-        assert!(!table.key_occurs_in_unitig_between(300, 0, 26, 29));
-        assert!(!table.key_occurs_in_unitig_between(300, 0, 31, 40));
+        let km300 = CanonicalKmer::new(300);
+        assert!(table.key_occurs_in_unitig_between(km300, 0, 20, 30));
+        assert!(table.key_occurs_in_unitig_between(km300, 0, 20, 20));
+        assert!(table.key_occurs_in_unitig_between(km300, 0, 25, 25));
+        assert!(table.key_occurs_in_unitig_between(km300, 0, 24, 26));
+        assert!(!table.key_occurs_in_unitig_between(km300, 0, 21, 24));
+        assert!(!table.key_occurs_in_unitig_between(km300, 0, 26, 29));
+        assert!(!table.key_occurs_in_unitig_between(km300, 0, 31, 40));
 
         // Wrong unitig
-        assert!(!table.key_occurs_in_unitig_between(300, 1, 20, 30));
+        assert!(!table.key_occurs_in_unitig_between(km300, 1, 20, 30));
 
         // Non-existent k-mer
-        assert!(!table.key_occurs_in_unitig_between(999, 0, 0, 100));
+        assert!(!table.key_occurs_in_unitig_between(CanonicalKmer::new(999), 0, 0, 100));
     }
 
     #[test]
@@ -539,9 +547,9 @@ mod tests {
         assert_eq!(table.num_poison_kmers(), 0);
         assert_eq!(table.num_poison_occs(), 0);
         assert_eq!(table.max_poison_occ(), 0);
-        assert!(!table.key_exists(42));
-        assert!(!table.key_occurs_in_unitig(42, 0));
-        assert!(!table.key_occurs_in_unitig_between(42, 0, 0, 100));
+        assert!(!table.key_exists(CanonicalKmer::new(42)));
+        assert!(!table.key_occurs_in_unitig(CanonicalKmer::new(42), 0));
+        assert!(!table.key_occurs_in_unitig_between(CanonicalKmer::new(42), 0, 0, 100));
     }
 
     #[test]
@@ -569,7 +577,8 @@ mod tests {
         assert_eq!(table2.max_poison_occ(), table.max_poison_occ());
 
         // Verify all queries produce the same results
-        for &km in &[100u64, 200, 300, 999] {
+        for &raw in &[100u64, 200, 300, 999] {
+            let km = CanonicalKmer::new(raw);
             assert_eq!(table2.key_exists(km), table.key_exists(km));
             for uid in 0..3 {
                 assert_eq!(
@@ -580,8 +589,9 @@ mod tests {
         }
 
         // Verify specific positional queries
-        assert!(table2.key_occurs_in_unitig_between(300, 0, 20, 30));
-        assert!(!table2.key_occurs_in_unitig_between(300, 0, 21, 24));
+        let km300 = CanonicalKmer::new(300);
+        assert!(table2.key_occurs_in_unitig_between(km300, 0, 20, 30));
+        assert!(!table2.key_occurs_in_unitig_between(km300, 0, 21, 24));
     }
 
     #[test]
@@ -621,7 +631,7 @@ mod tests {
     #[test]
     fn test_single_kmer_single_occ() {
         let occs = vec![LabeledPoisonOcc {
-            canonical_kmer: 42,
+            canonical_kmer: CanonicalKmer::new(42),
             unitig_id: 7,
             unitig_pos: 15,
         }];
@@ -630,10 +640,11 @@ mod tests {
 
         assert_eq!(table.num_poison_kmers(), 1);
         assert_eq!(table.num_poison_occs(), 1);
-        assert!(table.key_exists(42));
-        assert!(table.key_occurs_in_unitig(42, 7));
-        assert!(table.key_occurs_in_unitig_between(42, 7, 15, 15));
-        assert!(!table.key_occurs_in_unitig_between(42, 7, 0, 14));
+        let km42 = CanonicalKmer::new(42);
+        assert!(table.key_exists(km42));
+        assert!(table.key_occurs_in_unitig(km42, 7));
+        assert!(table.key_occurs_in_unitig_between(km42, 7, 15, 15));
+        assert!(!table.key_occurs_in_unitig_between(km42, 7, 0, 14));
     }
 
     #[test]
@@ -641,22 +652,22 @@ mod tests {
         // Input in reverse order — should still work after sorting
         let occs = vec![
             LabeledPoisonOcc {
-                canonical_kmer: 300,
+                canonical_kmer: CanonicalKmer::new(300),
                 unitig_id: 0,
                 unitig_pos: 30,
             },
             LabeledPoisonOcc {
-                canonical_kmer: 100,
+                canonical_kmer: CanonicalKmer::new(100),
                 unitig_id: 1,
                 unitig_pos: 10,
             },
             LabeledPoisonOcc {
-                canonical_kmer: 200,
+                canonical_kmer: CanonicalKmer::new(200),
                 unitig_id: 2,
                 unitig_pos: 0,
             },
             LabeledPoisonOcc {
-                canonical_kmer: 100,
+                canonical_kmer: CanonicalKmer::new(100),
                 unitig_id: 0,
                 unitig_pos: 5,
             },
@@ -666,9 +677,9 @@ mod tests {
 
         assert_eq!(table.num_poison_kmers(), 3);
         assert_eq!(table.num_poison_occs(), 4);
-        assert!(table.key_occurs_in_unitig(100, 0));
-        assert!(table.key_occurs_in_unitig(100, 1));
-        assert!(table.key_occurs_in_unitig(200, 2));
-        assert!(table.key_occurs_in_unitig(300, 0));
+        assert!(table.key_occurs_in_unitig(CanonicalKmer::new(100), 0));
+        assert!(table.key_occurs_in_unitig(CanonicalKmer::new(100), 1));
+        assert!(table.key_occurs_in_unitig(CanonicalKmer::new(200), 2));
+        assert!(table.key_occurs_in_unitig(CanonicalKmer::new(300), 0));
     }
 }

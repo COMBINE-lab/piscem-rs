@@ -35,6 +35,11 @@ const CPP_BULK_BIN: &str = "piscem-cpp/build/pesc-bulk";
 const CPP_BUILD_BIN: &str = "piscem-cpp/build/build";
 const CPP_INDEX_DIR: &str = "test_data/gencode_pc_v44_index_cpp_from_dbg";
 
+// C++ index that already has a poison table (must be built on same architecture)
+const CPP_INDEX_WITH_POISON_PREFIX: &str =
+    "test_data/gencode_pc_v44_index_cpp_from_dbg/gencode_pc_v44_index";
+const DECOY_FASTA: &str = "test_data/GRCh38.primary_assembly.genome.fa.gz";
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -860,5 +865,208 @@ fn dump_rad_records() {
             (None, Some(rb)) => eprintln!("Record {}: Only in Rust: {}", i, rb),
             (None, None) => {}
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Poison table parity
+// ---------------------------------------------------------------------------
+
+/// Build the Rust poison table if it doesn't already exist.
+fn ensure_rust_poison_table() -> Result<()> {
+    let marker = PathBuf::from(RUST_INDEX_PREFIX).with_extension("poison");
+    if marker.exists() {
+        eprintln!("Rust poison table already exists at {}", marker.display());
+        return Ok(());
+    }
+
+    eprintln!("Building Rust poison table...");
+    let bin = if PathBuf::from("target/release/piscem-rs").exists() {
+        PathBuf::from("target/release/piscem-rs")
+    } else {
+        PathBuf::from("target/debug/piscem-rs")
+    };
+
+    let status = Command::new(&bin)
+        .arg("build-poison")
+        .arg("-i").arg(RUST_INDEX_PREFIX)
+        .arg("-d").arg(DECOY_FASTA)
+        .arg("-t").arg("4")
+        .status()
+        .context("failed to run Rust poison table builder")?;
+    if !status.success() {
+        anyhow::bail!("Rust poison table builder exited with status: {}", status);
+    }
+    eprintln!("Rust poison table built successfully.");
+    Ok(())
+}
+
+/// Full bulk PE RAD parity test **with poison filtering**.
+///
+/// Run with:
+///   cargo test --features parity-test --release --test rad_parity_bulk -- bulk_pe_rad_parity_with_poison --ignored --nocapture
+#[test]
+#[ignore]
+fn bulk_pe_rad_parity_with_poison() {
+    // Check prerequisites
+    if !Path::new(READ1).exists() {
+        eprintln!("SKIP: {} not found", READ1);
+        return;
+    }
+    if !Path::new(CPP_BULK_BIN).exists() {
+        eprintln!("SKIP: C++ binary not found at {}", CPP_BULK_BIN);
+        return;
+    }
+    if !Path::new(DECOY_FASTA).exists() {
+        eprintln!("SKIP: decoy FASTA not found at {}", DECOY_FASTA);
+        return;
+    }
+    if !Path::new(&format!("{CPP_INDEX_WITH_POISON_PREFIX}.sshash")).exists() {
+        eprintln!("SKIP: C++ index with poison not found at {}", CPP_INDEX_WITH_POISON_PREFIX);
+        return;
+    }
+    if !Path::new(&format!("{CFISH_PREFIX}.cf_seg")).exists() {
+        eprintln!("SKIP: cuttlefish output not found at {}", CFISH_PREFIX);
+        return;
+    }
+
+    // 1. Build indices if needed
+    ensure_rust_index().expect("failed to build Rust index");
+    ensure_rust_poison_table().expect("failed to build Rust poison table");
+
+    // 2. Compare poison table stats
+    let cpp_stats_path = format!("{CPP_INDEX_WITH_POISON_PREFIX}.poison.json");
+    let rust_stats_path = format!("{RUST_INDEX_PREFIX}.poison.json");
+
+    if Path::new(&cpp_stats_path).exists() && Path::new(&rust_stats_path).exists() {
+        let cpp_json: serde_json::Value = serde_json::from_reader(
+            std::fs::File::open(&cpp_stats_path).unwrap()
+        ).unwrap();
+        let rust_json: serde_json::Value = serde_json::from_reader(
+            std::fs::File::open(&rust_stats_path).unwrap()
+        ).unwrap();
+
+        let cpp_nk = cpp_json["num_poison_kmers"].as_u64().unwrap_or(0);
+        let cpp_no = cpp_json["num_poison_occs"].as_u64().unwrap_or(0);
+        let rust_nk = rust_json["num_poison_kmers"].as_u64().unwrap_or(0);
+        let rust_no = rust_json["num_poison_occs"].as_u64().unwrap_or(0);
+
+        eprintln!("Poison table comparison:");
+        eprintln!("  C++:  {} k-mers, {} occs", cpp_nk, cpp_no);
+        eprintln!("  Rust: {} k-mers, {} occs", rust_nk, rust_no);
+
+        // Allow some tolerance since the Rust and C++ dictionaries
+        // may differ slightly in what k-mers they contain
+        let kmer_ratio = rust_nk as f64 / cpp_nk.max(1) as f64;
+        let occ_ratio = rust_no as f64 / cpp_no.max(1) as f64;
+        eprintln!("  K-mer ratio: {:.4}", kmer_ratio);
+        eprintln!("  Occ ratio:   {:.4}", occ_ratio);
+
+        assert!(
+            kmer_ratio > 0.90 && kmer_ratio < 1.10,
+            "Poison k-mer count differs by more than 10%: C++={}, Rust={}",
+            cpp_nk, rust_nk,
+        );
+    }
+
+    // 3. Create temp directories
+    let tmpdir = tempfile::tempdir().expect("failed to create tempdir");
+    let cpp_out_stem = tmpdir.path().join("cpp_out");
+    let rust_out_dir = tmpdir.path().join("rust_out");
+    std::fs::create_dir_all(&rust_out_dir).unwrap();
+
+    // 4. Run both mappers WITH poison (not passing --no-poison)
+    run_cpp_bulk_with_poison_index(&cpp_out_stem, 1)
+        .expect("C++ mapper with poison failed");
+    run_rust_bulk(&rust_out_dir, RUST_INDEX_PREFIX, 1, false)
+        .expect("Rust mapper with poison failed");
+
+    // 5. Compare RAD files
+    let cpp_rad = cpp_out_stem.with_extension("rad");
+    let rust_rad = rust_out_dir.join("map.rad");
+
+    assert!(cpp_rad.exists(), "C++ RAD file not found: {}", cpp_rad.display());
+    assert!(rust_rad.exists(), "Rust RAD file not found: {}", rust_rad.display());
+
+    eprintln!("Comparing RAD files (with poison filtering)...");
+    let result = compare_bulk_rad_full(&cpp_rad, &rust_rad)
+        .expect("failed to compare RAD files");
+
+    eprintln!("Poison comparison result:");
+    eprintln!("  Header match: {}", result.header_match);
+    eprintln!("  Records A (C++): {}", result.total_records_a);
+    eprintln!("  Records B (Rust): {}", result.total_records_b);
+    eprintln!("  Matching: {}", result.matching_records);
+    eprintln!("  Missing in A: {}", result.missing_in_a);
+    eprintln!("  Missing in B: {}", result.missing_in_b);
+    eprintln!("  Mismatch categories:");
+    eprintln!("    Same targets, diff detail: {}", result.same_targets_diff_detail);
+    eprintln!("    Different targets: {}", result.different_targets);
+    eprintln!("    Diff position only: {}", result.diff_pos_only);
+    eprintln!("    Diff frag_len only: {}", result.diff_frag_len_only);
+    eprintln!("    Diff num alignments: {}", result.diff_num_alns);
+    eprintln!("  Notes: {}", result.notes);
+    if !result.first_mismatches.is_empty() {
+        eprintln!("  First mismatches:");
+        for m in &result.first_mismatches {
+            eprintln!("    {}", m);
+        }
+    }
+
+    assert!(
+        result.header_match,
+        "RAD headers differ between C++ and Rust: {}",
+        result.notes,
+    );
+
+    let match_rate = if result.total_records_a > 0 {
+        result.matching_records as f64 / result.total_records_a as f64 * 100.0
+    } else {
+        0.0
+    };
+    eprintln!("  Record match rate: {:.2}% ({}/{})",
+        match_rate, result.matching_records, result.total_records_a);
+
+    // Poison filtering may cause more divergence since the poison tables
+    // themselves may differ slightly. Accept a somewhat lower threshold.
+    assert!(
+        match_rate > 70.0,
+        "Record-level match rate too low with poison ({:.2}%): {}",
+        match_rate,
+        result.notes,
+    );
+}
+
+/// Run the C++ bulk mapper using the pre-built C++ index with poison.
+fn run_cpp_bulk_with_poison_index(
+    output_stem: &Path,
+    threads: usize,
+) -> Result<()> {
+    let mut cmd = Command::new(CPP_BULK_BIN);
+    cmd.arg("-i").arg(CPP_INDEX_WITH_POISON_PREFIX)
+        .arg("-o").arg(output_stem)
+        .arg("-t").arg(threads.to_string())
+        .arg("-1").arg(READ1)
+        .arg("-2").arg(READ2)
+        .arg("--quiet");
+    // Note: NOT passing --no-poison
+    eprintln!("Running C++ mapper with poison: {:?}", cmd);
+    let status = cmd.status().context("failed to run C++ bulk mapper")?;
+    if !status.success() {
+        anyhow::bail!("C++ bulk mapper exited with status: {}", status);
+    }
+    Ok(())
+}
+
+#[test]
+fn resolve_refs() {
+    use std::io::BufReader;
+    use libradicl::header::RadPrelude;
+    let f = std::fs::File::open("/tmp/cpp_poison_new.rad").unwrap();
+    let mut r = BufReader::new(f);
+    let prelude = RadPrelude::from_bytes(&mut r).unwrap();
+    eprintln!("Total refs: {}", prelude.hdr.ref_names.len());
+    for id in [4453usize, 4454, 4455, 4456, 4458, 4471, 4473] {
+        eprintln!("ref[{}] = {}", id, prelude.hdr.ref_names[id]);
     }
 }

@@ -9,6 +9,7 @@
 use sshash_lib::streaming_query::StreamingQueryEngine;
 use sshash_lib::{Dictionary, Kmer, KmerBits, LookupResult};
 
+use crate::mapping::kmer_value::CanonicalKmer;
 use crate::mapping::unitig_end_cache::UnitigEndCache;
 
 /// Streaming k-mer query engine for the piscem mapping pipeline.
@@ -107,7 +108,7 @@ where
                 if let Ok(kmer) = Kmer::<K>::from_str(kmer_str) {
                     let canonical = kmer.canonical();
                     let canonical_hash =
-                        <Kmer<K> as KmerBits>::to_u64(canonical.bits());
+                        CanonicalKmer::new(<Kmer<K> as KmerBits>::to_u64(canonical.bits()));
                     let fw_is_canonical = kmer.bits() == canonical.bits();
 
                     if let Some(result) = cache.get(canonical_hash, fw_is_canonical) {
@@ -133,7 +134,7 @@ where
                 if let Ok(kmer) = Kmer::<K>::from_str(kmer_str) {
                     let canonical = kmer.canonical();
                     let canonical_hash =
-                        <Kmer<K> as KmerBits>::to_u64(canonical.bits());
+                        CanonicalKmer::new(<Kmer<K> as KmerBits>::to_u64(canonical.bits()));
                     let fw_is_canonical = kmer.bits() == canonical.bits();
                     cache.insert(canonical_hash, &result, fw_is_canonical);
                 }

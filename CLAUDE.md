@@ -63,6 +63,17 @@ The full implementation plan with C++ → Rust type mappings, architectural note
   - `tests/parity_smoke.rs` — REWRITTEN: RAD header roundtrip tests (bulk, SC, ATAC) + ignored integration test
   - New dep: `dashmap = "6"`
 
+- **Phase 7: Poison Table Builder + CanonicalKmer** — `build-poison` CLI command, CanonicalKmer strong type, parity test with poison filtering.
+  - `src/mapping/kmer_value.rs` — `CanonicalKmer` newtype wrapping `u64`, with upgrade path docs for k > 31
+  - `src/index/build_poison.rs` — Edge-method poison table builder: FASTA scanning with crossbeam threading, `PoisonKmerState` state machine, `scan_sequence_for_poison()` per-sequence scanner
+  - `src/cli/poison.rs` — REWRITTEN: Full `build-poison` CLI with dispatch_on_k, index loading, table save
+  - `src/index/poison_table.rs` — Updated: `PoisonMap` key and `LabeledPoisonOcc::canonical_kmer` changed from `u64` to `CanonicalKmer`
+  - `src/mapping/filters.rs` — Updated: `CanonicalKmerIter` yields `CanonicalKmer`, made `pub(crate)`
+  - `src/mapping/unitig_end_cache.rs` — Updated: `DashMap<CanonicalKmer, CachedLookup>`
+  - `src/mapping/streaming_query.rs` — Updated: cache key uses `CanonicalKmer`
+  - `tests/rad_parity_bulk.rs` — Added: `bulk_pe_rad_parity_with_poison` test (99.68% match rate)
+  - Poison table parity: C++ 3,764,601 k-mers / Rust 3,764,549 k-mers (~99.999%)
+
 ### Next Up
 
 - Performance benchmarking and optimization
@@ -108,21 +119,24 @@ piscem-rs/
     lib.rs                      # Modules: cli, index, io, mapping, verify
     main.rs                     # Entry point
     index/
-      mod.rs                    # build, contig_table, eq_classes, poison_table, formats, reference_index, refinfo
+      mod.rs                    # build, build_poison, contig_table, eq_classes, poison_table, formats, reference_index, refinfo
       build.rs                  # DONE — End-to-end index build pipeline from cuttlefish output
+      build_poison.rs           # DONE — Edge-method poison table builder from decoy FASTA
       contig_table.rs           # DONE — EF offsets + BitFieldVec entries
       refinfo.rs                # DONE — reference names and lengths
       reference_index.rs        # DONE — assembles Dictionary + ContigTable + RefInfo
       eq_classes.rs             # DONE — EC map: tile → EC → (transcript_id, orientation)
-      poison_table.rs           # DONE — Poison k-mer table with AHashMap, build_from_occs, queries
+      poison_table.rs           # DONE — Poison k-mer table with AHashMap<CanonicalKmer, u64>, build_from_occs, queries
       formats.rs                # ArtifactFormat enum
     cli/
       build.rs                  # DONE — Index build CLI
+      poison.rs                 # DONE — build-poison CLI (decoy scanning + save)
       map_bulk.rs               # DONE — Bulk mapping CLI (SE + PE)
       map_scrna.rs              # DONE — scRNA mapping CLI (Chromium protocols, --with-position)
       map_scatac.rs             # DONE — scATAC mapping CLI (overlap detection, Tn5 shift, binning)
     mapping/
-      unitig_end_cache.rs       # DONE — UnitigEndCache with DashMap, orientation-aware
+      kmer_value.rs             # DONE — CanonicalKmer newtype (u64-backed, upgrade path for k>31)
+      unitig_end_cache.rs       # DONE — UnitigEndCache with DashMap<CanonicalKmer>, orientation-aware
       hit_searcher.rs           # DONE — HitSearcher, ReadKmerIter, PERMISSIVE/STRICT modes
       projected_hits.rs         # DONE — RefPos, ProjectedHits<'a>, decode_hit()
       streaming_query.rs        # DONE — PiscemStreamingQuery<'a, K> wrapper + unitig-end cache integration
@@ -165,7 +179,7 @@ piscem-rs/
 ## Running Tests
 
 ```bash
-cargo test              # All 173 tests should pass (2 ignored integration tests)
+cargo test              # All 174 tests should pass (2 ignored integration tests)
 cargo check             # Should compile clean with no warnings
 RUST_LOG=info cargo run # Run with logging
 ```

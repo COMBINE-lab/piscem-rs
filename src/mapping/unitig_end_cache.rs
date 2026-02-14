@@ -11,6 +11,8 @@
 use dashmap::DashMap;
 use sshash_lib::LookupResult;
 
+use crate::mapping::kmer_value::CanonicalKmer;
+
 /// Cached lookup result with orientation metadata.
 #[derive(Clone, Debug)]
 struct CachedLookup {
@@ -25,7 +27,7 @@ struct CachedLookup {
 /// are bounded by `capacity` — once the cache is full, no new entries
 /// are inserted (existing entries remain accessible).
 pub struct UnitigEndCache {
-    map: DashMap<u64, CachedLookup>,
+    map: DashMap<CanonicalKmer, CachedLookup>,
     capacity: usize,
 }
 
@@ -42,7 +44,7 @@ impl UnitigEndCache {
     ///
     /// If the stored orientation doesn't match the current query's
     /// `fw_is_canonical`, the result's orientation is flipped.
-    pub fn get(&self, canonical_hash: u64, fw_is_canonical: bool) -> Option<LookupResult> {
+    pub fn get(&self, canonical_hash: CanonicalKmer, fw_is_canonical: bool) -> Option<LookupResult> {
         self.map.get(&canonical_hash).map(|entry| {
             let cached = entry.value();
             let mut result = cached.result.clone();
@@ -57,7 +59,7 @@ impl UnitigEndCache {
     /// Insert a lookup result into the cache.
     ///
     /// Does nothing if the cache is at capacity.
-    pub fn insert(&self, canonical_hash: u64, result: &LookupResult, fw_is_canonical: bool) {
+    pub fn insert(&self, canonical_hash: CanonicalKmer, result: &LookupResult, fw_is_canonical: bool) {
         if self.map.len() >= self.capacity {
             return;
         }
@@ -107,10 +109,10 @@ mod tests {
         let cache = UnitigEndCache::new(100);
 
         let result = make_result(42, 1000, 1); // forward
-        cache.insert(0xDEAD, &result, true); // fw_is_canonical=true
+        cache.insert(CanonicalKmer::new(0xDEAD), &result, true); // fw_is_canonical=true
 
         // Same orientation → no flip
-        let got = cache.get(0xDEAD, true).unwrap();
+        let got = cache.get(CanonicalKmer::new(0xDEAD), true).unwrap();
         assert_eq!(got.kmer_orientation, 1);
         assert_eq!(got.string_id, 42);
     }
@@ -120,10 +122,10 @@ mod tests {
         let cache = UnitigEndCache::new(100);
 
         let result = make_result(42, 1000, 1); // forward
-        cache.insert(0xBEEF, &result, true); // stored with fw_is_canonical=true
+        cache.insert(CanonicalKmer::new(0xBEEF), &result, true); // stored with fw_is_canonical=true
 
         // Different fw_is_canonical → orientation flipped
-        let got = cache.get(0xBEEF, false).unwrap();
+        let got = cache.get(CanonicalKmer::new(0xBEEF), false).unwrap();
         assert_eq!(got.kmer_orientation, -1); // flipped from 1 to -1
     }
 
@@ -133,20 +135,20 @@ mod tests {
 
         for i in 0..5u64 {
             let result = make_result(i, i * 10, 1);
-            cache.insert(i, &result, true);
+            cache.insert(CanonicalKmer::new(i), &result, true);
         }
 
         // Only first 3 should be present
         assert!(cache.len() <= 3);
-        assert!(cache.get(0, true).is_some());
-        assert!(cache.get(1, true).is_some());
-        assert!(cache.get(2, true).is_some());
+        assert!(cache.get(CanonicalKmer::new(0), true).is_some());
+        assert!(cache.get(CanonicalKmer::new(1), true).is_some());
+        assert!(cache.get(CanonicalKmer::new(2), true).is_some());
     }
 
     #[test]
     fn test_cache_miss_falls_through() {
         let cache = UnitigEndCache::new(100);
-        assert!(cache.get(0xDEAD, true).is_none());
+        assert!(cache.get(CanonicalKmer::new(0xDEAD), true).is_none());
         assert!(cache.is_empty());
     }
 }
