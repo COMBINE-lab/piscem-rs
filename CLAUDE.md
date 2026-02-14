@@ -98,9 +98,28 @@ The full implementation plan with C++ → Rust type mappings, architectural note
 | scRNA | SRR12623882 (Chromium V3) | 100% match | 100% |
 | scATAC | 5M ATAC reads (hg38 k25) | 100% match (98.33%) | 100% (4,916,721/4,916,721) |
 
+### Performance Status
+
+Rust is **faster than C++** at all thread counts on bulk PE mapping (1M reads, gencode v44, Apple Silicon M2 Max):
+
+| Threads | C++ | Rust | Ratio |
+|--------:|----:|-----:|------:|
+| 1 | 13.7s | 12.5s | 0.91x |
+| 4 | 3.9s | 3.2s | 0.83x |
+| 8 | 3.3s | 3.1s | 0.92x |
+
+Key optimizations already applied:
+- **LocatedHit**: Eliminated double `locate_with_end` Elias-Fano successor queries in dictionary lookups
+- **from_ascii_unchecked**: Eliminated `Kmer::from_str` string round-trips (~15% of worker thread time), changed streaming query API from `&str` to `&[u8]`
+
 ### Next Up
 
-- Performance benchmarking and optimization
+- **Profile remaining hot spots**: Use macOS `sample` or `cargo-instruments` to capture a fresh profile and identify the next optimization targets. From the last profile (pre-`from_ascii_unchecked`), remaining hot areas were:
+  - Dictionary lookups (~29% of worker time): bucket dispatch, MPHF evaluation, Elias-Fano successor queries
+  - `collect_mappings_from_hits` (~15%): hit deduplication and HashMap operations
+  - `merge_se_mappings` + PE merge (~24%): sorting and two-pointer merge of SimpleHit vectors
+  - These percentages will have shifted now that `from_str` is eliminated — re-profile to get current breakdown
+- Benchmark script: `/tmp/bench_piscem.sh` (reads: `test_data/sim_1M_{1,2}.fq.gz`, Rust index: `test_data/gencode_pc_v44_index_rust/`, C++ index: `test_data/gencode_pc_v44_index_cpp/`)
 
 ## Key Design Decisions
 
