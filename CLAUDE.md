@@ -71,7 +71,7 @@ The full implementation plan with C++ → Rust type mappings, architectural note
   - `src/mapping/filters.rs` — Updated: `CanonicalKmerIter` yields `CanonicalKmer`, made `pub(crate)`
   - `src/mapping/unitig_end_cache.rs` — Updated: `DashMap<CanonicalKmer, CachedLookup>`
   - `src/mapping/streaming_query.rs` — Updated: cache key uses `CanonicalKmer`
-  - `tests/rad_parity_bulk.rs` — Added: `bulk_pe_rad_parity_with_poison` test (99.68% match rate)
+  - `tests/rad_parity_bulk.rs` — Added: `bulk_pe_rad_parity_with_poison` test (100% match rate)
   - Poison table parity: C++ 3,764,601 k-mers / Rust 3,764,549 k-mers (~99.999%)
 
 - **Phase 8: scATAC Parity** — Fix ATAC mapper to match C++ behavior. 100% record-level parity achieved. 7 new tests, 184 total.
@@ -91,14 +91,16 @@ The full implementation plan with C++ → Rust type mappings, architectural note
 
 | Mode | Dataset | Mapping Rate | Record-Level Parity |
 |------|---------|-------------|-------------------|
-| Bulk PE | gencode_pc_v44 (with poison) | 100% match | 99.68% |
+| Bulk PE | gencode_pc_v44 (no poison) | 100% match (96.46%) | 100% (964,594/964,594) |
+| Bulk PE | gencode_pc_v44 (with poison) | 100% match | 100% (961,505/961,505) |
+| Bulk PE (strict) | gencode_pc_v44 | 100% match | 100% |
+| Bulk SE | gencode_pc_v44 | 100% match | 83.65% (tie-breaking differences expected) |
 | scRNA | SRR12623882 (Chromium V3) | 100% match | 100% |
 | scATAC | 5M ATAC reads (hg38 k25) | 100% match (98.33%) | 100% (4,916,721/4,916,721) |
 
 ### Next Up
 
 - Performance benchmarking and optimization
-- Investigate remaining bulk PE parity gap (0.32% — likely tie-breaking in STRICT/PERMISSIVE mode)
 
 ## Key Design Decisions
 
