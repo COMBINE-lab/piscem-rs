@@ -27,7 +27,9 @@ smallvec = "1.13"
 nohash-hasher = "0.2"
 crossbeam = "0.8"
 paraseq = "0.4"
-niffler = "2"
+niffler = { version = "3", default-features = false, features = ["gz", "bz2", "zstd"] }
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+indicatif = "0.17"
 
 # Succinct data structures (same versions as sshash-rs)
 sux = { version = "0.12", features = ["epserde"] }
@@ -40,7 +42,7 @@ libradicl = { git = "https://github.com/COMBINE-lab/libradicl.git", branch = "de
 
 [dev-dependencies]
 tempfile = "3"
-flate2 = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 libradicl = { git = "https://github.com/COMBINE-lab/libradicl.git", branch = "develop" }
 
 [[example]]

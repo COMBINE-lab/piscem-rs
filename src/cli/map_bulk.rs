@@ -3,10 +3,11 @@
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Args;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use tracing::info;
 
 use sshash_lib::{Kmer, KmerBits, dispatch_on_k};
@@ -43,6 +44,9 @@ pub struct MapBulkArgs {
     /// Disable poison k-mer filtering
     #[arg(long)]
     pub no_poison: bool,
+    /// Suppress progress output
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
 }
 
 pub fn run(args: MapBulkArgs) -> Result<()> {
@@ -101,6 +105,9 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
         )),
     };
 
+    // Setup progress bar
+    let progress = make_progress_bar(args.quiet);
+
     let k = index.k();
     let end_cache = UnitigEndCache::new(5_000_000);
     let num_threads = args.threads.max(1);
@@ -111,9 +118,11 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
             &args.read1, &args.read2,
             &output_info, &stats,
             &index, strat, is_paired, &end_cache,
-            num_threads,
+            num_threads, &progress,
         )?;
     });
+
+    progress.finish_and_clear();
 
     // Backpatch num_chunks
     let num_chunks = output_info.num_chunks.load(Ordering::Relaxed) as u64;
@@ -166,13 +175,14 @@ fn run_bulk_pipeline<const K: usize>(
     is_paired: bool,
     end_cache: &UnitigEndCache,
     num_threads: usize,
+    progress: &ProgressBar,
 ) -> Result<()>
 where
     Kmer<K>: KmerBits,
 {
     use paraseq::parallel::ParallelReader;
 
-    let mut processor = BulkProcessor::<K>::new(index, end_cache, output, stats, strat);
+    let mut processor = BulkProcessor::<K>::new(index, end_cache, output, stats, strat, progress);
 
     if is_paired {
         let r1 = open_concatenated_readers(read1_paths)?;
@@ -191,4 +201,22 @@ where
     }
 
     Ok(())
+}
+
+/// Create a progress bar for mapping (shared across all CLI commands).
+pub(crate) fn make_progress_bar(quiet: bool) -> ProgressBar {
+    if quiet {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new_spinner();
+        pb.set_draw_target(ProgressDrawTarget::stderr_with_hz(5));
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] {human_pos} reads processed ({per_sec})",
+            )
+            .unwrap(),
+        );
+        pb.enable_steady_tick(Duration::from_millis(200));
+        pb
+    }
 }

@@ -24,6 +24,8 @@ use crate::mapping::protocols::scrna::ChromiumProtocol;
 use crate::mapping::protocols::Protocol;
 use crate::mapping::unitig_end_cache::UnitigEndCache;
 
+use super::map_bulk::make_progress_bar;
+
 #[derive(Args, Debug)]
 pub struct MapScrnaArgs {
     /// Index prefix path
@@ -53,6 +55,9 @@ pub struct MapScrnaArgs {
     /// Include mapping positions in RAD output
     #[arg(long)]
     pub with_position: bool,
+    /// Suppress progress output
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
 }
 
 pub fn run(args: MapScrnaArgs) -> Result<()> {
@@ -125,6 +130,9 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
 
     let read_length_samples: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
+    // Setup progress bar
+    let progress = make_progress_bar(args.quiet);
+
     let k = index.k();
     let with_position = args.with_position;
     let end_cache = UnitigEndCache::new(5_000_000);
@@ -137,9 +145,11 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
             &output_info, &stats,
             &index, strat, protocol.as_ref(), bc_len, umi_len,
             with_position, &read_length_samples, &end_cache,
-            num_threads,
+            num_threads, &progress,
         )?;
     });
+
+    progress.finish_and_clear();
 
     // Backpatch num_chunks
     let num_chunks = output_info.num_chunks.load(Ordering::Relaxed) as u64;
@@ -216,6 +226,7 @@ fn run_scrna_pipeline<const K: usize>(
     read_length_samples: &Mutex<Vec<u32>>,
     end_cache: &UnitigEndCache,
     num_threads: usize,
+    progress: &indicatif::ProgressBar,
 ) -> Result<()>
 where
     Kmer<K>: KmerBits,
@@ -229,7 +240,7 @@ where
 
     let mut processor = ScrnaProcessor::<K>::new(
         index, end_cache, output, stats, strat, protocol, bc_len, umi_len, with_position,
-        read_length_samples,
+        read_length_samples, progress,
     );
 
     reader1

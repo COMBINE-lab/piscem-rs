@@ -11,6 +11,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
+use indicatif::ProgressBar;
 use paraseq::parallel::{MultiParallelProcessor, PairedParallelProcessor, ParallelProcessor};
 use paraseq::Record;
 use smallvec::SmallVec;
@@ -38,6 +39,13 @@ use crate::mapping::streaming_query::PiscemStreamingQuery;
 use crate::mapping::unitig_end_cache::UnitigEndCache;
 
 // ===========================================================================
+// Constants
+// ===========================================================================
+
+/// Maximum mapped reads per RAD chunk before flushing (matches C++ max_chunk_reads).
+const MAX_CHUNK_READS: u32 = 5000;
+
+// ===========================================================================
 // Common thread state helpers
 // ===========================================================================
 
@@ -57,6 +65,7 @@ where
     local_mapped: u64,
     local_poisoned: u64,
     num_reads_in_chunk: u32,
+    chunk_in_progress: bool,
 }
 
 impl<'a, const K: usize> CommonThreadState<'a, K>
@@ -76,17 +85,26 @@ where
             local_mapped: 0,
             local_poisoned: 0,
             num_reads_in_chunk: 0,
+            chunk_in_progress: false,
         }
     }
 
-    fn begin_chunk(&mut self) {
-        self.rad_writer.clear();
-        self.rad_writer.write_u32(0); // placeholder num_bytes
-        self.rad_writer.write_u32(0); // placeholder num_reads
-        self.num_reads_in_chunk = 0;
+    /// Ensure a RAD chunk header has been written. Call before processing records.
+    fn ensure_chunk_started(&mut self) {
+        if !self.chunk_in_progress {
+            self.rad_writer.clear();
+            self.rad_writer.write_u32(0); // placeholder num_bytes
+            self.rad_writer.write_u32(0); // placeholder num_reads
+            self.num_reads_in_chunk = 0;
+            self.chunk_in_progress = true;
+        }
     }
 
+    /// Finalize and flush the current chunk if it has any reads.
     fn finalize_chunk(&mut self, output: &OutputInfo) {
+        if !self.chunk_in_progress {
+            return;
+        }
         let total_bytes = self.rad_writer.len() as u32;
         self.rad_writer.write_u32_at_offset(0, total_bytes);
         self.rad_writer.write_u32_at_offset(4, self.num_reads_in_chunk);
@@ -94,6 +112,14 @@ where
             let mut file = output.rad_file.lock().unwrap();
             self.rad_writer.flush_to(&mut *file).ok();
             output.num_chunks.fetch_add(1, Ordering::Relaxed);
+        }
+        self.chunk_in_progress = false;
+    }
+
+    /// Flush if we've accumulated enough mapped reads.
+    fn maybe_flush_chunk(&mut self, output: &OutputInfo) {
+        if self.num_reads_in_chunk >= MAX_CHUNK_READS {
+            self.finalize_chunk(output);
         }
     }
 
@@ -125,6 +151,7 @@ where
     end_cache: &'a UnitigEndCache,
     output: &'a OutputInfo,
     stats: &'a MappingStats,
+    progress: &'a ProgressBar,
     strat: SkippingStrategy,
     state: Option<CommonThreadState<'a, K>>,
 }
@@ -139,12 +166,14 @@ where
         output: &'a OutputInfo,
         stats: &'a MappingStats,
         strat: SkippingStrategy,
+        progress: &'a ProgressBar,
     ) -> Self {
         Self {
             index,
             end_cache,
             output,
             stats,
+            progress,
             strat,
             state: None,
         }
@@ -161,6 +190,7 @@ where
             end_cache: self.end_cache,
             output: self.output,
             stats: self.stats,
+            progress: self.progress,
             strat: self.strat,
             state: None,
         }
@@ -187,10 +217,12 @@ where
         let s = self
             .state
             .get_or_insert_with(|| CommonThreadState::new(index, end_cache));
-        s.begin_chunk();
+        s.ensure_chunk_started();
 
+        let mut batch_reads: u64 = 0;
         for (rec1, rec2) in record_pairs {
             s.local_reads += 1;
+            batch_reads += 1;
             let seq1 = rec1.seq();
             let seq2 = rec2.seq();
 
@@ -223,20 +255,23 @@ where
                 s.num_reads_in_chunk += 1;
             }
         }
+        self.progress.inc(batch_reads);
         Ok(())
     }
 
     fn on_batch_complete(&mut self) -> paraseq::Result<()> {
         let output = self.output;
         if let Some(s) = &mut self.state {
-            s.finalize_chunk(output);
+            s.maybe_flush_chunk(output);
         }
         Ok(())
     }
 
     fn on_thread_complete(&mut self) -> paraseq::Result<()> {
+        let output = self.output;
         let stats = self.stats;
-        if let Some(s) = &self.state {
+        if let Some(s) = &mut self.state {
+            s.finalize_chunk(output);
             s.flush_stats(stats);
         }
         Ok(())
@@ -260,10 +295,12 @@ where
         let s = self
             .state
             .get_or_insert_with(|| CommonThreadState::new(index, end_cache));
-        s.begin_chunk();
+        s.ensure_chunk_started();
 
+        let mut batch_reads: u64 = 0;
         for rec in records {
             s.local_reads += 1;
+            batch_reads += 1;
             let seq1 = rec.seq();
 
             s.poison_state.paired_for_mapping = false;
@@ -292,20 +329,23 @@ where
                 s.num_reads_in_chunk += 1;
             }
         }
+        self.progress.inc(batch_reads);
         Ok(())
     }
 
     fn on_batch_complete(&mut self) -> paraseq::Result<()> {
         let output = self.output;
         if let Some(s) = &mut self.state {
-            s.finalize_chunk(output);
+            s.maybe_flush_chunk(output);
         }
         Ok(())
     }
 
     fn on_thread_complete(&mut self) -> paraseq::Result<()> {
+        let output = self.output;
         let stats = self.stats;
-        if let Some(s) = &self.state {
+        if let Some(s) = &mut self.state {
+            s.finalize_chunk(output);
             s.flush_stats(stats);
         }
         Ok(())
@@ -334,6 +374,7 @@ where
     end_cache: &'a UnitigEndCache,
     output: &'a OutputInfo,
     stats: &'a MappingStats,
+    progress: &'a ProgressBar,
     strat: SkippingStrategy,
     protocol: &'a dyn Protocol,
     bc_len: u16,
@@ -359,12 +400,14 @@ where
         umi_len: u16,
         with_position: bool,
         read_length_samples: &'a Mutex<Vec<u32>>,
+        progress: &'a ProgressBar,
     ) -> Self {
         Self {
             index,
             end_cache,
             output,
             stats,
+            progress,
             strat,
             protocol,
             bc_len,
@@ -386,6 +429,7 @@ where
             end_cache: self.end_cache,
             output: self.output,
             stats: self.stats,
+            progress: self.progress,
             strat: self.strat,
             protocol: self.protocol,
             bc_len: self.bc_len,
@@ -423,10 +467,12 @@ where
             local_rlen_samples: Vec::new(),
         });
         let s = &mut st.common;
-        s.begin_chunk();
+        s.ensure_chunk_started();
 
+        let mut batch_reads: u64 = 0;
         for (rec1, rec2) in record_pairs {
             s.local_reads += 1;
+            batch_reads += 1;
 
             let r1 = rec1.seq();
             let r2 = rec2.seq();
@@ -521,22 +567,25 @@ where
                 s.num_reads_in_chunk += 1;
             }
         }
+        self.progress.inc(batch_reads);
         Ok(())
     }
 
     fn on_batch_complete(&mut self) -> paraseq::Result<()> {
         let output = self.output;
         if let Some(st) = &mut self.state {
-            st.common.finalize_chunk(output);
+            st.common.maybe_flush_chunk(output);
         }
         Ok(())
     }
 
     fn on_thread_complete(&mut self) -> paraseq::Result<()> {
+        let output = self.output;
         let stats = self.stats;
         let with_position = self.with_position;
         let read_length_samples = self.read_length_samples;
-        if let Some(st) = &self.state {
+        if let Some(st) = &mut self.state {
+            st.common.finalize_chunk(output);
             st.common.flush_stats(stats);
             if with_position && !st.local_rlen_samples.is_empty() {
                 let mut samples = read_length_samples.lock().unwrap();
@@ -560,6 +609,7 @@ where
     end_cache: &'a UnitigEndCache,
     output: &'a OutputInfo,
     stats: &'a MappingStats,
+    progress: &'a ProgressBar,
     binning: &'a BinPos,
     bc_len: u16,
     tn5_shift: bool,
@@ -581,12 +631,14 @@ where
         bc_len: u16,
         tn5_shift: bool,
         min_overlap: i32,
+        progress: &'a ProgressBar,
     ) -> Self {
         Self {
             index,
             end_cache,
             output,
             stats,
+            progress,
             binning,
             bc_len,
             tn5_shift,
@@ -606,6 +658,7 @@ where
             end_cache: self.end_cache,
             output: self.output,
             stats: self.stats,
+            progress: self.progress,
             binning: self.binning,
             bc_len: self.bc_len,
             tn5_shift: self.tn5_shift,
@@ -638,10 +691,12 @@ where
         let s = self
             .state
             .get_or_insert_with(|| CommonThreadState::new(index, end_cache));
-        s.begin_chunk();
+        s.ensure_chunk_started();
 
+        let mut batch_reads: u64 = 0;
         for multi in multi_records {
             s.local_reads += 1;
+            batch_reads += 1;
 
             // multi[0] = R1 (genomic left), multi[1] = barcode, multi[2] = R2 (genomic right)
             if multi.len() < 3 {
@@ -775,20 +830,23 @@ where
                 s.num_reads_in_chunk += 1;
             }
         }
+        self.progress.inc(batch_reads);
         Ok(())
     }
 
     fn on_batch_complete(&mut self) -> paraseq::Result<()> {
         let output = self.output;
         if let Some(s) = &mut self.state {
-            s.finalize_chunk(output);
+            s.maybe_flush_chunk(output);
         }
         Ok(())
     }
 
     fn on_thread_complete(&mut self) -> paraseq::Result<()> {
+        let output = self.output;
         let stats = self.stats;
-        if let Some(s) = &self.state {
+        if let Some(s) = &mut self.state {
+            s.finalize_chunk(output);
             s.flush_stats(stats);
         }
         Ok(())

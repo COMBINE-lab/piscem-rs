@@ -30,6 +30,8 @@ use crate::mapping::binning::BinPos;
 use crate::mapping::processors::ScatacProcessor;
 use crate::mapping::unitig_end_cache::UnitigEndCache;
 
+use super::map_bulk::make_progress_bar;
+
 #[derive(Args, Debug)]
 pub struct MapScatacArgs {
     /// Index prefix path
@@ -74,6 +76,9 @@ pub struct MapScatacArgs {
     /// K-mer skipping strategy (ignored for ATAC — always uses every-kmer)
     #[arg(long)]
     pub skipping_strategy: Option<String>,
+    /// Suppress progress output
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
 }
 
 pub fn run(args: MapScatacArgs) -> Result<()> {
@@ -136,6 +141,9 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
         )),
     };
 
+    // Setup progress bar
+    let progress = make_progress_bar(args.quiet);
+
     let k = index.k();
     let tn5_shift = !args.no_tn5_shift;
     let min_overlap = args.min_overlap;
@@ -148,9 +156,11 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
             &args.read1, &args.barcode, &args.read2,
             &output_info, &stats,
             &index, &binning, bc_len, tn5_shift, min_overlap, &end_cache,
-            num_threads,
+            num_threads, &progress,
         )?;
     });
+
+    progress.finish_and_clear();
 
     // Backpatch num_chunks
     let num_chunks = output_info.num_chunks.load(Ordering::Relaxed) as u64;
@@ -206,6 +216,7 @@ fn run_atac_pipeline<const K: usize>(
     min_overlap: i32,
     end_cache: &UnitigEndCache,
     num_threads: usize,
+    progress: &indicatif::ProgressBar,
 ) -> Result<()>
 where
     Kmer<K>: KmerBits,
@@ -222,7 +233,7 @@ where
     let reader2 = paraseq::fastq::Reader::new(r2);
 
     let mut processor = ScatacProcessor::<K>::new(
-        index, end_cache, output, stats, binning, bc_len, tn5_shift, min_overlap,
+        index, end_cache, output, stats, binning, bc_len, tn5_shift, min_overlap, progress,
     );
 
     reader1
