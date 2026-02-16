@@ -30,11 +30,14 @@ The full implementation plan with C++ → Rust type mappings, architectural note
 | Bulk PE (strict) | gencode_pc_v44 | 100% match | 100% |
 | Bulk SE | gencode_pc_v44 | 100% match | 83.65% (tie-breaking differences expected) |
 | scRNA | SRR12623882 (Chromium V3) | 100% match | 100% |
+| scRNA | PBMC 1k v3 (33.4M reads) | 100% match (86.64%) | 100% (28,968,858/28,968,858) |
 | scATAC | 5M ATAC reads (hg38 k25) | 100% match (98.33%) | 100% (4,916,721/4,916,721) |
 
 ### Performance Status
 
-Rust is **faster than C++** on bulk PE mapping (1M reads, gencode v44, Apple Silicon M2 Max):
+Rust is **faster than C++** across both bulk and scRNA workloads (Apple Silicon M2 Max):
+
+**Bulk PE** (1M reads, gencode v44):
 
 | Threads | C++ | Rust | Ratio |
 |--------:|----:|-----:|------:|
@@ -42,21 +45,25 @@ Rust is **faster than C++** on bulk PE mapping (1M reads, gencode v44, Apple Sil
 | 4 | 3.9s | 3.8s | 0.96x |
 | 8 | 3.3s | 2.4s | 0.71x |
 
-Note: at t=1 paraseq uses a single thread for both I/O and mapping (vs the old dedicated producer thread model). At higher thread counts the mutex-based reader model works well with reduced atomic contention.
+**scRNA** (PBMC 1k v3, 33.4M reads, Chromium V3, gencode v44, 237K refs):
 
-Key optimizations already applied:
+| Threads | C++ | Rust | Ratio |
+|--------:|----:|-----:|------:|
+| 8 | 114s | 106s | 0.93x |
+
+Mapping counts are identical: 28,968,858 / 33,436,697 (86.64%) for both implementations.
+
+Key optimizations applied:
+- **AHashMap for hit_map**: Replaced `nohash-hasher` (identity hash) which caused pathological SwissTable H2 collisions with sequential transcript IDs (~38% regression on scRNA with 237K refs). `AHashMap` properly distributes hash bits for SwissTable SIMD probing.
+- **AHashSet for observed_ecs**: Replaced standard `HashSet<u64>` (SipHash) with `AHashSet<u64>` matching C++ `ankerl::unordered_dense::set` performance.
 - **LocatedHit**: Eliminated double `locate_with_end` Elias-Fano successor queries in dictionary lookups
 - **from_ascii_unchecked**: Eliminated `Kmer::from_str` string round-trips (~15% of worker thread time), changed streaming query API from `&str` to `&[u8]`
 - **Paraseq native processing**: Zero-copy read access, per-thread stat accumulation (reduced atomic contention at high thread counts)
 
 ### Next Up
 
-- **Profile remaining hot spots**: Use macOS `sample` or `cargo-instruments` to capture a fresh profile and identify the next optimization targets. From the last profile (pre-`from_ascii_unchecked`), remaining hot areas were:
-  - Dictionary lookups (~29% of worker time): bucket dispatch, MPHF evaluation, Elias-Fano successor queries
-  - `collect_mappings_from_hits` (~15%): hit deduplication and HashMap operations
-  - `merge_se_mappings` + PE merge (~24%): sorting and two-pointer merge of SimpleHit vectors
-  - These percentages will have shifted now that `from_str` is eliminated — re-profile to get current breakdown
 - Benchmark script: `/tmp/bench_piscem.sh` (reads: `test_data/sim_1M_{1,2}.fq.gz`, Rust index: `test_data/gencode_pc_v44_index_rust/`, C++ index: `test_data/gencode_pc_v44_index_cpp/`)
+- SC perf test data: `test_data/perf_test/pbmc_1k_v3_S1_L001_R{1,2}_001.fastq.gz`, indices at `test_data/perf_test/{cpp_index,rust_index}`
 
 ## Key Design Decisions
 
