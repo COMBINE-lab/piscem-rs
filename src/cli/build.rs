@@ -30,6 +30,9 @@ pub struct BuildArgs {
     /// Hash seed for dictionary construction
     #[arg(short = 's', long, default_value = "1")]
     pub seed: u64,
+    /// Use a single monolithic MPHF instead of partitioned (disables parallel MPHF build)
+    #[arg(long)]
+    pub single_mphf: bool,
 }
 
 pub fn run(args: BuildArgs) -> Result<()> {
@@ -42,6 +45,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         num_threads: args.threads,
         canonical: args.canonical,
         seed: args.seed,
+        single_mphf: args.single_mphf,
     };
     build_index(&config)
 }

@@ -94,6 +94,7 @@ fn ensure_rust_index() -> Result<()> {
         num_threads: 0,
         canonical: true,
         seed: 1,
+        single_mphf: false,
     };
 
     piscem_rs::index::build::build_index(&config)?;

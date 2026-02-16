@@ -22,6 +22,9 @@ target
 
 .claude/settings.local.json
 
+# Local Cargo config (contains [patch] for sshash-rs local checkout)
+.cargo/
+
 # sshash-rs is an independent repo; use a local checkout for development
 # and override in .cargo/config.toml if needed
 sshash-rs/

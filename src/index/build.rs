@@ -41,6 +41,8 @@ pub struct BuildConfig {
     pub canonical: bool,
     /// Hash seed for the dictionary.
     pub seed: u64,
+    /// Use a single monolithic MPHF instead of partitioned.
+    pub single_mphf: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +147,7 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
     build_cfg.canonical = config.canonical;
     build_cfg.seed = config.seed;
     build_cfg.num_threads = config.num_threads;
+    build_cfg.partitioned_mphf = !config.single_mphf;
 
     let dict_builder = DictionaryBuilder::new(build_cfg)
         .map_err(|e| anyhow::anyhow!("failed to create dictionary builder: {e}"))?;
@@ -630,6 +633,7 @@ mod tests {
             num_threads: 0,
             canonical: false,
             seed: 1,
+            single_mphf: false,
         };
 
         build_index(&config).expect("build_index failed");
