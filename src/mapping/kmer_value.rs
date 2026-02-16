@@ -33,7 +33,7 @@
 //! 5. **Serialization**: A new format version (e.g., `PPOIS02\0`) would write
 //!    the wider type, with backward-compatible loading.
 //!
-//! 6. **Construct from Kmer<K>**: Add `CanonicalKmer::from_kmer()` using
+//! 6. **Construct from `Kmer<K>`**: Add `CanonicalKmer::from_kmer()` using
 //!    `KmerBits::to_u64()` (k <= 31) or `to_u128()` (k > 31).
 
 /// A canonical k-mer packed into a `u64`.
