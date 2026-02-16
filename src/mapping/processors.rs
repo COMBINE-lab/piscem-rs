@@ -32,7 +32,7 @@ use crate::mapping::map_fragment::{
 };
 use crate::mapping::merge_pairs::{remove_duplicate_hits_pub, simple_hit_cmp_bins};
 use crate::mapping::overlap::{find_overlap, OverlapType};
-use crate::mapping::protocols::scrna::{barcode_has_n, count_ns, recover_barcode};
+use crate::mapping::protocols::scrna::{barcode_has_n, count_ns, is_all_acgt, recover_barcode};
 use crate::mapping::protocols::Protocol;
 use crate::mapping::sketch_hit_simple::SketchHitInfoSimple;
 use crate::mapping::streaming_query::PiscemStreamingQuery;
@@ -478,11 +478,19 @@ where
             let r2 = rec2.seq();
 
             // Extract technical sequences
+            // C++ returns nullptr if R1 too short for BC or UMI → skip read
             let tech = protocol.extract_tech_seqs(&r1, &r2);
-            let bc_raw = tech.barcode.unwrap_or(&[]);
-            let umi_raw = tech.umi.unwrap_or(&[]);
+            let bc_raw = match tech.barcode {
+                Some(bc) if !bc.is_empty() => bc,
+                _ => continue,
+            };
+            let umi_raw = match tech.umi {
+                Some(umi) if !umi.is_empty() => umi,
+                _ => continue,
+            };
 
-            // Check barcode for N bases
+            // Barcode validation + recovery (matching C++ recover_barcode + fromChars)
+            // C++ uses find_first_not_of("ACTGactg") which catches any non-ACGT char
             let n_count = count_ns(bc_raw);
             if n_count > 1 {
                 continue;
@@ -494,8 +502,23 @@ where
             };
             let bc_to_pack = match &recovered_bc {
                 Some(bc) => bc.as_slice(),
-                None => bc_raw,
+                None => {
+                    // No recovery needed/attempted — validate original BC
+                    if !is_all_acgt(bc_raw) {
+                        continue;
+                    }
+                    bc_raw
+                }
             };
+            // Validate recovered BC (C++ fromChars check)
+            if !is_all_acgt(bc_to_pack) {
+                continue;
+            }
+
+            // UMI validation (matching C++ umi_kmer.fromChars check)
+            if !is_all_acgt(umi_raw) {
+                continue;
+            }
 
             let bc_packed = pack_bases_2bit(bc_to_pack);
             let umi_packed = pack_bases_2bit(umi_raw);

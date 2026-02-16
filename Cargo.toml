@@ -24,7 +24,6 @@ ahash = "0.8"
 # Phase 4 dependencies
 dashmap = "6"
 smallvec = "1.13"
-nohash-hasher = "0.2"
 crossbeam = "0.8"
 paraseq = "0.4"
 niffler = { version = "3", default-features = false, features = ["gz", "bz2", "zstd"] }

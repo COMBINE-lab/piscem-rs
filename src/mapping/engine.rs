@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 
+use ahash::AHashMap;
 use sshash_lib::{Kmer, KmerBits};
 
 use crate::index::eq_classes::ec_entry_transcript_id;
@@ -130,9 +131,7 @@ where
             let mut visited: usize = 0;
 
             let visit_ec =
-                |hit_map: &mut std::collections::HashMap<u32, S, _>,
-                 ent: u64,
-                 fw_on_contig: bool| {
+                |hit_map: &mut AHashMap<u32, S>, ent: u64, fw_on_contig: bool| {
                     let tid = ec_entry_transcript_id(ent);
                     if let Some(target) = hit_map.get_mut(&tid) {
                         let ori = ent & 0x3;
@@ -574,7 +573,7 @@ fn collect_mappings_from_hits_binned<S: SketchHitInfo>(
 #[allow(clippy::too_many_arguments)]
 fn collect_mappings_from_hits<S: SketchHitInfo>(
     raw_hits: &[(i32, ProjectedHits<'_>)],
-    hit_map: &mut std::collections::HashMap<u32, S, nohash_hasher::BuildNoHashHasher<u32>>,
+    hit_map: &mut AHashMap<u32, S>,
     num_valid_hits: &mut u32,
     min_occ: &mut u64,
     max_allowed_occ: u64,
@@ -648,13 +647,7 @@ mod tests {
     #[test]
     fn test_collect_empty_hits() {
         let raw_hits: Vec<(i32, ProjectedHits<'_>)> = Vec::new();
-        let mut hit_map: std::collections::HashMap<
-            u32,
-            SketchHitInfoSimple,
-            nohash_hasher::BuildNoHashHasher<u32>,
-        > = std::collections::HashMap::with_hasher(
-            nohash_hasher::BuildNoHashHasher::default(),
-        );
+        let mut hit_map: AHashMap<u32, SketchHitInfoSimple> = AHashMap::new();
         let num_valid = 0u32;
         let mut min_occ = u64::MAX;
         let mut ambig: Vec<u32> = Vec::new();

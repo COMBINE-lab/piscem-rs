@@ -7,9 +7,7 @@
 //! borrow the index and are created as separate per-thread locals alongside
 //! the cache.
 
-use std::collections::{HashMap, HashSet};
-
-use nohash_hasher::BuildNoHashHasher;
+use ahash::{AHashMap, AHashSet};
 
 use crate::mapping::hits::{MappingType, SimpleHit, SketchHitInfo};
 
@@ -24,7 +22,8 @@ pub struct MappingCache<S: SketchHitInfo> {
     /// How the read mapped.
     pub map_type: MappingType,
     /// Map from reference target ID → per-target hit accumulator.
-    pub hit_map: HashMap<u32, S, BuildNoHashHasher<u32>>,
+    /// Uses AHashMap (fast hash) matching C++ ankerl::unordered_dense::map performance.
+    pub hit_map: AHashMap<u32, S>,
     /// Final accepted hit list (after filtering).
     pub accepted_hits: Vec<SimpleHit>,
     /// Maximum number of reference occurrences before a k-mer is considered
@@ -46,8 +45,9 @@ pub struct MappingCache<S: SketchHitInfo> {
     /// Indices of raw hits that exceeded the occurrence threshold (for EC filtering).
     pub ambiguous_hit_indices: Vec<u32>,
     /// Reusable set for tracking observed ECs during ambiguous hit filtering.
-    /// Kept here to avoid per-read allocation.
-    pub observed_ecs: HashSet<u64>,
+    /// Uses AHashSet (fast hash) instead of standard HashSet (SipHash) to match
+    /// C++ performance with ankerl::unordered_dense::set.
+    pub observed_ecs: AHashSet<u64>,
 }
 
 impl<S: SketchHitInfo> MappingCache<S> {
@@ -55,10 +55,12 @@ impl<S: SketchHitInfo> MappingCache<S> {
     pub fn new(k: usize) -> Self {
         let max_hit_occ = 256;
         let max_hit_occ_recover = 1024;
+        // Pre-reserve capacity matching C++ (utils.hpp line 932, 966)
+        let hit_map = AHashMap::with_capacity(max_hit_occ);
         Self {
             map_type: MappingType::Unmapped,
-            hit_map: HashMap::with_hasher(BuildNoHashHasher::default()),
-            accepted_hits: Vec::new(),
+            hit_map,
+            accepted_hits: Vec::with_capacity(64),
             max_hit_occ,
             max_hit_occ_recover,
             attempt_occ_recover: max_hit_occ_recover > max_hit_occ,
@@ -67,7 +69,7 @@ impl<S: SketchHitInfo> MappingCache<S> {
             max_ec_card: 4096,
             has_matching_kmers: false,
             ambiguous_hit_indices: Vec::new(),
-            observed_ecs: HashSet::new(),
+            observed_ecs: AHashSet::new(),
         }
     }
 

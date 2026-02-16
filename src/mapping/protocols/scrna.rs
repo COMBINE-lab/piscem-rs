@@ -99,12 +99,20 @@ impl Protocol for ChromiumProtocol {
     }
 
     fn extract_tech_seqs<'a>(&self, r1: &'a [u8], _r2: &'a [u8]) -> TechSeqs<'a> {
-        let bc_end = self.bc_len.min(r1.len());
-        let umi_end = (self.bc_len + self.umi_len).min(r1.len());
-        TechSeqs {
-            barcode: Some(&r1[..bc_end]),
-            umi: Some(&r1[bc_end..umi_end]),
-        }
+        // Match C++ behavior: return None if R1 is too short for BC or UMI
+        // C++ extract_bc returns nullptr if r1.length() < bc_len
+        // C++ extract_umi returns nullptr if r1.length() < bc_len + umi_len
+        let barcode = if r1.len() >= self.bc_len {
+            Some(&r1[..self.bc_len])
+        } else {
+            None
+        };
+        let umi = if r1.len() >= self.bc_len + self.umi_len {
+            Some(&r1[self.bc_len..self.bc_len + self.umi_len])
+        } else {
+            None
+        };
+        TechSeqs { barcode, umi }
     }
 
     fn extract_mappable_reads<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> AlignableReads<'a> {
@@ -164,6 +172,15 @@ pub fn barcode_has_n(bc: &[u8]) -> bool {
 /// Count N bases in a barcode.
 pub fn count_ns(bc: &[u8]) -> usize {
     bc.iter().filter(|&&b| b == b'N' || b == b'n').count()
+}
+
+/// Check whether a sequence contains only valid ACGT bases (upper or lowercase).
+///
+/// Matches C++ `fromChars()` validation: returns `false` if any character
+/// is not in {A, C, G, T, a, c, g, t}.
+#[inline]
+pub fn is_all_acgt(seq: &[u8]) -> bool {
+    seq.iter().all(|&b| matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't'))
 }
 
 // ---------------------------------------------------------------------------
