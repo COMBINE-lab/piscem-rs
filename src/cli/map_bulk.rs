@@ -12,17 +12,12 @@ use tracing::info;
 use sshash_lib::{Kmer, KmerBits, dispatch_on_k};
 
 use crate::index::reference_index::ReferenceIndex;
-use crate::io::fastx::{FastxConfig, FastxSource, ReadChunk};
+use crate::io::fastx::open_concatenated_readers;
 use crate::io::map_info::write_map_info;
-use crate::io::rad::{RadWriter, write_bulk_record, write_rad_header_bulk};
-use crate::io::threads::{MappingStats, OutputInfo, ThreadConfig, run_mapping_pipeline};
-use crate::mapping::cache::MappingCache;
-use crate::mapping::filters::PoisonState;
-use crate::mapping::hit_searcher::{HitSearcher, SkippingStrategy};
-use crate::mapping::hits::MappingType;
-use crate::mapping::map_fragment::{map_pe_fragment, map_se_fragment};
-use crate::mapping::sketch_hit_simple::SketchHitInfoSimple;
-use crate::mapping::streaming_query::PiscemStreamingQuery;
+use crate::io::rad::write_rad_header_bulk;
+use crate::io::threads::{MappingStats, OutputInfo};
+use crate::mapping::hit_searcher::SkippingStrategy;
+use crate::mapping::processors::BulkProcessor;
 use crate::mapping::unitig_end_cache::UnitigEndCache;
 
 #[derive(Args, Debug)]
@@ -95,18 +90,7 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
         &ref_lengths,
     )?;
 
-    // Setup pipeline
-    let fastx_config = FastxConfig {
-        read1_paths: args.read1.clone(),
-        read2_paths: args.read2.clone(),
-        chunk_size: 5000,
-        ..Default::default()
-    };
-    let fastx = FastxSource::new(fastx_config)?;
-
-    let thread_config = ThreadConfig {
-        threads: args.threads,
-    };
+    // Setup shared output state
     let stats = MappingStats::new();
     let output_info = OutputInfo {
         num_chunks: std::sync::atomic::AtomicUsize::new(0),
@@ -119,12 +103,15 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
 
     let k = index.k();
     let end_cache = UnitigEndCache::new(5_000_000);
+    let num_threads = args.threads.max(1);
 
-    // Dispatch on K and run the pipeline
+    // Dispatch on K and run the pipeline via paraseq
     dispatch_on_k!(k, K => {
         run_bulk_pipeline::<K>(
-            fastx, thread_config, &output_info, &stats,
+            &args.read1, &args.read2,
+            &output_info, &stats,
             &index, strat, is_paired, &end_cache,
+            num_threads,
         )?;
     });
 
@@ -170,102 +157,38 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn run_bulk_pipeline<const K: usize>(
-    fastx: FastxSource,
-    thread_config: ThreadConfig,
+    read1_paths: &[String],
+    read2_paths: &[String],
     output: &OutputInfo,
     stats: &MappingStats,
     index: &ReferenceIndex,
     strat: SkippingStrategy,
     is_paired: bool,
     end_cache: &UnitigEndCache,
+    num_threads: usize,
 ) -> Result<()>
 where
     Kmer<K>: KmerBits,
 {
-    let worker_fn = |chunk: ReadChunk, output: &OutputInfo, stats: &MappingStats| {
-        // Per-thread state
-        let mut hs = HitSearcher::new(index);
-        let mut query = PiscemStreamingQuery::<K>::with_cache(index.dict(), end_cache);
-        let mut cache_out = MappingCache::<SketchHitInfoSimple>::new(K);
-        let mut cache_left = MappingCache::<SketchHitInfoSimple>::new(K);
-        let mut cache_right = MappingCache::<SketchHitInfoSimple>::new(K);
-        let mut poison_state = PoisonState::new(index.poison_table());
-        let mut rad_writer = RadWriter::with_capacity(150_000);
+    use paraseq::parallel::ParallelReader;
 
-        let mut local_reads: u64 = 0;
-        let mut local_mapped: u64 = 0;
-        let mut local_poisoned: u64 = 0;
+    let mut processor = BulkProcessor::<K>::new(index, end_cache, output, stats, strat);
 
-        // Reserve space for chunk header: num_bytes (u32) + num_reads (u32)
-        rad_writer.write_u32(0); // placeholder num_bytes
-        rad_writer.write_u32(0); // placeholder num_reads
-        let mut num_reads_in_chunk: u32 = 0;
+    if is_paired {
+        let r1 = open_concatenated_readers(read1_paths)?;
+        let r2 = open_concatenated_readers(read2_paths)?;
+        let reader1 = paraseq::fastq::Reader::new(r1);
+        let reader2 = paraseq::fastq::Reader::new(r2);
+        reader1
+            .process_parallel_paired(reader2, &mut processor, num_threads)
+            .map_err(|e| anyhow::anyhow!("mapping failed: {}", e))?;
+    } else {
+        let r1 = open_concatenated_readers(read1_paths)?;
+        let reader1 = paraseq::fastq::Reader::new(r1);
+        reader1
+            .process_parallel(&mut processor, num_threads)
+            .map_err(|e| anyhow::anyhow!("mapping failed: {}", e))?;
+    }
 
-        for read_pair in &chunk {
-            local_reads += 1;
-
-            if is_paired {
-                let seq2 = read_pair.seq2.as_deref().unwrap_or(&[]);
-                poison_state.paired_for_mapping = true;
-                map_pe_fragment::<K>(
-                    &read_pair.seq1,
-                    seq2,
-                    &mut hs,
-                    &mut query,
-                    &mut cache_left,
-                    &mut cache_right,
-                    &mut cache_out,
-                    index,
-                    &mut poison_state,
-                    strat,
-                );
-            } else {
-                poison_state.paired_for_mapping = false;
-                map_se_fragment::<K>(
-                    &read_pair.seq1,
-                    &mut hs,
-                    &mut query,
-                    &mut cache_out,
-                    index,
-                    &mut poison_state,
-                    strat,
-                );
-            }
-
-            if poison_state.is_poisoned() {
-                local_poisoned += 1;
-                continue;
-            }
-
-            if cache_out.map_type != MappingType::Unmapped {
-                local_mapped += 1;
-                write_bulk_record(
-                    cache_out.map_type,
-                    &cache_out.accepted_hits,
-                    &mut rad_writer,
-                );
-                num_reads_in_chunk += 1;
-            }
-        }
-
-        // Backpatch chunk header
-        let total_bytes = rad_writer.len() as u32;
-        rad_writer.write_u32_at_offset(0, total_bytes);
-        rad_writer.write_u32_at_offset(4, num_reads_in_chunk);
-
-        // Flush to file under mutex
-        if num_reads_in_chunk > 0 {
-            let mut file = output.rad_file.lock().unwrap();
-            rad_writer.flush_to(&mut *file).ok();
-            output.num_chunks.fetch_add(1, Ordering::Relaxed);
-        }
-
-        stats.num_reads.fetch_add(local_reads, Ordering::Relaxed);
-        stats.num_mapped.fetch_add(local_mapped, Ordering::Relaxed);
-        stats
-            .num_poisoned
-            .fetch_add(local_poisoned, Ordering::Relaxed);
-    };
-
-    run_mapping_pipeline(fastx, thread_config, output, stats, worker_fn)
+    Ok(())
 }

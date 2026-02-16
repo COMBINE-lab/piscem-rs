@@ -22,21 +22,12 @@ use tracing::info;
 use sshash_lib::{Kmer, KmerBits, dispatch_on_k};
 
 use crate::index::reference_index::ReferenceIndex;
-use crate::io::fastx::{FastxTripleSource, ReadTripletChunk};
+use crate::io::fastx::open_concatenated_readers;
 use crate::io::map_info::write_map_info;
-use crate::io::rad::{RadWriter, pack_bases_2bit, write_atac_record, write_rad_header_atac};
-use crate::io::threads::{MappingStats, OutputInfo, ThreadConfig, run_mapping_pipeline_triple};
+use crate::io::rad::write_rad_header_atac;
+use crate::io::threads::{MappingStats, OutputInfo};
 use crate::mapping::binning::BinPos;
-use crate::mapping::cache::MappingCache;
-use crate::mapping::filters::PoisonState;
-use crate::mapping::hit_searcher::HitSearcher;
-use crate::mapping::hits::MappingType;
-use crate::mapping::map_fragment::{map_pe_fragment_atac, map_se_fragment_atac};
-use crate::mapping::merge_pairs::{remove_duplicate_hits_pub, simple_hit_cmp_bins};
-use crate::mapping::overlap::{find_overlap, OverlapType};
-use crate::mapping::protocols::scrna::{barcode_has_n, count_ns, recover_barcode};
-use crate::mapping::sketch_hit_simple::SketchHitInfoSimple;
-use crate::mapping::streaming_query::PiscemStreamingQuery;
+use crate::mapping::processors::ScatacProcessor;
 use crate::mapping::unitig_end_cache::UnitigEndCache;
 
 #[derive(Args, Debug)]
@@ -134,18 +125,7 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
     let binning = BinPos::new(&index, args.bin_size, args.bin_overlap, args.thr);
     info!("Binning: {} total bins", binning.num_bins());
 
-    // Setup triple-file FASTQ source
-    let fastx = FastxTripleSource::new(
-        &args.read1,
-        &args.barcode,
-        &args.read2,
-        5000,
-        false,
-    )?;
-
-    let thread_config = ThreadConfig {
-        threads: args.threads,
-    };
+    // Setup shared state
     let stats = MappingStats::new();
     let output_info = OutputInfo {
         num_chunks: std::sync::atomic::AtomicUsize::new(0),
@@ -160,12 +140,15 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
     let tn5_shift = !args.no_tn5_shift;
     let min_overlap = args.min_overlap;
     let end_cache = UnitigEndCache::new(5_000_000);
+    let num_threads = args.threads.max(1);
 
-    // Dispatch on K and run the pipeline
+    // Dispatch on K and run the pipeline via paraseq multi-reader
     dispatch_on_k!(k, K => {
         run_atac_pipeline::<K>(
-            fastx, thread_config, &output_info, &stats,
+            &args.read1, &args.barcode, &args.read2,
+            &output_info, &stats,
             &index, &binning, bc_len, tn5_shift, min_overlap, &end_cache,
+            num_threads,
         )?;
     });
 
@@ -211,8 +194,9 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn run_atac_pipeline<const K: usize>(
-    fastx: FastxTripleSource,
-    thread_config: ThreadConfig,
+    read1_paths: &[String],
+    barcode_paths: &[String],
+    read2_paths: &[String],
     output: &OutputInfo,
     stats: &MappingStats,
     index: &ReferenceIndex,
@@ -221,183 +205,29 @@ fn run_atac_pipeline<const K: usize>(
     tn5_shift: bool,
     min_overlap: i32,
     end_cache: &UnitigEndCache,
+    num_threads: usize,
 ) -> Result<()>
 where
     Kmer<K>: KmerBits,
 {
-    let worker_fn = |chunk: ReadTripletChunk, output: &OutputInfo, stats: &MappingStats| {
-        // Per-thread state
-        let mut hs = HitSearcher::new(index);
-        let mut query = PiscemStreamingQuery::<K>::with_cache(index.dict(), end_cache);
-        let mut cache_out = MappingCache::<SketchHitInfoSimple>::new(K);
-        let mut cache_left = MappingCache::<SketchHitInfoSimple>::new(K);
-        let mut cache_right = MappingCache::<SketchHitInfoSimple>::new(K);
-        let mut poison_state = PoisonState::new(index.poison_table());
-        let mut rad_writer = RadWriter::with_capacity(150_000);
+    use paraseq::parallel::ParallelReader;
 
-        let mut local_reads: u64 = 0;
-        let mut local_mapped: u64 = 0;
-        let mut local_poisoned: u64 = 0;
+    // R1 (genomic left) is the "primary" reader; barcode + R2 are "rest".
+    let r1 = open_concatenated_readers(read1_paths)?;
+    let rbc = open_concatenated_readers(barcode_paths)?;
+    let r2 = open_concatenated_readers(read2_paths)?;
 
-        // Reserve space for chunk header
-        rad_writer.write_u32(0); // placeholder num_bytes
-        rad_writer.write_u32(0); // placeholder num_reads
-        let mut num_reads_in_chunk: u32 = 0;
+    let reader1 = paraseq::fastq::Reader::new(r1);
+    let reader_bc = paraseq::fastq::Reader::new(rbc);
+    let reader2 = paraseq::fastq::Reader::new(r2);
 
-        for triplet in &chunk {
-            local_reads += 1;
+    let mut processor = ScatacProcessor::<K>::new(
+        index, end_cache, output, stats, binning, bc_len, tn5_shift, min_overlap,
+    );
 
-            let r1 = &triplet.seq1;
-            let r2 = &triplet.seq2;
-            let bc_raw = &triplet.barcode;
+    reader1
+        .process_parallel_multi(vec![reader_bc, reader2], &mut processor, num_threads)
+        .map_err(|e| anyhow::anyhow!("mapping failed: {}", e))?;
 
-            if r1.is_empty() || r2.is_empty() {
-                continue;
-            }
-
-            // Check barcode for Ns (truncate to bc_len if longer)
-            let bc_end = (bc_len as usize).min(bc_raw.len());
-            let bc_slice = &bc_raw[..bc_end];
-
-            let n_count = count_ns(bc_slice);
-            if n_count > 1 {
-                continue;
-            }
-            let recovered_bc = if n_count == 1 {
-                recover_barcode(bc_slice)
-            } else {
-                None
-            };
-            let bc_to_pack = match &recovered_bc {
-                Some(bc) => bc.as_slice(),
-                None => {
-                    if barcode_has_n(bc_slice) {
-                        continue;
-                    }
-                    bc_slice
-                }
-            };
-            let bc_packed = pack_bases_2bit(bc_to_pack);
-
-            poison_state.clear();
-            cache_out.clear();
-
-            // Try mate overlap detection
-            let mate_ov = find_overlap(r1, r2, min_overlap, 0);
-
-            if mate_ov.ov_type != OverlapType::NoOverlap && !mate_ov.frag.is_empty() {
-                // Map merged fragment as single read (bin-based)
-                poison_state.paired_for_mapping = false;
-                map_se_fragment_atac::<K>(
-                    &mate_ov.frag,
-                    &mut hs,
-                    &mut query,
-                    &mut cache_out,
-                    index,
-                    &mut poison_state,
-                    binning,
-                );
-
-                // Sort+dedup hits (matching C++ pesc_sc_atac.cpp lines 101-104)
-                if !cache_out.accepted_hits.is_empty() {
-                    cache_out.accepted_hits.sort_by(simple_hit_cmp_bins);
-                    remove_duplicate_hits_pub(&mut cache_out.accepted_hits);
-                    cache_out.map_type = if !cache_out.accepted_hits.is_empty() {
-                        MappingType::MappedPair
-                    } else {
-                        MappingType::Unmapped
-                    };
-
-                    // C++: r1_len = shorter read, r2_len = longer read
-                    let (r1_len, r2_len) = if r1.len() <= r2.len() {
-                        (r1.len() as i32, r2.len() as i32)
-                    } else {
-                        (r2.len() as i32, r1.len() as i32)
-                    };
-
-                    for hit in &mut cache_out.accepted_hits {
-                        hit.fragment_length = mate_ov.frag_length as i32;
-                        // Compute mate_pos based on orientation
-                        hit.mate_pos = if hit.is_fw {
-                            hit.pos + hit.fragment_length - r2_len - 1
-                        } else {
-                            hit.pos + r1_len - hit.fragment_length - 1
-                        };
-                        // C++: clamp mate_pos > ref_len (not < 0)
-                        let ref_len = index.ref_len(hit.tid as usize) as i32;
-                        if hit.mate_pos > ref_len {
-                            hit.mate_pos = hit.pos;
-                        }
-                        if mate_ov.ov_type == OverlapType::Dovetail {
-                            hit.mate_pos = hit.pos;
-                        }
-                    }
-                }
-            } else {
-                // No overlap: map both ends independently, then merge (bin-aware)
-                poison_state.paired_for_mapping = true;
-                map_pe_fragment_atac::<K>(
-                    r1,
-                    r2,
-                    &mut hs,
-                    &mut query,
-                    &mut cache_left,
-                    &mut cache_right,
-                    &mut cache_out,
-                    index,
-                    &mut poison_state,
-                    binning,
-                );
-
-                // Set fragment_length for orphan reads (matching C++ lines 204-213)
-                if cache_out.map_type == MappingType::MappedFirstOrphan {
-                    for hit in &mut cache_out.accepted_hits {
-                        hit.fragment_length = r1.len() as i32;
-                    }
-                } else if cache_out.map_type == MappingType::MappedSecondOrphan {
-                    for hit in &mut cache_out.accepted_hits {
-                        hit.fragment_length = r2.len() as i32;
-                    }
-                }
-            }
-
-            if poison_state.is_poisoned() {
-                local_poisoned += 1;
-                continue;
-            }
-
-            if cache_out.map_type != MappingType::Unmapped {
-                local_mapped += 1;
-                write_atac_record(
-                    bc_packed,
-                    bc_len,
-                    cache_out.map_type,
-                    &cache_out.accepted_hits,
-                    tn5_shift,
-                    &mut rad_writer,
-                );
-                num_reads_in_chunk += 1;
-            }
-        }
-
-        // Backpatch chunk header
-        let total_bytes = rad_writer.len() as u32;
-        rad_writer.write_u32_at_offset(0, total_bytes);
-        rad_writer.write_u32_at_offset(4, num_reads_in_chunk);
-
-        // Flush to file under mutex
-        if num_reads_in_chunk > 0 {
-            let mut file = output.rad_file.lock().unwrap();
-            rad_writer.flush_to(&mut *file).ok();
-            output.num_chunks.fetch_add(1, Ordering::Relaxed);
-        }
-
-        stats.num_reads.fetch_add(local_reads, Ordering::Relaxed);
-        stats.num_mapped.fetch_add(local_mapped, Ordering::Relaxed);
-        stats
-            .num_poisoned
-            .fetch_add(local_poisoned, Ordering::Relaxed);
-    };
-
-    run_mapping_pipeline_triple(fastx, thread_config, output, stats, worker_fn)
+    Ok(())
 }

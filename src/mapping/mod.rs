@@ -9,6 +9,7 @@ pub mod kmer_value;
 pub mod map_fragment;
 pub mod merge_pairs;
 pub mod overlap;
+pub mod processors;
 pub mod projected_hits;
 pub mod protocols;
 pub mod sketch_hit_simple;

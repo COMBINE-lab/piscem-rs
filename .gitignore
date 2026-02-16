@@ -21,3 +21,7 @@ target
 #.idea/
 
 .claude/settings.local.json
+
+# sshash-rs is an independent repo; use a local checkout for development
+# and override in .cargo/config.toml if needed
+sshash-rs/
