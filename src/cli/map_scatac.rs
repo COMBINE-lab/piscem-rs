@@ -155,7 +155,7 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
         run_atac_pipeline::<K>(
             &args.read1, &args.barcode, &args.read2,
             &output_info, &stats,
-            &index, &binning, bc_len, tn5_shift, min_overlap, &end_cache,
+            &index, &binning, bc_len, tn5_shift, min_overlap, Some(&end_cache),
             num_threads, &progress,
         )?;
     });
@@ -214,7 +214,7 @@ fn run_atac_pipeline<const K: usize>(
     bc_len: u16,
     tn5_shift: bool,
     min_overlap: i32,
-    end_cache: &UnitigEndCache,
+    end_cache: Option<&UnitigEndCache>,
     num_threads: usize,
     progress: &indicatif::ProgressBar,
 ) -> Result<()>

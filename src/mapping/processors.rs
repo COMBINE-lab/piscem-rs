@@ -72,10 +72,14 @@ impl<'a, const K: usize> CommonThreadState<'a, K>
 where
     Kmer<K>: KmerBits,
 {
-    fn new(index: &'a ReferenceIndex, end_cache: &'a UnitigEndCache) -> Self {
+    fn new(index: &'a ReferenceIndex, end_cache: Option<&'a UnitigEndCache>) -> Self {
+        let query = match end_cache {
+            Some(cache) => PiscemStreamingQuery::<K>::with_cache(index.dict(), cache),
+            None => PiscemStreamingQuery::<K>::new(index.dict()),
+        };
         Self {
             hs: HitSearcher::new(index),
-            query: PiscemStreamingQuery::<K>::with_cache(index.dict(), end_cache),
+            query,
             cache_out: MappingCache::new(K),
             cache_left: MappingCache::new(K),
             cache_right: MappingCache::new(K),
@@ -148,7 +152,7 @@ where
     Kmer<K>: KmerBits,
 {
     index: &'a ReferenceIndex,
-    end_cache: &'a UnitigEndCache,
+    end_cache: Option<&'a UnitigEndCache>,
     output: &'a OutputInfo,
     stats: &'a MappingStats,
     progress: &'a ProgressBar,
@@ -162,7 +166,7 @@ where
 {
     pub fn new(
         index: &'a ReferenceIndex,
-        end_cache: &'a UnitigEndCache,
+        end_cache: Option<&'a UnitigEndCache>,
         output: &'a OutputInfo,
         stats: &'a MappingStats,
         strat: SkippingStrategy,
@@ -371,7 +375,7 @@ where
     Kmer<K>: KmerBits,
 {
     index: &'a ReferenceIndex,
-    end_cache: &'a UnitigEndCache,
+    end_cache: Option<&'a UnitigEndCache>,
     output: &'a OutputInfo,
     stats: &'a MappingStats,
     progress: &'a ProgressBar,
@@ -391,7 +395,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         index: &'a ReferenceIndex,
-        end_cache: &'a UnitigEndCache,
+        end_cache: Option<&'a UnitigEndCache>,
         output: &'a OutputInfo,
         stats: &'a MappingStats,
         strat: SkippingStrategy,
@@ -629,7 +633,7 @@ where
     Kmer<K>: KmerBits,
 {
     index: &'a ReferenceIndex,
-    end_cache: &'a UnitigEndCache,
+    end_cache: Option<&'a UnitigEndCache>,
     output: &'a OutputInfo,
     stats: &'a MappingStats,
     progress: &'a ProgressBar,
@@ -647,7 +651,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         index: &'a ReferenceIndex,
-        end_cache: &'a UnitigEndCache,
+        end_cache: Option<&'a UnitigEndCache>,
         output: &'a OutputInfo,
         stats: &'a MappingStats,
         binning: &'a BinPos,

@@ -19,7 +19,6 @@ use crate::io::rad::write_rad_header_bulk;
 use crate::io::threads::{MappingStats, OutputInfo};
 use crate::mapping::hit_searcher::SkippingStrategy;
 use crate::mapping::processors::BulkProcessor;
-use crate::mapping::unitig_end_cache::UnitigEndCache;
 
 #[derive(Args, Debug)]
 pub struct MapBulkArgs {
@@ -109,7 +108,6 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
     let progress = make_progress_bar(args.quiet);
 
     let k = index.k();
-    let end_cache = UnitigEndCache::new(5_000_000);
     let num_threads = args.threads.max(1);
 
     // Dispatch on K and run the pipeline via paraseq
@@ -117,7 +115,7 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
         run_bulk_pipeline::<K>(
             &args.read1, &args.read2,
             &output_info, &stats,
-            &index, strat, is_paired, &end_cache,
+            &index, strat, is_paired,
             num_threads, &progress,
         )?;
     });
@@ -173,7 +171,6 @@ fn run_bulk_pipeline<const K: usize>(
     index: &ReferenceIndex,
     strat: SkippingStrategy,
     is_paired: bool,
-    end_cache: &UnitigEndCache,
     num_threads: usize,
     progress: &ProgressBar,
 ) -> Result<()>
@@ -182,7 +179,7 @@ where
 {
     use paraseq::parallel::ParallelReader;
 
-    let mut processor = BulkProcessor::<K>::new(index, end_cache, output, stats, strat, progress);
+    let mut processor = BulkProcessor::<K>::new(index, None, output, stats, strat, progress);
 
     if is_paired {
         let r1 = open_concatenated_readers(read1_paths)?;

@@ -22,7 +22,6 @@ use crate::mapping::processors::ScrnaProcessor;
 use crate::mapping::protocols::custom::parse_custom_geometry;
 use crate::mapping::protocols::scrna::ChromiumProtocol;
 use crate::mapping::protocols::Protocol;
-use crate::mapping::unitig_end_cache::UnitigEndCache;
 
 use super::map_bulk::make_progress_bar;
 
@@ -135,7 +134,6 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
 
     let k = index.k();
     let with_position = args.with_position;
-    let end_cache = UnitigEndCache::new(5_000_000);
     let num_threads = args.threads.max(1);
 
     // Dispatch on K and run the pipeline via paraseq
@@ -144,7 +142,7 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
             &args.read1, &args.read2,
             &output_info, &stats,
             &index, strat, protocol.as_ref(), bc_len, umi_len,
-            with_position, &read_length_samples, &end_cache,
+            with_position, &read_length_samples,
             num_threads, &progress,
         )?;
     });
@@ -224,7 +222,6 @@ fn run_scrna_pipeline<const K: usize>(
     umi_len: u16,
     with_position: bool,
     read_length_samples: &Mutex<Vec<u32>>,
-    end_cache: &UnitigEndCache,
     num_threads: usize,
     progress: &indicatif::ProgressBar,
 ) -> Result<()>
@@ -239,7 +236,7 @@ where
     let reader2 = paraseq::fastq::Reader::new(r2);
 
     let mut processor = ScrnaProcessor::<K>::new(
-        index, end_cache, output, stats, strat, protocol, bc_len, umi_len, with_position,
+        index, None, output, stats, strat, protocol, bc_len, umi_len, with_position,
         read_length_samples, progress,
     );
 
