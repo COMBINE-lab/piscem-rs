@@ -47,15 +47,18 @@ Rust is **faster than C++** across both bulk and scRNA workloads (Apple Silicon 
 
 **scRNA** (PBMC 1k v3, 33.4M reads, Chromium V3, gencode v44, 237K refs):
 
-| Threads | C++ | Rust | Ratio |
-|--------:|----:|-----:|------:|
-| 8 | 114s | 106s | 0.93x |
+| Platform | Threads | C++ | Rust | Ratio |
+|----------|--------:|----:|-----:|------:|
+| Apple Silicon M2 Max | 8 | 114s | 111s | 0.97x |
+| x86-64 Linux | 8 | 55s | 47s | 0.85x |
 
 Mapping counts are identical: 28,968,858 / 33,436,697 (86.64%) for both implementations.
 
 Key optimizations applied:
 - **AHashMap for hit_map**: Replaced `nohash-hasher` (identity hash) which caused pathological SwissTable H2 collisions with sequential transcript IDs (~38% regression on scRNA with 237K refs). `AHashMap` properly distributes hash bits for SwissTable SIMD probing.
 - **AHashSet for observed_ecs**: Replaced standard `HashSet<u64>` (SipHash) with `AHashSet<u64>` matching C++ `ankerl::unordered_dense::set` performance.
+- **rapidhash in sshash-rs**: Replaced ahash for MPHF and minimizer hashing. ahash switches algorithm when AES-NI is available (via `target-cpu=native`), silently breaking serialized indices. rapidhash is CPU-feature independent.
+- **Optional UnitigEndCache**: Only scATAC uses the cache; bulk and scRNA pass `None`, avoiding DashMap overhead. This was the primary source of the x86-64 performance gap.
 - **LocatedHit**: Eliminated double `locate_with_end` Elias-Fano successor queries in dictionary lookups
 - **from_ascii_unchecked**: Eliminated `Kmer::from_str` string round-trips (~15% of worker thread time), changed streaming query API from `&str` to `&[u8]`
 - **Paraseq native processing**: Zero-copy read access, per-thread stat accumulation (reduced atomic contention at high thread counts)
@@ -72,6 +75,8 @@ Key optimizations applied:
 3. **Default mapping strategy**: `get_raw_hits_sketch` with PERMISSIVE mode, no structural constraints initially
 4. **C++ global mutable state → Rust struct fields**: `ref_shift`/`pos_mask` stored in `EntryEncoding`, passed by reference (not global)
 5. **sshash-rs const-generic K**: Use `dispatch_on_k!(k, K => { ... })` at mapping entry point
+6. **rapidhash for index hashing**: sshash-rs uses rapidhash (not ahash) for MPHF and minimizer hashing — CPU-feature independent, indices portable across `target-cpu=native`. ahash is still used in piscem-rs for ephemeral hot-path HashMaps (hit_map, observed_ecs) where portability doesn't matter.
+7. **UnitigEndCache is scATAC-only**: Bulk and scRNA pass `None` to avoid DashMap overhead
 6. **Succinct data structure crates**: `sux` 0.12 git main (with epserde feature), NOT `cseq` or `sucds`
 7. **Test data**: Pre-built C++ indices expected in `test_data/` directory
 8. **libradicl**: Use git dependency to `develop` branch for RAD comparison
