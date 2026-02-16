@@ -20,6 +20,7 @@ The full implementation plan with C++ → Rust type mappings, architectural note
 - **Phase 7: Poison builder + CanonicalKmer** — `build-poison` CLI, CanonicalKmer newtype
 - **Phase 8: scATAC parity** — Triple-file input, every-kmer mode, bin-based merge, 100% record parity
 - **Phase 9: Idiomatic paraseq refactor** — Replaced custom crossbeam producer-consumer pipeline with paraseq's native `ParallelProcessor`/`PairedParallelProcessor`/`MultiParallelProcessor` traits. Eliminated intermediate `ReadPair`/`ReadTriplet` owned copies; reads processed in-place from paraseq buffers (zero-copy for single-line FASTQ). Per-thread stats flushed once via `on_thread_complete()` instead of per-chunk atomics.
+- **Phase 10: Multi-file parallel decompression** — Switched from concatenated single-reader streams (`open_concatenated_readers` + `fastq::Reader`) to paraseq's `Collection` API (`fastx::Collection` with `CollectionType::Paired`/`Single`/`Multi`). Enables parallel decompression across multiple input file sets. Processor trait impls updated from `fastq::RefRecord` to `fastx::RefRecord`.
 
 ### Parity Status
 
@@ -41,7 +42,7 @@ Rust is **faster than C++** across both bulk and scRNA workloads (Apple Silicon 
 
 | Threads | C++ | Rust | Ratio |
 |--------:|----:|-----:|------:|
-| 1 | 14.4s | 14.7s | 1.02x |
+| 1 | 14.3s | 14.0s | 0.98x |
 | 4 | 3.9s | 3.8s | 0.96x |
 | 8 | 3.3s | 2.4s | 0.71x |
 
@@ -62,6 +63,7 @@ Key optimizations applied:
 - **LocatedHit**: Eliminated double `locate_with_end` Elias-Fano successor queries in dictionary lookups
 - **from_ascii_unchecked**: Eliminated `Kmer::from_str` string round-trips (~15% of worker thread time), changed streaming query API from `&str` to `&[u8]`
 - **Paraseq native processing**: Zero-copy read access, per-thread stat accumulation (reduced atomic contention at high thread counts)
+- **Paraseq Collection**: Multi-file parallel decompression via `fastx::Collection` — threads distributed across reader groups when multiple file sets provided (e.g., `-1 a.fq.gz,b.fq.gz`). No regression for single-file case.
 
 ### Next Up
 
@@ -84,12 +86,12 @@ Key optimizations applied:
 
 ## Threading Architecture
 
-The mapping pipeline uses **paraseq's native parallel processing traits** — no custom threading infrastructure:
+The mapping pipeline uses **paraseq's `Collection` API** for parallel I/O across multiple input files:
 
 ```
-paraseq Reader (mutex-guarded I/O)
-  └─ spawns N worker threads via std::thread::scope
-     └─ each thread: lock reader → fill RecordSet → unlock → process batch
+paraseq Collection (Vec<fastx::Reader>, CollectionType)
+  └─ distributes threads across reader groups (auto: total_threads / num_groups)
+     └─ each group: mutex-guarded I/O → fill RecordSet → process batch
         └─ Processor struct (one clone per thread, lazy-init state)
            ├─ process_record_pair_batch(): map reads, accumulate RAD output
            ├─ on_batch_complete(): backpatch chunk header, flush to shared file
@@ -111,9 +113,13 @@ paraseq Reader (mutex-guarded I/O)
 ```rust
 dispatch_on_k!(k, K => {
     let mut processor = BulkProcessor::<K>::new(index, end_cache, output, stats, strat);
-    let reader1 = paraseq::fastq::Reader::new(open_concatenated_readers(&read1_paths)?);
-    let reader2 = paraseq::fastq::Reader::new(open_concatenated_readers(&read2_paths)?);
-    reader1.process_parallel_paired(reader2, &mut processor, num_threads)?;
+    let mut readers = Vec::new();
+    for (r1, r2) in read1_paths.iter().zip(read2_paths.iter()) {
+        readers.push(paraseq::fastx::Reader::new(open_with_decompression(r1)?)?);
+        readers.push(paraseq::fastx::Reader::new(open_with_decompression(r2)?)?);
+    }
+    let collection = Collection::new(readers, CollectionType::Paired)?;
+    collection.process_parallel_paired(&mut processor, num_threads, None)?;
 });
 ```
 
@@ -138,8 +144,10 @@ use mem_dbg::{MemSize, SizeFlags};
 // ef.mem_size(SizeFlags::default())
 
 // paraseq parallel processing (explicit lifetime on trait impl):
-use paraseq::parallel::{ParallelProcessor, PairedParallelProcessor, MultiParallelProcessor, ParallelReader};
-// impl<'a, 'r, const K: usize> PairedParallelProcessor<RefRecord<'r>> for MyProcessor<'a, K>
+use paraseq::parallel::{ParallelProcessor, PairedParallelProcessor, MultiParallelProcessor};
+use paraseq::fastx::{Collection, CollectionType};
+// Processors impl traits for fastx::RefRecord (not fastq::RefRecord) — Collection uses fastx
+// impl<'a, 'r, const K: usize> PairedParallelProcessor<paraseq::fastx::RefRecord<'r>> for MyProcessor<'a, K>
 // (NOT RefRecord<'_> — anonymous lifetimes in impl Trait are unstable)
 ```
 
@@ -194,7 +202,7 @@ piscem-rs/
         custom.rs               # CustomProtocol + geometry parser (recursive descent)
     io/
       rad.rs                    # RadWriter + RAD headers/records (SC + bulk + ATAC)
-      fastx.rs                  # open_concatenated_readers(), MultiReader, paraseq re-exports
+      fastx.rs                  # open_with_decompression(), Collection/CollectionType re-exports, MultiReader
       threads.rs                # OutputInfo (mutex RAD file), MappingStats (atomic counters), ThreadConfig
       map_info.rs               # map_info.json writer
     verify/
