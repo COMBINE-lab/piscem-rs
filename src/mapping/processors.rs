@@ -206,14 +206,14 @@ unsafe impl<const K: usize> Send for BulkProcessor<'_, K> where Kmer<K>: KmerBit
 
 // --- Bulk PE ---
 
-impl<'a, 'r, const K: usize> PairedParallelProcessor<paraseq::fastq::RefRecord<'r>>
+impl<'a, 'r, const K: usize> PairedParallelProcessor<paraseq::fastx::RefRecord<'r>>
     for BulkProcessor<'a, K>
 where
     Kmer<K>: KmerBits,
 {
     fn process_record_pair_batch(
         &mut self,
-        record_pairs: impl Iterator<Item = (paraseq::fastq::RefRecord<'r>, paraseq::fastq::RefRecord<'r>)>,
+        record_pairs: impl Iterator<Item = (paraseq::fastx::RefRecord<'r>, paraseq::fastx::RefRecord<'r>)>,
     ) -> paraseq::Result<()> {
         let index = self.index;
         let end_cache = self.end_cache;
@@ -284,14 +284,14 @@ where
 
 // --- Bulk SE ---
 
-impl<'a, 'r, const K: usize> ParallelProcessor<paraseq::fastq::RefRecord<'r>>
+impl<'a, 'r, const K: usize> ParallelProcessor<paraseq::fastx::RefRecord<'r>>
     for BulkProcessor<'a, K>
 where
     Kmer<K>: KmerBits,
 {
     fn process_record_batch(
         &mut self,
-        records: impl Iterator<Item = paraseq::fastq::RefRecord<'r>>,
+        records: impl Iterator<Item = paraseq::fastx::RefRecord<'r>>,
     ) -> paraseq::Result<()> {
         let index = self.index;
         let end_cache = self.end_cache;
@@ -447,14 +447,14 @@ where
 
 unsafe impl<const K: usize> Send for ScrnaProcessor<'_, K> where Kmer<K>: KmerBits {}
 
-impl<'a, 'r, const K: usize> PairedParallelProcessor<paraseq::fastq::RefRecord<'r>>
+impl<'a, 'r, const K: usize> PairedParallelProcessor<paraseq::fastx::RefRecord<'r>>
     for ScrnaProcessor<'a, K>
 where
     Kmer<K>: KmerBits,
 {
     fn process_record_pair_batch(
         &mut self,
-        record_pairs: impl Iterator<Item = (paraseq::fastq::RefRecord<'r>, paraseq::fastq::RefRecord<'r>)>,
+        record_pairs: impl Iterator<Item = (paraseq::fastx::RefRecord<'r>, paraseq::fastx::RefRecord<'r>)>,
     ) -> paraseq::Result<()> {
         let index = self.index;
         let end_cache = self.end_cache;
@@ -697,7 +697,7 @@ where
 
 unsafe impl<const K: usize> Send for ScatacProcessor<'_, K> where Kmer<K>: KmerBits {}
 
-impl<'a, 'r, const K: usize> MultiParallelProcessor<paraseq::fastq::RefRecord<'r>>
+impl<'a, 'r, const K: usize> MultiParallelProcessor<paraseq::fastx::RefRecord<'r>>
     for ScatacProcessor<'a, K>
 where
     Kmer<K>: KmerBits,
@@ -705,7 +705,7 @@ where
     fn process_multi_record_batch(
         &mut self,
         multi_records: impl Iterator<
-            Item = SmallVec<[paraseq::fastq::RefRecord<'r>; paraseq::MAX_ARITY]>,
+            Item = SmallVec<[paraseq::fastx::RefRecord<'r>; paraseq::MAX_ARITY]>,
         >,
     ) -> paraseq::Result<()> {
         let index = self.index;

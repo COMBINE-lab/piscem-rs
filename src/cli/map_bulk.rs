@@ -13,7 +13,7 @@ use tracing::info;
 use sshash_lib::{Kmer, KmerBits, dispatch_on_k};
 
 use crate::index::reference_index::ReferenceIndex;
-use crate::io::fastx::open_concatenated_readers;
+use crate::io::fastx::{open_with_decompression, Collection, CollectionType};
 use crate::io::map_info::write_map_info;
 use crate::io::rad::write_rad_header_bulk;
 use crate::io::threads::{MappingStats, OutputInfo};
@@ -177,23 +177,37 @@ fn run_bulk_pipeline<const K: usize>(
 where
     Kmer<K>: KmerBits,
 {
-    use paraseq::parallel::ParallelReader;
-
     let mut processor = BulkProcessor::<K>::new(index, None, output, stats, strat, progress);
 
     if is_paired {
-        let r1 = open_concatenated_readers(read1_paths)?;
-        let r2 = open_concatenated_readers(read2_paths)?;
-        let reader1 = paraseq::fastq::Reader::new(r1);
-        let reader2 = paraseq::fastq::Reader::new(r2);
-        reader1
-            .process_parallel_paired(reader2, &mut processor, num_threads)
+        let mut readers = Vec::with_capacity(read1_paths.len() * 2);
+        for (r1_path, r2_path) in read1_paths.iter().zip(read2_paths.iter()) {
+            readers.push(
+                paraseq::fastx::Reader::new(open_with_decompression(r1_path)?)
+                    .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r1_path, e))?,
+            );
+            readers.push(
+                paraseq::fastx::Reader::new(open_with_decompression(r2_path)?)
+                    .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r2_path, e))?,
+            );
+        }
+        let collection = Collection::new(readers, CollectionType::Paired)
+            .map_err(|e| anyhow::anyhow!("failed to create collection: {}", e))?;
+        collection
+            .process_parallel_paired(&mut processor, num_threads, None)
             .map_err(|e| anyhow::anyhow!("mapping failed: {}", e))?;
     } else {
-        let r1 = open_concatenated_readers(read1_paths)?;
-        let reader1 = paraseq::fastq::Reader::new(r1);
-        reader1
-            .process_parallel(&mut processor, num_threads)
+        let mut readers = Vec::with_capacity(read1_paths.len());
+        for r1_path in read1_paths {
+            readers.push(
+                paraseq::fastx::Reader::new(open_with_decompression(r1_path)?)
+                    .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r1_path, e))?,
+            );
+        }
+        let collection = Collection::new(readers, CollectionType::Single)
+            .map_err(|e| anyhow::anyhow!("failed to create collection: {}", e))?;
+        collection
+            .process_parallel(&mut processor, num_threads, None)
             .map_err(|e| anyhow::anyhow!("mapping failed: {}", e))?;
     }
 

@@ -22,7 +22,7 @@ use tracing::info;
 use sshash_lib::{Kmer, KmerBits, dispatch_on_k};
 
 use crate::index::reference_index::ReferenceIndex;
-use crate::io::fastx::open_concatenated_readers;
+use crate::io::fastx::{open_with_decompression, Collection, CollectionType};
 use crate::io::map_info::write_map_info;
 use crate::io::rad::write_rad_header_atac;
 use crate::io::threads::{MappingStats, OutputInfo};
@@ -221,23 +221,30 @@ fn run_atac_pipeline<const K: usize>(
 where
     Kmer<K>: KmerBits,
 {
-    use paraseq::parallel::ParallelReader;
-
-    // R1 (genomic left) is the "primary" reader; barcode + R2 are "rest".
-    let r1 = open_concatenated_readers(read1_paths)?;
-    let rbc = open_concatenated_readers(barcode_paths)?;
-    let r2 = open_concatenated_readers(read2_paths)?;
-
-    let reader1 = paraseq::fastq::Reader::new(r1);
-    let reader_bc = paraseq::fastq::Reader::new(rbc);
-    let reader2 = paraseq::fastq::Reader::new(r2);
-
     let mut processor = ScatacProcessor::<K>::new(
         index, end_cache, output, stats, binning, bc_len, tn5_shift, min_overlap, progress,
     );
 
-    reader1
-        .process_parallel_multi(vec![reader_bc, reader2], &mut processor, num_threads)
+    // Triple-file: interleave [R1, barcode, R2] per file set
+    let mut readers = Vec::with_capacity(read1_paths.len() * 3);
+    for i in 0..read1_paths.len() {
+        readers.push(
+            paraseq::fastx::Reader::new(open_with_decompression(&read1_paths[i])?)
+                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", read1_paths[i], e))?,
+        );
+        readers.push(
+            paraseq::fastx::Reader::new(open_with_decompression(&barcode_paths[i])?)
+                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", barcode_paths[i], e))?,
+        );
+        readers.push(
+            paraseq::fastx::Reader::new(open_with_decompression(&read2_paths[i])?)
+                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", read2_paths[i], e))?,
+        );
+    }
+    let collection = Collection::new(readers, CollectionType::Multi { arity: 3 })
+        .map_err(|e| anyhow::anyhow!("failed to create collection: {}", e))?;
+    collection
+        .process_parallel_multi(&mut processor, num_threads, None)
         .map_err(|e| anyhow::anyhow!("mapping failed: {}", e))?;
 
     Ok(())

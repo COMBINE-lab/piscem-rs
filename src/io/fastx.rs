@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 
 // Re-export paraseq types used by the mapping pipeline.
 pub use paraseq::fastq;
+pub use paraseq::fastx::{Collection, CollectionType};
 pub use paraseq::parallel::{
     MultiParallelProcessor, PairedParallelProcessor, ParallelProcessor, ParallelReader,
 };
@@ -18,7 +19,7 @@ pub use paraseq::Record;
 // ---------------------------------------------------------------------------
 
 /// Open a single file with automatic decompression (gzip, zstd, etc.).
-fn open_with_decompression(path: &str) -> Result<Box<dyn std::io::Read + Send>> {
+pub(crate) fn open_with_decompression(path: &str) -> Result<Box<dyn std::io::Read + Send>> {
     let (reader, _format) = niffler::send::from_path(path)
         .with_context(|| format!("failed to open {}", path))?;
     Ok(reader)
