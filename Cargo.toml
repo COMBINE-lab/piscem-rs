@@ -30,7 +30,7 @@ paraseq = "0.4"
 niffler = "2"
 
 # Succinct data structures (same versions as sshash-rs)
-sux = { git = "https://github.com/vigna/sux-rs", features = ["epserde"] }
+sux = { version = "0.12", features = ["epserde"] }
 epserde = "0.12"
 value-traits = "0.2"
 mem_dbg = "0.4.0"
@@ -42,6 +42,14 @@ libradicl = { git = "https://github.com/COMBINE-lab/libradicl.git", branch = "de
 tempfile = "3"
 flate2 = "1"
 libradicl = { git = "https://github.com/COMBINE-lab/libradicl.git", branch = "develop" }
+
+[[example]]
+name = "atac_mismatch_diag"
+required-features = ["parity-test"]
+
+[[example]]
+name = "test_atac_compare"
+required-features = ["parity-test"]
 
 [profile.release]
 lto = "thin"

@@ -87,8 +87,21 @@ pub(crate) fn is_homopolymer(kmer: &[u8]) -> bool {
     kmer.iter().all(|&b| b == first)
 }
 
-/// Parse a read k-mer from a byte slice.
-/// ReadKmerIter guarantees only valid uppercase DNA bases in the window.
+/// Parse a k-mer from a byte slice known to contain only valid DNA bases
+/// (e.g. SPSS unitig sequence). No per-base validation is performed.
+#[inline]
+fn parse_read_kmer_unchecked<const K: usize>(bytes: &[u8]) -> Option<Kmer<K>>
+where
+    Kmer<K>: KmerBits,
+{
+    if bytes.len() != K {
+        return None;
+    }
+    Some(Kmer::<K>::from_ascii_unchecked(bytes))
+}
+
+/// Parse a k-mer from a byte slice that may contain invalid bases (e.g. N).
+/// Returns `None` if the slice has wrong length or any non-ACGT character.
 #[inline]
 fn parse_read_kmer<const K: usize>(bytes: &[u8]) -> Option<Kmer<K>>
 where
@@ -96,6 +109,11 @@ where
 {
     if bytes.len() != K {
         return None;
+    }
+    for &b in bytes {
+        if !is_valid_base(b) {
+            return None;
+        }
     }
     Some(Kmer::<K>::from_ascii_unchecked(bytes))
 }
@@ -727,7 +745,7 @@ impl<'idx> HitSearcher<'idx> {
                         let ref_kmer: Kmer<K> =
                             index.dict().kmer_at_pos(c_curr_pos as usize);
                         let read_kmer_bytes = iter.kmer_bytes();
-                        if let Some(read_kmer) = parse_read_kmer::<K>(read_kmer_bytes)
+                        if let Some(read_kmer) = parse_read_kmer_unchecked::<K>(read_kmer_bytes)
                         {
                             let match_type = kmer_match(&read_kmer, &ref_kmer);
                             matches = match_type != KmerMatchType::NoMatch;
@@ -829,7 +847,7 @@ impl<'idx> HitSearcher<'idx> {
 
         // Compare read k-mer to ref k-mer.
         let read_kmer_bytes = iter.kmer_bytes();
-        let read_kmer = match parse_read_kmer::<K>(read_kmer_bytes) {
+        let read_kmer = match parse_read_kmer_unchecked::<K>(read_kmer_bytes) {
             Some(k) => k,
             None => return false,
         };
@@ -1061,7 +1079,22 @@ mod tests {
         let kmer: Option<Kmer<5>> = parse_read_kmer(b"ACGTG");
         assert!(kmer.is_some());
 
+        // N in sequence returns None
         let bad: Option<Kmer<5>> = parse_read_kmer(b"ACNGT");
+        assert!(bad.is_none());
+
+        // Wrong length returns None
+        let short: Option<Kmer<5>> = parse_read_kmer(b"ACGT");
+        assert!(short.is_none());
+    }
+
+    #[test]
+    fn test_parse_read_kmer_unchecked() {
+        let kmer: Option<Kmer<5>> = parse_read_kmer_unchecked(b"ACGTG");
+        assert!(kmer.is_some());
+
+        // Wrong length returns None
+        let bad: Option<Kmer<5>> = parse_read_kmer_unchecked(b"ACGT");
         assert!(bad.is_none());
     }
 }

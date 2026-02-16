@@ -104,8 +104,7 @@ fn integration_rust_index_lookup() {
                     query.reset();
                     continue;
                 }
-                let ks = std::str::from_utf8(kb).unwrap();
-                let result = query.lookup(ks);
+                let result = query.lookup(kb);
                 read_total += 1;
                 if result.is_found() {
                     read_found += 1;
