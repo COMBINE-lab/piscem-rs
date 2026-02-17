@@ -35,6 +35,8 @@ pub struct OutputInfo {
     pub num_chunks: AtomicUsize,
     /// Mutex-guarded RAD output file.
     pub rad_file: Mutex<BufWriter<File>>,
+    /// Mutex-guarded unmapped barcode count file (scRNA/scATAC only).
+    pub unmapped_bc_file: Option<Mutex<BufWriter<File>>>,
 }
 
 // ---------------------------------------------------------------------------

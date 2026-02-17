@@ -102,6 +102,7 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
                 .try_clone()
                 .context("failed to clone RAD file handle")?,
         )),
+        unmapped_bc_file: None,
     };
 
     // Setup progress bar

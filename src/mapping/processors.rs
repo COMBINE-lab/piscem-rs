@@ -11,6 +11,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
+use ahash::AHashMap;
 use indicatif::ProgressBar;
 use paraseq::parallel::{MultiParallelProcessor, PairedParallelProcessor, ParallelProcessor};
 use paraseq::Record;
@@ -367,6 +368,7 @@ where
 {
     common: CommonThreadState<'a, K>,
     local_rlen_samples: Vec<u32>,
+    unmapped_bc_counts: AHashMap<u64, u32>,
 }
 
 /// Parallel processor for scRNA-seq mapping.
@@ -469,6 +471,7 @@ where
         let st = self.state.get_or_insert_with(|| ScrnaThreadState {
             common: CommonThreadState::new(index, end_cache),
             local_rlen_samples: Vec::new(),
+            unmapped_bc_counts: AHashMap::new(),
         });
         let s = &mut st.common;
         s.ensure_chunk_started();
@@ -592,6 +595,8 @@ where
                     &mut s.rad_writer,
                 );
                 s.num_reads_in_chunk += 1;
+            } else {
+                *st.unmapped_bc_counts.entry(bc_packed).or_insert(0) += 1;
             }
         }
         self.progress.inc(batch_reads);
@@ -618,6 +623,19 @@ where
                 let mut samples = read_length_samples.lock().unwrap();
                 samples.extend_from_slice(&st.local_rlen_samples);
             }
+            // Write unmapped barcode counts to shared file
+            if let Some(ref unmapped_file) = output.unmapped_bc_file {
+                if !st.unmapped_bc_counts.is_empty() {
+                    let mut buf = Vec::with_capacity(st.unmapped_bc_counts.len() * 12);
+                    for (&bc, &count) in &st.unmapped_bc_counts {
+                        buf.extend_from_slice(&bc.to_le_bytes());
+                        buf.extend_from_slice(&count.to_le_bytes());
+                    }
+                    let mut file = unmapped_file.lock().unwrap();
+                    use std::io::Write;
+                    file.write_all(&buf).ok();
+                }
+            }
         }
         Ok(())
     }
@@ -626,6 +644,15 @@ where
 // ===========================================================================
 // ScatacProcessor
 // ===========================================================================
+
+/// Per-thread state for scATAC mapping (extends common state).
+struct ScatacThreadState<'a, const K: usize>
+where
+    Kmer<K>: KmerBits,
+{
+    common: CommonThreadState<'a, K>,
+    unmapped_bc_counts: AHashMap<u64, u32>,
+}
 
 /// Parallel processor for scATAC-seq mapping (triple-file input).
 pub struct ScatacProcessor<'a, const K: usize>
@@ -641,7 +668,7 @@ where
     bc_len: u16,
     tn5_shift: bool,
     min_overlap: i32,
-    state: Option<CommonThreadState<'a, K>>,
+    state: Option<ScatacThreadState<'a, K>>,
 }
 
 impl<'a, const K: usize> ScatacProcessor<'a, K>
@@ -715,9 +742,11 @@ where
         let tn5_shift = self.tn5_shift;
         let min_overlap = self.min_overlap;
 
-        let s = self
-            .state
-            .get_or_insert_with(|| CommonThreadState::new(index, end_cache));
+        let st = self.state.get_or_insert_with(|| ScatacThreadState {
+            common: CommonThreadState::new(index, end_cache),
+            unmapped_bc_counts: AHashMap::new(),
+        });
+        let s = &mut st.common;
         s.ensure_chunk_started();
 
         let mut batch_reads: u64 = 0;
@@ -855,6 +884,8 @@ where
                     &mut s.rad_writer,
                 );
                 s.num_reads_in_chunk += 1;
+            } else {
+                *st.unmapped_bc_counts.entry(bc_packed).or_insert(0) += 1;
             }
         }
         self.progress.inc(batch_reads);
@@ -863,8 +894,8 @@ where
 
     fn on_batch_complete(&mut self) -> paraseq::Result<()> {
         let output = self.output;
-        if let Some(s) = &mut self.state {
-            s.maybe_flush_chunk(output);
+        if let Some(st) = &mut self.state {
+            st.common.maybe_flush_chunk(output);
         }
         Ok(())
     }
@@ -872,9 +903,22 @@ where
     fn on_thread_complete(&mut self) -> paraseq::Result<()> {
         let output = self.output;
         let stats = self.stats;
-        if let Some(s) = &mut self.state {
-            s.finalize_chunk(output);
-            s.flush_stats(stats);
+        if let Some(st) = &mut self.state {
+            st.common.finalize_chunk(output);
+            st.common.flush_stats(stats);
+            // Write unmapped barcode counts to shared file
+            if let Some(ref unmapped_file) = output.unmapped_bc_file {
+                if !st.unmapped_bc_counts.is_empty() {
+                    let mut buf = Vec::with_capacity(st.unmapped_bc_counts.len() * 12);
+                    for (&bc, &count) in &st.unmapped_bc_counts {
+                        buf.extend_from_slice(&bc.to_le_bytes());
+                        buf.extend_from_slice(&count.to_le_bytes());
+                    }
+                    let mut file = unmapped_file.lock().unwrap();
+                    use std::io::Write;
+                    file.write_all(&buf).ok();
+                }
+            }
         }
         Ok(())
     }

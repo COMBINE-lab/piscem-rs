@@ -116,6 +116,11 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
         args.with_position,
     )?;
 
+    // Create unmapped barcode count file
+    let unmapped_bc_path = out_dir.join("unmapped_bc_count.bin");
+    let unmapped_bc_file = std::fs::File::create(&unmapped_bc_path)
+        .with_context(|| format!("failed to create {}", unmapped_bc_path.display()))?;
+
     // Setup shared state
     let stats = MappingStats::new();
     let output_info = OutputInfo {
@@ -125,6 +130,9 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
                 .try_clone()
                 .context("failed to clone RAD file handle")?,
         )),
+        unmapped_bc_file: Some(std::sync::Mutex::new(std::io::BufWriter::new(
+            unmapped_bc_file,
+        ))),
     };
 
     let read_length_samples: Mutex<Vec<u32>> = Mutex::new(Vec::new());
