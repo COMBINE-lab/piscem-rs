@@ -42,7 +42,7 @@ pub struct MapBulkArgs {
     #[arg(short = '2', long, value_delimiter = ',',
           requires = "read1", conflicts_with = "reads")]
     pub read2: Vec<String>,
-    /// Output directory
+    /// Output file stem (e.g. foo/bar/sample); creates foo/bar/sample.rad and foo/bar/sample.map_info.json
     #[arg(short = 'o', long)]
     pub output: String,
     /// Number of mapping threads
@@ -107,11 +107,16 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
         load_secs
     );
 
-    // Create output directory and RAD file
-    let out_dir = PathBuf::from(&args.output);
-    std::fs::create_dir_all(&out_dir)
-        .with_context(|| format!("failed to create output directory: {}", out_dir.display()))?;
-    let rad_path = out_dir.join("map.rad");
+    // Treat -o as a file stem: create parent dirs, then append extensions
+    let out_stem = PathBuf::from(&args.output);
+    if let Some(parent) = out_stem.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create output directory: {}", parent.display())
+            })?;
+        }
+    }
+    let rad_path = PathBuf::from(format!("{}.rad", args.output));
     let mut rad_file = std::fs::File::create(&rad_path)
         .with_context(|| format!("failed to create {}", rad_path.display()))?;
 
@@ -197,7 +202,7 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
 
     // Write map_info.json
     write_map_info(
-        &out_dir.join("map_info.json"),
+        &PathBuf::from(format!("{}.map_info.json", args.output)),
         num_reads,
         num_mapped,
         num_poisoned,
