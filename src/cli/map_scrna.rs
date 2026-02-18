@@ -232,6 +232,7 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
         num_mapped,
         num_poisoned,
         elapsed,
+        index.ref_sig_info(),
     )?;
 
     Ok(())

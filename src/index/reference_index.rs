@@ -9,7 +9,7 @@
 use anyhow::{Context, Result};
 use sshash_lib::Dictionary;
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::contig_table::{ContigTable, EntryEncoding};
 use super::eq_classes::EqClassMap;
@@ -18,6 +18,81 @@ use super::refinfo::RefInfo;
 
 use crate::mapping::projected_hits::ProjectedHits;
 use sshash_lib::LookupResult;
+
+// ---------------------------------------------------------------------------
+// File extension helpers
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// RefSigInfo
+// ---------------------------------------------------------------------------
+
+/// Reference signature hashes loaded from `{index_prefix}.sigs.json`.
+///
+/// Matches the C++ `ref_sig_info_t` struct. All four fields are hex-encoded
+/// hash strings. The file is optional — if absent, `load()` returns `None`.
+#[derive(Debug, Clone)]
+pub struct RefSigInfo {
+    pub sha256_names: String,
+    pub sha256_seqs: String,
+    pub sha512_names: String,
+    pub sha512_seqs: String,
+}
+
+impl RefSigInfo {
+    /// Try to load from `{prefix}.sigs.json`. Returns `None` if the file
+    /// does not exist. Warns and returns `None` if the file exists but
+    /// cannot be read or parsed.
+    fn try_load(prefix: &Path) -> Option<Self> {
+        let path = {
+            let mut p = prefix.to_path_buf();
+            let ext = match p.extension() {
+                Some(e) => format!("{}.sigs.json", e.to_string_lossy()),
+                None => "sigs.json".to_owned(),
+            };
+            p.set_extension(&ext);
+            p
+        };
+        if !path.exists() {
+            return None;
+        }
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(
+                    "Signature file {} exists but could not be opened: {}",
+                    path.display(),
+                    e
+                );
+                return None;
+            }
+        };
+        let v: serde_json::Value = match serde_json::from_reader(std::io::BufReader::new(file)) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "Signature file {} could not be parsed: {}",
+                    path.display(),
+                    e
+                );
+                return None;
+            }
+        };
+        let get = |key: &str| {
+            v.get(key)
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_owned()
+        };
+        info!("Loaded reference signatures from {}", path.display());
+        Some(Self {
+            sha256_names: get("sha256_names"),
+            sha256_seqs: get("sha256_seqs"),
+            sha512_names: get("sha512_names"),
+            sha512_seqs: get("sha512_seqs"),
+        })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // File extension helpers
@@ -75,6 +150,8 @@ pub struct ReferenceIndex {
     ec_table: Option<EqClassMap>,
     /// Optional poison k-mer table for mapping specificity.
     poison_table: Option<PoisonTable>,
+    /// Optional reference signature hashes from `{prefix}.sigs.json`.
+    sig_info: Option<RefSigInfo>,
 }
 
 impl ReferenceIndex {
@@ -181,6 +258,9 @@ impl ReferenceIndex {
             None
         };
 
+        // 7. Optionally load reference signature info
+        let sig_info = RefSigInfo::try_load(prefix);
+
         Ok(Self {
             dict,
             contig_table,
@@ -188,6 +268,7 @@ impl ReferenceIndex {
             encoding,
             ec_table,
             poison_table,
+            sig_info,
         })
     }
 
@@ -330,6 +411,12 @@ impl ReferenceIndex {
         self.poison_table.as_ref()
     }
 
+    /// Reference signature hashes, if a `.sigs.json` file was found alongside the index.
+    #[inline]
+    pub fn ref_sig_info(&self) -> Option<&RefSigInfo> {
+        self.sig_info.as_ref()
+    }
+
     /// Number of unitigs (contigs) in the index.
     #[inline]
     pub fn num_contigs(&self) -> usize {
@@ -387,6 +474,7 @@ impl ReferenceIndex {
             encoding,
             ec_table,
             poison_table,
+            sig_info: None,
         }
     }
 }

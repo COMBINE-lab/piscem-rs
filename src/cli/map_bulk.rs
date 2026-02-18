@@ -207,6 +207,7 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
         num_mapped,
         num_poisoned,
         elapsed,
+        index.ref_sig_info(),
     )?;
 
     Ok(())
