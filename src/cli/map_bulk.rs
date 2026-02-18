@@ -21,15 +21,26 @@ use crate::mapping::hit_searcher::SkippingStrategy;
 use crate::mapping::processors::BulkProcessor;
 
 #[derive(Args, Debug)]
+#[command(group(
+    clap::ArgGroup::new("input_reads")
+        .required(true)
+        .args(["reads", "read1"])
+))]
 pub struct MapBulkArgs {
     /// Index prefix path
     #[arg(short = 'i', long)]
     pub index: String,
-    /// Read 1 FASTQ files (comma-separated)
-    #[arg(short = '1', long, value_delimiter = ',')]
+    /// Single-end FASTQ files (comma-separated); mutually exclusive with -1/-2
+    #[arg(short = 'r', long = "reads", value_delimiter = ',',
+          conflicts_with_all = ["read1", "read2"])]
+    pub reads: Vec<String>,
+    /// Read 1 FASTQ files (comma-separated); requires -2
+    #[arg(short = '1', long, value_delimiter = ',',
+          requires = "read2", conflicts_with = "reads")]
     pub read1: Vec<String>,
-    /// Read 2 FASTQ files (comma-separated, omit for single-end)
-    #[arg(short = '2', long, value_delimiter = ',')]
+    /// Read 2 FASTQ files (comma-separated); requires -1
+    #[arg(short = '2', long, value_delimiter = ',',
+          requires = "read1", conflicts_with = "reads")]
     pub read2: Vec<String>,
     /// Output directory
     #[arg(short = 'o', long)]
@@ -57,14 +68,10 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
         other => anyhow::bail!("unknown skipping strategy: {}", other),
     };
 
-    let is_paired = !args.read2.is_empty();
+    let is_paired = !args.read1.is_empty();
     info!(
         "Mapping {} reads ({})",
-        if is_paired {
-            "paired-end"
-        } else {
-            "single-end"
-        },
+        if is_paired { "paired-end" } else { "single-end" },
         args.skipping_strategy,
     );
 
@@ -122,8 +129,13 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
 
     // Dispatch on K and run the pipeline via paraseq
     dispatch_on_k!(k, K => {
+        let (r1_paths, r2_paths) = if is_paired {
+            (args.read1.as_slice(), args.read2.as_slice())
+        } else {
+            (args.reads.as_slice(), [].as_slice())
+        };
         run_bulk_pipeline::<K>(
-            &args.read1, &args.read2,
+            r1_paths, r2_paths,
             &output_info, &stats,
             &index, strat, is_paired,
             num_threads, &progress,
