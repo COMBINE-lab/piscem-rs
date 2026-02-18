@@ -226,16 +226,11 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
     );
 
     // Write map_info.json
-    let cmdline = format!(
-        "piscem-rs map-scrna -i {} -g {} -o {}",
-        args.index, args.geometry, args.output
-    );
     write_map_info(
         &out_dir.join("map_info.json"),
         num_reads,
         num_mapped,
         num_poisoned,
-        &cmdline,
         elapsed,
     )?;
 

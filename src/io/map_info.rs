@@ -10,7 +10,6 @@ pub fn write_map_info(
     num_reads: u64,
     num_mapped: u64,
     num_poisoned: u64,
-    cmdline: &str,
     elapsed_secs: f64,
 ) -> Result<()> {
     let percent_mapped = if num_reads > 0 {
@@ -19,13 +18,15 @@ pub fn write_map_info(
         0.0
     };
 
+    let cmdline: Vec<String> = std::env::args().collect();
+
     let info = serde_json::json!({
         "num_reads": num_reads,
         "num_mapped": num_mapped,
         "num_poisoned": num_poisoned,
         "percent_mapped": format!("{:.2}", percent_mapped),
         "runtime_seconds": format!("{:.2}", elapsed_secs),
-        "cmdline": cmdline,
+        "cmdline": cmdline.join(" "),
     });
 
     let file = std::fs::File::create(path)?;
@@ -43,7 +44,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("map_info.json");
 
-        write_map_info(&path, 1000, 800, 10, "piscem-rs map-bulk ...", 42.5).unwrap();
+        write_map_info(&path, 1000, 800, 10, 42.5).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let val: serde_json::Value = serde_json::from_str(&content).unwrap();

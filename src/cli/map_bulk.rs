@@ -196,13 +196,11 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
     );
 
     // Write map_info.json
-    let cmdline = format!("piscem-rs map-bulk -i {} -o {}", args.index, args.output);
     write_map_info(
         &out_dir.join("map_info.json"),
         num_reads,
         num_mapped,
         num_poisoned,
-        &cmdline,
         elapsed,
     )?;
 
