@@ -18,7 +18,7 @@ use crate::io::map_info::write_map_info;
 use crate::io::rad::write_rad_header_sc;
 use crate::io::threads::{MappingStats, OutputInfo};
 use crate::mapping::hit_searcher::SkippingStrategy;
-use crate::mapping::processors::ScrnaProcessor;
+use crate::mapping::processors::{MappingOpts, ScrnaProcessor};
 use crate::mapping::protocols::custom::parse_custom_geometry;
 use crate::mapping::protocols::scrna::ChromiumProtocol;
 use crate::mapping::protocols::Protocol;
@@ -51,6 +51,22 @@ pub struct MapScrnaArgs {
     /// Disable poison k-mer filtering
     #[arg(long)]
     pub no_poison: bool,
+    /// Ignore highly-ambiguous hits rather than using EC-based fallback;
+    /// mutually exclusive with --max-ec-card
+    #[arg(long, conflicts_with = "max_ec_card")]
+    pub ignore_ambig_hits: bool,
+    /// Maximum equivalence class cardinality for ambiguous hit resolution
+    #[arg(long, default_value = "4096", conflicts_with = "ignore_ambig_hits")]
+    pub max_ec_card: u32,
+    /// Maximum k-mer occurrence count considered in the first mapping pass
+    #[arg(long, default_value = "256")]
+    pub max_hit_occ: usize,
+    /// Maximum occurrence for the recovery pass
+    #[arg(long, default_value = "1024")]
+    pub max_hit_occ_recover: usize,
+    /// Reads with more than this many accepted mappings are discarded
+    #[arg(long, default_value = "2500")]
+    pub max_read_occ: usize,
     /// Include mapping positions in RAD output
     #[arg(long)]
     pub with_position: bool,
@@ -89,10 +105,13 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
         protocol.umi_len(),
     );
 
+    // --ignore-ambig-hits disables EC table loading
+    let check_ambig = !args.ignore_ambig_hits;
+
     // Load index
     let index_prefix = Path::new(&args.index);
     info!("Loading index from {}", index_prefix.display());
-    let index = ReferenceIndex::load(index_prefix, true, !args.no_poison)?;
+    let index = ReferenceIndex::load(index_prefix, check_ambig, !args.no_poison)?;
     info!("Index loaded: k={}, {} refs", index.k(), index.num_refs());
 
     // Create output directory and RAD file
@@ -143,13 +162,19 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
     let k = index.k();
     let with_position = args.with_position;
     let num_threads = args.threads.max(1);
+    let opts = MappingOpts {
+        max_hit_occ: args.max_hit_occ,
+        max_hit_occ_recover: args.max_hit_occ_recover,
+        max_read_occ: args.max_read_occ,
+        max_ec_card: if args.ignore_ambig_hits { 0 } else { args.max_ec_card },
+    };
 
     // Dispatch on K and run the pipeline via paraseq
     dispatch_on_k!(k, K => {
         run_scrna_pipeline::<K>(
             &args.read1, &args.read2,
             &output_info, &stats,
-            &index, strat, protocol.as_ref(), bc_len, umi_len,
+            &index, strat, opts, protocol.as_ref(), bc_len, umi_len,
             with_position, &read_length_samples,
             num_threads, &progress,
         )?;
@@ -225,6 +250,7 @@ fn run_scrna_pipeline<const K: usize>(
     stats: &MappingStats,
     index: &ReferenceIndex,
     strat: SkippingStrategy,
+    opts: MappingOpts,
     protocol: &dyn Protocol,
     bc_len: u16,
     umi_len: u16,
@@ -237,7 +263,7 @@ where
     Kmer<K>: KmerBits,
 {
     let mut processor = ScrnaProcessor::<K>::new(
-        index, None, output, stats, strat, protocol, bc_len, umi_len, with_position,
+        index, None, output, stats, strat, opts, protocol, bc_len, umi_len, with_position,
         read_length_samples, progress,
     );
 

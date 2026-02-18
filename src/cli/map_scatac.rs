@@ -27,21 +27,32 @@ use crate::io::map_info::write_map_info;
 use crate::io::rad::write_rad_header_atac;
 use crate::io::threads::{MappingStats, OutputInfo};
 use crate::mapping::binning::BinPos;
-use crate::mapping::processors::ScatacProcessor;
+use crate::mapping::processors::{MappingOpts, ScatacProcessor};
 use crate::mapping::unitig_end_cache::UnitigEndCache;
 
 use super::map_bulk::make_progress_bar;
 
 #[derive(Args, Debug)]
+#[command(group(
+    clap::ArgGroup::new("bio_reads")
+        .required(true)
+        .args(["reads", "read1"])
+))]
 pub struct MapScatacArgs {
     /// Index prefix path
     #[arg(short = 'i', long)]
     pub index: String,
-    /// Read 1 FASTQ files (genomic left, comma-separated)
-    #[arg(short = '1', long, value_delimiter = ',')]
+    /// Single-end biological FASTQ files (comma-separated); mutually exclusive with -1/-2
+    #[arg(short = 'r', long = "reads", value_delimiter = ',',
+          conflicts_with_all = ["read1", "read2"])]
+    pub reads: Vec<String>,
+    /// Read 1 FASTQ files (genomic left, comma-separated); requires -2
+    #[arg(short = '1', long, value_delimiter = ',',
+          requires = "read2", conflicts_with = "reads")]
     pub read1: Vec<String>,
-    /// Read 2 FASTQ files (genomic right, comma-separated)
-    #[arg(short = '2', long, value_delimiter = ',')]
+    /// Read 2 FASTQ files (genomic right, comma-separated); requires -1
+    #[arg(short = '2', long, value_delimiter = ',',
+          requires = "read1", conflicts_with = "reads")]
     pub read2: Vec<String>,
     /// Barcode FASTQ files (comma-separated)
     #[arg(short = 'b', long, value_delimiter = ',')]
@@ -61,6 +72,24 @@ pub struct MapScatacArgs {
     /// Disable poison k-mer filtering (default: true, matching C++ behavior)
     #[arg(long, default_value = "true")]
     pub no_poison: bool,
+    /// Enable ambiguous hit checking (EC table loading); disabled by default for ATAC
+    #[arg(long)]
+    pub check_ambig_hits: bool,
+    /// Maximum equivalence class cardinality for ambiguous hit resolution
+    #[arg(long, default_value = "256")]
+    pub max_ec_card: u32,
+    /// Maximum k-mer occurrence count considered in the first mapping pass
+    #[arg(long, default_value = "256")]
+    pub max_hit_occ: usize,
+    /// Maximum occurrence for the recovery pass
+    #[arg(long, default_value = "1024")]
+    pub max_hit_occ_recover: usize,
+    /// Reads with more than this many accepted mappings are discarded
+    #[arg(long, default_value = "2500")]
+    pub max_read_occ: usize,
+    /// UnitigEndCache capacity (number of entries)
+    #[arg(long, default_value = "5000000")]
+    pub end_cache_capacity: usize,
     /// Bin size for genomic binning
     #[arg(long, default_value = "1000")]
     pub bin_size: u64,
@@ -97,11 +126,13 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
         args.thr,
     );
 
+    let is_paired = !args.read1.is_empty();
+
     // Load index
     let index_prefix = Path::new(&args.index);
     info!("Loading index from {}", index_prefix.display());
     // C++ ATAC: check_ambig_hits defaults to false, so EC table is NOT loaded
-    let index = ReferenceIndex::load(index_prefix, false, !args.no_poison)?;
+    let index = ReferenceIndex::load(index_prefix, args.check_ambig_hits, !args.no_poison)?;
     info!("Index loaded: k={}, {} refs", index.k(), index.num_refs());
 
     // Create output directory and RAD file
@@ -155,15 +186,27 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
     let k = index.k();
     let tn5_shift = !args.no_tn5_shift;
     let min_overlap = args.min_overlap;
-    let end_cache = UnitigEndCache::new(5_000_000);
+    let end_cache = UnitigEndCache::new(args.end_cache_capacity);
     let num_threads = args.threads.max(1);
+    let opts = MappingOpts {
+        max_hit_occ: args.max_hit_occ,
+        max_hit_occ_recover: args.max_hit_occ_recover,
+        max_read_occ: args.max_read_occ,
+        max_ec_card: args.max_ec_card,
+    };
 
     // Dispatch on K and run the pipeline via paraseq multi-reader
     dispatch_on_k!(k, K => {
+        let (bio_paths, r2_paths) = if is_paired {
+            (args.read1.as_slice(), args.read2.as_slice())
+        } else {
+            (args.reads.as_slice(), [].as_slice())
+        };
         run_atac_pipeline::<K>(
-            &args.read1, &args.barcode, &args.read2,
+            bio_paths, &args.barcode, r2_paths,
             &output_info, &stats,
             &index, &binning, bc_len, tn5_shift, min_overlap, Some(&end_cache),
+            is_paired, opts,
             num_threads, &progress,
         )?;
     });
@@ -212,7 +255,7 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn run_atac_pipeline<const K: usize>(
-    read1_paths: &[String],
+    bio_paths: &[String],
     barcode_paths: &[String],
     read2_paths: &[String],
     output: &OutputInfo,
@@ -223,6 +266,8 @@ fn run_atac_pipeline<const K: usize>(
     tn5_shift: bool,
     min_overlap: i32,
     end_cache: Option<&UnitigEndCache>,
+    is_paired: bool,
+    opts: MappingOpts,
     num_threads: usize,
     progress: &indicatif::ProgressBar,
 ) -> Result<()>
@@ -230,26 +275,29 @@ where
     Kmer<K>: KmerBits,
 {
     let mut processor = ScatacProcessor::<K>::new(
-        index, end_cache, output, stats, binning, bc_len, tn5_shift, min_overlap, progress,
+        index, end_cache, output, stats, binning, bc_len, tn5_shift, min_overlap, is_paired, opts,
+        progress,
     );
 
-    // Triple-file: interleave [R1, barcode, R2] per file set
-    let mut readers = Vec::with_capacity(read1_paths.len() * 3);
-    for i in 0..read1_paths.len() {
+    let mut readers = Vec::with_capacity(bio_paths.len() * if is_paired { 3 } else { 2 });
+    for i in 0..bio_paths.len() {
         readers.push(
-            paraseq::fastx::Reader::new(open_with_decompression(&read1_paths[i])?)
-                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", read1_paths[i], e))?,
+            paraseq::fastx::Reader::new(open_with_decompression(&bio_paths[i])?)
+                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", bio_paths[i], e))?,
         );
         readers.push(
             paraseq::fastx::Reader::new(open_with_decompression(&barcode_paths[i])?)
                 .map_err(|e| anyhow::anyhow!("failed to open {}: {}", barcode_paths[i], e))?,
         );
-        readers.push(
-            paraseq::fastx::Reader::new(open_with_decompression(&read2_paths[i])?)
-                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", read2_paths[i], e))?,
-        );
+        if is_paired {
+            readers.push(
+                paraseq::fastx::Reader::new(open_with_decompression(&read2_paths[i])?)
+                    .map_err(|e| anyhow::anyhow!("failed to open {}: {}", read2_paths[i], e))?,
+            );
+        }
     }
-    let collection = Collection::new(readers, CollectionType::Multi { arity: 3 })
+    let arity = if is_paired { 3 } else { 2 };
+    let collection = Collection::new(readers, CollectionType::Multi { arity })
         .map_err(|e| anyhow::anyhow!("failed to create collection: {}", e))?;
     collection
         .process_parallel_multi(&mut processor, num_threads, None)

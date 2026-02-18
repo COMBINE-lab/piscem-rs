@@ -47,6 +47,52 @@ use crate::mapping::unitig_end_cache::UnitigEndCache;
 const MAX_CHUNK_READS: u32 = 5000;
 
 // ===========================================================================
+// MappingOpts
+// ===========================================================================
+
+/// Per-cache mapping parameters exposed via CLI flags.
+///
+/// These are applied to all `MappingCache` instances when a worker thread
+/// initializes its state. Defaults match the C++ piscem values.
+#[derive(Clone, Copy, Debug)]
+pub struct MappingOpts {
+    /// Max k-mer occurrence count considered in the first mapping pass.
+    pub max_hit_occ: usize,
+    /// Max occurrence for the recovery pass (used when all k-mers exceeded
+    /// `max_hit_occ` but at least one is below this value).
+    pub max_hit_occ_recover: usize,
+    /// Reads with more than this many accepted mappings are discarded.
+    pub max_read_occ: usize,
+    /// Maximum equivalence class cardinality for ambiguous hit filtering.
+    pub max_ec_card: u32,
+}
+
+impl Default for MappingOpts {
+    fn default() -> Self {
+        Self {
+            max_hit_occ: 256,
+            max_hit_occ_recover: 1024,
+            max_read_occ: 2500,
+            max_ec_card: 4096,
+        }
+    }
+}
+
+impl MappingOpts {
+    /// Apply these opts to a `MappingCache`, overriding its defaults.
+    fn apply_to<S: crate::mapping::hits::SketchHitInfo>(
+        &self,
+        cache: &mut crate::mapping::cache::MappingCache<S>,
+    ) {
+        cache.max_hit_occ = self.max_hit_occ;
+        cache.max_hit_occ_recover = self.max_hit_occ_recover;
+        cache.attempt_occ_recover = self.max_hit_occ_recover > self.max_hit_occ;
+        cache.max_read_occ = self.max_read_occ;
+        cache.max_ec_card = self.max_ec_card;
+    }
+}
+
+// ===========================================================================
 // Common thread state helpers
 // ===========================================================================
 
@@ -73,17 +119,27 @@ impl<'a, const K: usize> CommonThreadState<'a, K>
 where
     Kmer<K>: KmerBits,
 {
-    fn new(index: &'a ReferenceIndex, end_cache: Option<&'a UnitigEndCache>) -> Self {
+    fn new(
+        index: &'a ReferenceIndex,
+        end_cache: Option<&'a UnitigEndCache>,
+        opts: &MappingOpts,
+    ) -> Self {
         let query = match end_cache {
             Some(cache) => PiscemStreamingQuery::<K>::with_cache(index.dict(), cache),
             None => PiscemStreamingQuery::<K>::new(index.dict()),
         };
+        let mut cache_out = MappingCache::new(K);
+        opts.apply_to(&mut cache_out);
+        let mut cache_left = MappingCache::new(K);
+        opts.apply_to(&mut cache_left);
+        let mut cache_right = MappingCache::new(K);
+        opts.apply_to(&mut cache_right);
         Self {
             hs: HitSearcher::new(index),
             query,
-            cache_out: MappingCache::new(K),
-            cache_left: MappingCache::new(K),
-            cache_right: MappingCache::new(K),
+            cache_out,
+            cache_left,
+            cache_right,
             poison_state: PoisonState::new(index.poison_table()),
             rad_writer: RadWriter::with_capacity(150_000),
             local_reads: 0,
@@ -158,6 +214,7 @@ where
     stats: &'a MappingStats,
     progress: &'a ProgressBar,
     strat: SkippingStrategy,
+    opts: MappingOpts,
     state: Option<CommonThreadState<'a, K>>,
 }
 
@@ -171,6 +228,7 @@ where
         output: &'a OutputInfo,
         stats: &'a MappingStats,
         strat: SkippingStrategy,
+        opts: MappingOpts,
         progress: &'a ProgressBar,
     ) -> Self {
         Self {
@@ -180,6 +238,7 @@ where
             stats,
             progress,
             strat,
+            opts,
             state: None,
         }
     }
@@ -197,6 +256,7 @@ where
             stats: self.stats,
             progress: self.progress,
             strat: self.strat,
+            opts: self.opts,
             state: None,
         }
     }
@@ -221,7 +281,7 @@ where
         let strat = self.strat;
         let s = self
             .state
-            .get_or_insert_with(|| CommonThreadState::new(index, end_cache));
+            .get_or_insert_with(|| CommonThreadState::new(index, end_cache, &self.opts));
         s.ensure_chunk_started();
 
         let mut batch_reads: u64 = 0;
@@ -299,7 +359,7 @@ where
         let strat = self.strat;
         let s = self
             .state
-            .get_or_insert_with(|| CommonThreadState::new(index, end_cache));
+            .get_or_insert_with(|| CommonThreadState::new(index, end_cache, &self.opts));
         s.ensure_chunk_started();
 
         let mut batch_reads: u64 = 0;
@@ -382,6 +442,7 @@ where
     stats: &'a MappingStats,
     progress: &'a ProgressBar,
     strat: SkippingStrategy,
+    opts: MappingOpts,
     protocol: &'a dyn Protocol,
     bc_len: u16,
     umi_len: u16,
@@ -401,6 +462,7 @@ where
         output: &'a OutputInfo,
         stats: &'a MappingStats,
         strat: SkippingStrategy,
+        opts: MappingOpts,
         protocol: &'a dyn Protocol,
         bc_len: u16,
         umi_len: u16,
@@ -415,6 +477,7 @@ where
             stats,
             progress,
             strat,
+            opts,
             protocol,
             bc_len,
             umi_len,
@@ -437,6 +500,7 @@ where
             stats: self.stats,
             progress: self.progress,
             strat: self.strat,
+            opts: self.opts,
             protocol: self.protocol,
             bc_len: self.bc_len,
             umi_len: self.umi_len,
@@ -469,7 +533,7 @@ where
         let max_rlen_samples: usize = 10;
 
         let st = self.state.get_or_insert_with(|| ScrnaThreadState {
-            common: CommonThreadState::new(index, end_cache),
+            common: CommonThreadState::new(index, end_cache, &self.opts),
             local_rlen_samples: Vec::new(),
             unmapped_bc_counts: AHashMap::new(),
         });
@@ -654,7 +718,10 @@ where
     unmapped_bc_counts: AHashMap<u64, u32>,
 }
 
-/// Parallel processor for scATAC-seq mapping (triple-file input).
+/// Parallel processor for scATAC-seq mapping.
+///
+/// Supports both paired-end (arity=3: R1, barcode, R2) and single-end
+/// (arity=2: reads, barcode) via `is_paired`.
 pub struct ScatacProcessor<'a, const K: usize>
 where
     Kmer<K>: KmerBits,
@@ -668,6 +735,8 @@ where
     bc_len: u16,
     tn5_shift: bool,
     min_overlap: i32,
+    is_paired: bool,
+    opts: MappingOpts,
     state: Option<ScatacThreadState<'a, K>>,
 }
 
@@ -685,6 +754,8 @@ where
         bc_len: u16,
         tn5_shift: bool,
         min_overlap: i32,
+        is_paired: bool,
+        opts: MappingOpts,
         progress: &'a ProgressBar,
     ) -> Self {
         Self {
@@ -697,6 +768,8 @@ where
             bc_len,
             tn5_shift,
             min_overlap,
+            is_paired,
+            opts,
             state: None,
         }
     }
@@ -717,6 +790,8 @@ where
             bc_len: self.bc_len,
             tn5_shift: self.tn5_shift,
             min_overlap: self.min_overlap,
+            is_paired: self.is_paired,
+            opts: self.opts,
             state: None,
         }
     }
@@ -741,9 +816,10 @@ where
         let bc_len = self.bc_len;
         let tn5_shift = self.tn5_shift;
         let min_overlap = self.min_overlap;
+        let is_paired = self.is_paired;
 
         let st = self.state.get_or_insert_with(|| ScatacThreadState {
-            common: CommonThreadState::new(index, end_cache),
+            common: CommonThreadState::new(index, end_cache, &self.opts),
             unmapped_bc_counts: AHashMap::new(),
         });
         let s = &mut st.common;
@@ -754,15 +830,27 @@ where
             s.local_reads += 1;
             batch_reads += 1;
 
-            // multi[0] = R1 (genomic left), multi[1] = barcode, multi[2] = R2 (genomic right)
-            if multi.len() < 3 {
-                continue;
+            if is_paired {
+                // PE mode: multi[0]=R1, multi[1]=barcode, multi[2]=R2
+                if multi.len() < 3 {
+                    continue;
+                }
+            } else {
+                // SE mode: multi[0]=bio read, multi[1]=barcode
+                if multi.len() < 2 {
+                    continue;
+                }
             }
+
             let r1 = multi[0].seq();
             let bc_raw = multi[1].seq();
-            let r2 = multi[2].seq();
 
-            if r1.is_empty() || r2.is_empty() {
+            if r1.is_empty() {
+                continue;
+            }
+
+            // For PE, also require r2
+            if is_paired && multi[2].seq().is_empty() {
                 continue;
             }
 
@@ -793,77 +881,106 @@ where
             s.poison_state.clear();
             s.cache_out.clear();
 
-            // Try mate overlap detection
-            let mate_ov = find_overlap(&r1, &r2, min_overlap, 0);
+            if is_paired {
+                let r2 = multi[2].seq();
 
-            if mate_ov.ov_type != OverlapType::NoOverlap && !mate_ov.frag.is_empty() {
-                // Map merged fragment as single read (bin-based)
-                s.poison_state.paired_for_mapping = false;
-                map_se_fragment_atac::<K>(
-                    &mate_ov.frag,
-                    &mut s.hs,
-                    &mut s.query,
-                    &mut s.cache_out,
-                    index,
-                    &mut s.poison_state,
-                    binning,
-                );
+                // Try mate overlap detection
+                let mate_ov = find_overlap(&r1, &r2, min_overlap, 0);
 
-                // Sort+dedup hits
-                if !s.cache_out.accepted_hits.is_empty() {
-                    s.cache_out.accepted_hits.sort_by(simple_hit_cmp_bins);
-                    remove_duplicate_hits_pub(&mut s.cache_out.accepted_hits);
-                    s.cache_out.map_type = if !s.cache_out.accepted_hits.is_empty() {
-                        MappingType::MappedPair
-                    } else {
-                        MappingType::Unmapped
-                    };
+                if mate_ov.ov_type != OverlapType::NoOverlap && !mate_ov.frag.is_empty() {
+                    // Map merged fragment as single read (bin-based)
+                    s.poison_state.paired_for_mapping = false;
+                    map_se_fragment_atac::<K>(
+                        &mate_ov.frag,
+                        &mut s.hs,
+                        &mut s.query,
+                        &mut s.cache_out,
+                        index,
+                        &mut s.poison_state,
+                        binning,
+                    );
 
-                    let (r1_len, r2_len) = if r1.len() <= r2.len() {
-                        (r1.len() as i32, r2.len() as i32)
-                    } else {
-                        (r2.len() as i32, r1.len() as i32)
-                    };
-
-                    for hit in &mut s.cache_out.accepted_hits {
-                        hit.fragment_length = mate_ov.frag_length as i32;
-                        hit.mate_pos = if hit.is_fw {
-                            hit.pos + hit.fragment_length - r2_len - 1
+                    // Sort+dedup hits
+                    if !s.cache_out.accepted_hits.is_empty() {
+                        s.cache_out.accepted_hits.sort_by(simple_hit_cmp_bins);
+                        remove_duplicate_hits_pub(&mut s.cache_out.accepted_hits);
+                        s.cache_out.map_type = if !s.cache_out.accepted_hits.is_empty() {
+                            MappingType::MappedPair
                         } else {
-                            hit.pos + r1_len - hit.fragment_length - 1
+                            MappingType::Unmapped
                         };
-                        let ref_len = index.ref_len(hit.tid as usize) as i32;
-                        if hit.mate_pos > ref_len {
-                            hit.mate_pos = hit.pos;
+
+                        let (r1_len, r2_len) = if r1.len() <= r2.len() {
+                            (r1.len() as i32, r2.len() as i32)
+                        } else {
+                            (r2.len() as i32, r1.len() as i32)
+                        };
+
+                        for hit in &mut s.cache_out.accepted_hits {
+                            hit.fragment_length = mate_ov.frag_length as i32;
+                            hit.mate_pos = if hit.is_fw {
+                                hit.pos + hit.fragment_length - r2_len - 1
+                            } else {
+                                hit.pos + r1_len - hit.fragment_length - 1
+                            };
+                            let ref_len = index.ref_len(hit.tid as usize) as i32;
+                            if hit.mate_pos > ref_len {
+                                hit.mate_pos = hit.pos;
+                            }
+                            if mate_ov.ov_type == OverlapType::Dovetail {
+                                hit.mate_pos = hit.pos;
+                            }
                         }
-                        if mate_ov.ov_type == OverlapType::Dovetail {
-                            hit.mate_pos = hit.pos;
+                    }
+                } else {
+                    // No overlap: map both ends independently, then merge (bin-aware)
+                    s.poison_state.paired_for_mapping = true;
+                    map_pe_fragment_atac::<K>(
+                        &r1,
+                        &r2,
+                        &mut s.hs,
+                        &mut s.query,
+                        &mut s.cache_left,
+                        &mut s.cache_right,
+                        &mut s.cache_out,
+                        index,
+                        &mut s.poison_state,
+                        binning,
+                    );
+
+                    if s.cache_out.map_type == MappingType::MappedFirstOrphan {
+                        for hit in &mut s.cache_out.accepted_hits {
+                            hit.fragment_length = r1.len() as i32;
+                        }
+                    } else if s.cache_out.map_type == MappingType::MappedSecondOrphan {
+                        for hit in &mut s.cache_out.accepted_hits {
+                            hit.fragment_length = r2.len() as i32;
                         }
                     }
                 }
             } else {
-                // No overlap: map both ends independently, then merge (bin-aware)
-                s.poison_state.paired_for_mapping = true;
-                map_pe_fragment_atac::<K>(
+                // SE mode: map the single biological read
+                s.poison_state.paired_for_mapping = false;
+                map_se_fragment_atac::<K>(
                     &r1,
-                    &r2,
                     &mut s.hs,
                     &mut s.query,
-                    &mut s.cache_left,
-                    &mut s.cache_right,
                     &mut s.cache_out,
                     index,
                     &mut s.poison_state,
                     binning,
                 );
 
-                if s.cache_out.map_type == MappingType::MappedFirstOrphan {
+                if !s.cache_out.accepted_hits.is_empty() {
+                    s.cache_out.accepted_hits.sort_by(simple_hit_cmp_bins);
+                    remove_duplicate_hits_pub(&mut s.cache_out.accepted_hits);
+                    s.cache_out.map_type = if !s.cache_out.accepted_hits.is_empty() {
+                        MappingType::SingleMapped
+                    } else {
+                        MappingType::Unmapped
+                    };
                     for hit in &mut s.cache_out.accepted_hits {
                         hit.fragment_length = r1.len() as i32;
-                    }
-                } else if s.cache_out.map_type == MappingType::MappedSecondOrphan {
-                    for hit in &mut s.cache_out.accepted_hits {
-                        hit.fragment_length = r2.len() as i32;
                     }
                 }
             }
