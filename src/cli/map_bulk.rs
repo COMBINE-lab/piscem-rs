@@ -13,7 +13,7 @@ use tracing::info;
 use sshash_lib::{Kmer, KmerBits, dispatch_on_k};
 
 use crate::index::reference_index::ReferenceIndex;
-use crate::io::fastx::{open_with_decompression, Collection, CollectionType};
+use crate::io::fastx::{Collection, CollectionType, open_with_decompression};
 use crate::io::map_info::write_map_info;
 use crate::io::rad::write_rad_header_bulk;
 use crate::io::threads::{MappingStats, OutputInfo};
@@ -60,7 +60,11 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
     let is_paired = !args.read2.is_empty();
     info!(
         "Mapping {} reads ({})",
-        if is_paired { "paired-end" } else { "single-end" },
+        if is_paired {
+            "paired-end"
+        } else {
+            "single-end"
+        },
         args.skipping_strategy,
     );
 
@@ -70,7 +74,12 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
     let load_start = Instant::now();
     let index = ReferenceIndex::load(index_prefix, true, !args.no_poison)?;
     let load_secs = load_start.elapsed().as_secs_f64();
-    info!("Index loaded: k={}, {} refs ({:.2}s)", index.k(), index.num_refs(), load_secs);
+    info!(
+        "Index loaded: k={}, {} refs ({:.2}s)",
+        index.k(),
+        index.num_refs(),
+        load_secs
+    );
 
     // Create output directory and RAD file
     let out_dir = PathBuf::from(&args.output);
@@ -221,14 +230,14 @@ pub(crate) fn make_progress_bar(quiet: bool) -> ProgressBar {
         ProgressBar::hidden()
     } else {
         let pb = ProgressBar::new_spinner();
-        pb.set_draw_target(ProgressDrawTarget::stderr_with_hz(5));
+        pb.set_draw_target(ProgressDrawTarget::stderr_with_hz(1));
         pb.set_style(
             ProgressStyle::with_template(
                 "{spinner:.green} [{elapsed_precise}] {human_pos} reads processed ({per_sec})",
             )
             .unwrap(),
         );
-        pb.enable_steady_tick(Duration::from_millis(200));
+        pb.enable_steady_tick(Duration::from_millis(1_000));
         pb
     }
 }
