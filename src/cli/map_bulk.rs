@@ -14,7 +14,7 @@ use sshash_lib::{Kmer, KmerBits, dispatch_on_k};
 
 use crate::index::reference_index::ReferenceIndex;
 use crate::io::fastx::{Collection, CollectionType, open_with_decompression};
-use crate::io::map_info::write_map_info;
+use crate::io::map_info::{MapInfoParams, write_map_info};
 use crate::io::rad::write_rad_header_bulk;
 use crate::io::threads::{MappingStats, OutputInfo};
 use crate::mapping::hit_searcher::SkippingStrategy;
@@ -202,14 +202,22 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
     // Write map_info.json
     let mut map_info_path = args.output.clone();
     map_info_path.add_extension("map_info.json");
-    write_map_info(
-        &map_info_path,
+    write_map_info(&MapInfoParams {
+        path: &map_info_path,
+        mode: "bulk",
         num_reads,
         num_mapped,
         num_poisoned,
-        elapsed,
-        index.ref_sig_info(),
-    )?;
+        elapsed_secs: elapsed,
+        sig_info: index.ref_sig_info(),
+        piscem_rs_version: crate::VERSION,
+        num_threads,
+        index_path: &args.index,
+        k: index.k(),
+        m: index.m(),
+        num_refs: index.num_refs(),
+        skipping_strategy: &args.skipping_strategy,
+    })?;
 
     Ok(())
 }

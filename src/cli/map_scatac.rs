@@ -23,7 +23,7 @@ use sshash_lib::{Kmer, KmerBits, dispatch_on_k};
 
 use crate::index::reference_index::ReferenceIndex;
 use crate::io::fastx::{open_with_decompression, Collection, CollectionType};
-use crate::io::map_info::write_map_info;
+use crate::io::map_info::{MapInfoParams, write_map_info};
 use crate::io::rad::write_rad_header_atac;
 use crate::io::threads::{MappingStats, OutputInfo};
 use crate::mapping::binning::BinPos;
@@ -236,14 +236,22 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
     );
 
     // Write map_info.json
-    write_map_info(
-        &out_dir.join("map_info.json"),
+    write_map_info(&MapInfoParams {
+        path: &out_dir.join("map_info.json"),
+        mode: "sc-atac",
         num_reads,
         num_mapped,
         num_poisoned,
-        elapsed,
-        index.ref_sig_info(),
-    )?;
+        elapsed_secs: elapsed,
+        sig_info: index.ref_sig_info(),
+        piscem_rs_version: crate::VERSION,
+        num_threads,
+        index_path: &args.index,
+        k: index.k(),
+        m: index.m(),
+        num_refs: index.num_refs(),
+        skipping_strategy: "every-kmer",
+    })?;
 
     Ok(())
 }

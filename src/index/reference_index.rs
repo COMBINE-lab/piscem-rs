@@ -345,6 +345,12 @@ impl ReferenceIndex {
         self.dict.k()
     }
 
+    /// Minimizer length used by the dictionary.
+    #[inline]
+    pub fn m(&self) -> usize {
+        self.dict.m()
+    }
+
     /// The SSHash dictionary.
     #[inline]
     pub fn dict(&self) -> &Dictionary {
