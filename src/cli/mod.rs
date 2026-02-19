@@ -1,10 +1,10 @@
-mod build;
+pub mod build;
 mod inspect;
-mod map_bulk;
-mod map_scatac;
-mod map_scrna;
+pub mod map_bulk;
+pub mod map_scatac;
+pub mod map_scrna;
 mod parity;
-mod poison;
+pub mod poison;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

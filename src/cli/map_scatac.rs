@@ -11,7 +11,7 @@
 //! - Poison filtering disabled by default (`--no-poison` is true)
 
 use std::io::{Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -41,25 +41,25 @@ use super::map_bulk::make_progress_bar;
 pub struct MapScatacArgs {
     /// Index prefix path
     #[arg(short = 'i', long)]
-    pub index: String,
+    pub index: PathBuf,
     /// Single-end biological FASTQ files (comma-separated); mutually exclusive with -1/-2
     #[arg(short = 'r', long = "reads", value_delimiter = ',',
           conflicts_with_all = ["read1", "read2"])]
-    pub reads: Vec<String>,
+    pub reads: Vec<PathBuf>,
     /// Read 1 FASTQ files (genomic left, comma-separated); requires -2
     #[arg(short = '1', long, value_delimiter = ',',
           requires = "read2", conflicts_with = "reads")]
-    pub read1: Vec<String>,
+    pub read1: Vec<PathBuf>,
     /// Read 2 FASTQ files (genomic right, comma-separated); requires -1
     #[arg(short = '2', long, value_delimiter = ',',
           requires = "read1", conflicts_with = "reads")]
-    pub read2: Vec<String>,
+    pub read2: Vec<PathBuf>,
     /// Barcode FASTQ files (comma-separated)
     #[arg(short = 'b', long, value_delimiter = ',')]
-    pub barcode: Vec<String>,
+    pub barcode: Vec<PathBuf>,
     /// Output directory
     #[arg(short = 'o', long)]
-    pub output: String,
+    pub output: PathBuf,
     /// Number of mapping threads
     #[arg(short = 't', long, default_value = "16")]
     pub threads: usize,
@@ -129,14 +129,13 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
     let is_paired = !args.read1.is_empty();
 
     // Load index
-    let index_prefix = Path::new(&args.index);
-    info!("Loading index from {}", index_prefix.display());
+    info!("Loading index from {}", args.index.display());
     // C++ ATAC: check_ambig_hits defaults to false, so EC table is NOT loaded
-    let index = ReferenceIndex::load(index_prefix, args.check_ambig_hits, !args.no_poison)?;
+    let index = ReferenceIndex::load(&args.index, args.check_ambig_hits, !args.no_poison)?;
     info!("Index loaded: k={}, {} refs", index.k(), index.num_refs());
 
     // Create output directory and RAD file
-    let out_dir = PathBuf::from(&args.output);
+    let out_dir = args.output.clone();
     std::fs::create_dir_all(&out_dir)
         .with_context(|| format!("failed to create output directory: {}", out_dir.display()))?;
     let rad_path = out_dir.join("map.rad");
@@ -251,9 +250,9 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn run_atac_pipeline<const K: usize>(
-    bio_paths: &[String],
-    barcode_paths: &[String],
-    read2_paths: &[String],
+    bio_paths: &[PathBuf],
+    barcode_paths: &[PathBuf],
+    read2_paths: &[PathBuf],
     output: &OutputInfo,
     stats: &MappingStats,
     index: &ReferenceIndex,
@@ -279,16 +278,16 @@ where
     for i in 0..bio_paths.len() {
         readers.push(
             paraseq::fastx::Reader::new(open_with_decompression(&bio_paths[i])?)
-                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", bio_paths[i], e))?,
+                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", bio_paths[i].display(), e))?,
         );
         readers.push(
             paraseq::fastx::Reader::new(open_with_decompression(&barcode_paths[i])?)
-                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", barcode_paths[i], e))?,
+                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", barcode_paths[i].display(), e))?,
         );
         if is_paired {
             readers.push(
                 paraseq::fastx::Reader::new(open_with_decompression(&read2_paths[i])?)
-                    .map_err(|e| anyhow::anyhow!("failed to open {}: {}", read2_paths[i], e))?,
+                    .map_err(|e| anyhow::anyhow!("failed to open {}: {}", read2_paths[i].display(), e))?,
             );
         }
     }

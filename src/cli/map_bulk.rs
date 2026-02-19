@@ -1,7 +1,7 @@
 //! CLI command for bulk RNA-seq mapping.
 
 use std::io::{Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -29,22 +29,22 @@ use crate::mapping::processors::{BulkProcessor, MappingOpts};
 pub struct MapBulkArgs {
     /// Index prefix path
     #[arg(short = 'i', long)]
-    pub index: String,
+    pub index: PathBuf,
     /// Single-end FASTQ files (comma-separated); mutually exclusive with -1/-2
     #[arg(short = 'r', long = "reads", value_delimiter = ',',
           conflicts_with_all = ["read1", "read2"])]
-    pub reads: Vec<String>,
+    pub reads: Vec<PathBuf>,
     /// Read 1 FASTQ files (comma-separated); requires -2
     #[arg(short = '1', long, value_delimiter = ',',
           requires = "read2", conflicts_with = "reads")]
-    pub read1: Vec<String>,
+    pub read1: Vec<PathBuf>,
     /// Read 2 FASTQ files (comma-separated); requires -1
     #[arg(short = '2', long, value_delimiter = ',',
           requires = "read1", conflicts_with = "reads")]
-    pub read2: Vec<String>,
+    pub read2: Vec<PathBuf>,
     /// Output file stem (e.g. foo/bar/sample); creates foo/bar/sample.rad and foo/bar/sample.map_info.json
     #[arg(short = 'o', long)]
-    pub output: String,
+    pub output: PathBuf,
     /// Number of mapping threads
     #[arg(short = 't', long, default_value = "16")]
     pub threads: usize,
@@ -95,10 +95,9 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
     let check_ambig = !args.ignore_ambig_hits;
 
     // Load index
-    let index_prefix = Path::new(&args.index);
-    info!("Loading index from {}", index_prefix.display());
+    info!("Loading index from {}", args.index.display());
     let load_start = Instant::now();
-    let index = ReferenceIndex::load(index_prefix, check_ambig, !args.no_poison)?;
+    let index = ReferenceIndex::load(&args.index, check_ambig, !args.no_poison)?;
     let load_secs = load_start.elapsed().as_secs_f64();
     info!(
         "Index loaded: k={}, {} refs ({:.2}s)",
@@ -108,15 +107,15 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
     );
 
     // Treat -o as a file stem: create parent dirs, then append extensions
-    let out_stem = PathBuf::from(&args.output);
-    if let Some(parent) = out_stem.parent() {
+    if let Some(parent) = args.output.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create output directory: {}", parent.display())
             })?;
         }
     }
-    let rad_path = PathBuf::from(format!("{}.rad", args.output));
+    let mut rad_path = args.output.clone();
+    rad_path.add_extension("rad");
     let mut rad_file = std::fs::File::create(&rad_path)
         .with_context(|| format!("failed to create {}", rad_path.display()))?;
 
@@ -201,8 +200,10 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
     );
 
     // Write map_info.json
+    let mut map_info_path = args.output.clone();
+    map_info_path.add_extension("map_info.json");
     write_map_info(
-        &PathBuf::from(format!("{}.map_info.json", args.output)),
+        &map_info_path,
         num_reads,
         num_mapped,
         num_poisoned,
@@ -215,8 +216,8 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn run_bulk_pipeline<const K: usize>(
-    read1_paths: &[String],
-    read2_paths: &[String],
+    read1_paths: &[PathBuf],
+    read2_paths: &[PathBuf],
     output: &OutputInfo,
     stats: &MappingStats,
     index: &ReferenceIndex,
@@ -236,11 +237,11 @@ where
         for (r1_path, r2_path) in read1_paths.iter().zip(read2_paths.iter()) {
             readers.push(
                 paraseq::fastx::Reader::new(open_with_decompression(r1_path)?)
-                    .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r1_path, e))?,
+                    .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r1_path.display(), e))?,
             );
             readers.push(
                 paraseq::fastx::Reader::new(open_with_decompression(r2_path)?)
-                    .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r2_path, e))?,
+                    .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r2_path.display(), e))?,
             );
         }
         let collection = Collection::new(readers, CollectionType::Paired)
@@ -253,7 +254,7 @@ where
         for r1_path in read1_paths {
             readers.push(
                 paraseq::fastx::Reader::new(open_with_decompression(r1_path)?)
-                    .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r1_path, e))?,
+                    .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r1_path.display(), e))?,
             );
         }
         let collection = Collection::new(readers, CollectionType::Single)

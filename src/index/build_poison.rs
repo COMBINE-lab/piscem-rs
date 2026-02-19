@@ -7,7 +7,7 @@
 //! Port of C++ `poison_table_builder.cpp`.
 
 use std::io::{BufRead, BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -214,7 +214,7 @@ fn scan_sequence_for_poison<'a, const K: usize>(
 /// Build a poison table by scanning decoy FASTA files.
 pub fn build_poison_table<const K: usize>(
     index: &ReferenceIndex,
-    decoy_paths: &[String],
+    decoy_paths: &[PathBuf],
     threads: usize,
 ) -> Result<PoisonTable>
 where
@@ -250,7 +250,7 @@ where
         let sender_for_producer = sender.clone();
         s.spawn(move |_| {
             for path_str in decoy_paths_ref {
-                let path = Path::new(path_str);
+                let path: &Path = path_str.as_path();
                 info!("Reading decoy sequences from {}", path.display());
                 let (reader, _format) = niffler::send::from_path(path)
                     .unwrap_or_else(|e| {

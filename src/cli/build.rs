@@ -8,10 +8,10 @@ use crate::index::build::{BuildConfig, build_index};
 pub struct BuildArgs {
     /// Input prefix (cuttlefish basename, e.g. path/to/index_cfish)
     #[arg(short = 'i', long)]
-    pub input: String,
+    pub input: PathBuf,
     /// Output prefix for index files
     #[arg(short = 'o', long)]
-    pub output: String,
+    pub output: PathBuf,
     /// K-mer length
     #[arg(short = 'k', long)]
     pub klen: usize,
@@ -37,8 +37,8 @@ pub struct BuildArgs {
 
 pub fn run(args: BuildArgs) -> Result<()> {
     let config = BuildConfig {
-        input_prefix: PathBuf::from(&args.input),
-        output_prefix: PathBuf::from(&args.output),
+        input_prefix: args.input,
+        output_prefix: args.output,
         k: args.klen,
         m: args.mlen,
         build_ec_table: args.build_ec_table,

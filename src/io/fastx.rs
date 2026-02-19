@@ -5,6 +5,7 @@
 //! paraseq's `Reader`.
 
 use anyhow::{Context, Result};
+use std::path::Path;
 
 // Re-export paraseq types used by the mapping pipeline.
 pub use paraseq::fastq;
@@ -19,9 +20,10 @@ pub use paraseq::Record;
 // ---------------------------------------------------------------------------
 
 /// Open a single file with automatic decompression (gzip, zstd, etc.).
-pub(crate) fn open_with_decompression(path: &str) -> Result<Box<dyn std::io::Read + Send>> {
+pub(crate) fn open_with_decompression(path: impl AsRef<Path>) -> Result<Box<dyn std::io::Read + Send>> {
+    let path = path.as_ref();
     let (reader, _format) = niffler::send::from_path(path)
-        .with_context(|| format!("failed to open {}", path))?;
+        .with_context(|| format!("failed to open {}", path.display()))?;
     Ok(reader)
 }
 

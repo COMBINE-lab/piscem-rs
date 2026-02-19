@@ -1,7 +1,7 @@
 //! CLI command for single-cell RNA-seq mapping.
 
 use std::io::{Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -29,16 +29,16 @@ use super::map_bulk::make_progress_bar;
 pub struct MapScrnaArgs {
     /// Index prefix path
     #[arg(short = 'i', long)]
-    pub index: String,
+    pub index: PathBuf,
     /// Read 1 FASTQ files (comma-separated)
     #[arg(short = '1', long, value_delimiter = ',')]
-    pub read1: Vec<String>,
+    pub read1: Vec<PathBuf>,
     /// Read 2 FASTQ files (comma-separated)
     #[arg(short = '2', long, value_delimiter = ',')]
-    pub read2: Vec<String>,
+    pub read2: Vec<PathBuf>,
     /// Output directory
     #[arg(short = 'o', long)]
-    pub output: String,
+    pub output: PathBuf,
     /// Number of mapping threads
     #[arg(short = 't', long, default_value = "16")]
     pub threads: usize,
@@ -109,13 +109,12 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
     let check_ambig = !args.ignore_ambig_hits;
 
     // Load index
-    let index_prefix = Path::new(&args.index);
-    info!("Loading index from {}", index_prefix.display());
-    let index = ReferenceIndex::load(index_prefix, check_ambig, !args.no_poison)?;
+    info!("Loading index from {}", args.index.display());
+    let index = ReferenceIndex::load(&args.index, check_ambig, !args.no_poison)?;
     info!("Index loaded: k={}, {} refs", index.k(), index.num_refs());
 
     // Create output directory and RAD file
-    let out_dir = PathBuf::from(&args.output);
+    let out_dir = args.output.clone();
     std::fs::create_dir_all(&out_dir)
         .with_context(|| format!("failed to create output directory: {}", out_dir.display()))?;
     let rad_path = out_dir.join("map.rad");
@@ -240,8 +239,8 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn run_scrna_pipeline<const K: usize>(
-    read1_paths: &[String],
-    read2_paths: &[String],
+    read1_paths: &[PathBuf],
+    read2_paths: &[PathBuf],
     output: &OutputInfo,
     stats: &MappingStats,
     index: &ReferenceIndex,
@@ -267,11 +266,11 @@ where
     for (r1_path, r2_path) in read1_paths.iter().zip(read2_paths.iter()) {
         readers.push(
             paraseq::fastx::Reader::new(open_with_decompression(r1_path)?)
-                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r1_path, e))?,
+                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r1_path.display(), e))?,
         );
         readers.push(
             paraseq::fastx::Reader::new(open_with_decompression(r2_path)?)
-                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r2_path, e))?,
+                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r2_path.display(), e))?,
         );
     }
     let collection = Collection::new(readers, CollectionType::Paired)

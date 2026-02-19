@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -14,10 +14,10 @@ use crate::index::reference_index::ReferenceIndex;
 pub struct BuildPoisonArgs {
     /// Path prefix of the piscem index
     #[arg(short = 'i', long)]
-    pub index: String,
+    pub index: PathBuf,
     /// Decoy FASTA file(s) to scan for poison k-mers
     #[arg(short = 'd', long, num_args = 1..)]
-    pub decoys: Vec<String>,
+    pub decoys: Vec<PathBuf>,
     /// Number of threads (0 = all cores)
     #[arg(short = 't', long, default_value = "0")]
     pub threads: usize,
@@ -26,9 +26,8 @@ pub struct BuildPoisonArgs {
 pub fn run(args: BuildPoisonArgs) -> Result<()> {
     let start = Instant::now();
 
-    let index_prefix = Path::new(&args.index);
-    info!("Loading index from {}", index_prefix.display());
-    let index = ReferenceIndex::load(index_prefix, false, false)?;
+    info!("Loading index from {}", args.index.display());
+    let index = ReferenceIndex::load(&args.index, false, false)?;
     info!(
         "Index loaded: k={}, {} refs, {} contigs",
         index.k(),
@@ -55,14 +54,16 @@ pub fn run(args: BuildPoisonArgs) -> Result<()> {
     }
 
     // Save poison table
-    let poison_path = format!("{}.poison", args.index);
-    info!("Saving poison table to {}", poison_path);
+    let mut poison_path = args.index.clone();
+    poison_path.add_extension("poison");
+    info!("Saving poison table to {}", poison_path.display());
     let mut poison_file = std::fs::File::create(&poison_path)?;
     table.save(&mut poison_file)?;
 
     // Save stats JSON
-    let json_path = format!("{}.poison.json", args.index);
-    info!("Saving poison stats to {}", json_path);
+    let mut json_path = poison_path.clone();
+    json_path.add_extension("json");
+    info!("Saving poison stats to {}", json_path.display());
     let mut json_file = std::fs::File::create(&json_path)?;
     table.save_stats_json(&mut json_file)?;
 
