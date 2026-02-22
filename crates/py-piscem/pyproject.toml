@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "piscem"
+version = "0.1.0"
+requires-python = ">=3.8"
+description = "Python bindings for the piscem k-mer mapping engine"
+keywords = ["bioinformatics", "k-mer", "genomics", "read-mapping"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "piscem"
