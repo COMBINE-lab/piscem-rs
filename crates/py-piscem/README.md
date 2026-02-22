@@ -126,6 +126,20 @@ index = piscem.ReferenceIndex.build(
 )
 ```
 
+To build an index with a poison k-mer table (for filtering spurious mappings near decoy boundaries), pass one or more decoy FASTA files:
+
+```python
+index = piscem.ReferenceIndex.build(
+    "path/to/cuttlefish_prefix",
+    "path/to/output_prefix",
+    k=31,
+    m=19,
+    threads=8,
+    decoys=["path/to/decoys.fa.gz"],
+)
+print(f"Poison table: {index.has_poison_table}")  # True
+```
+
 ## Thread safety
 
 - **`ReferenceIndex`** is immutable and can be shared freely across threads.

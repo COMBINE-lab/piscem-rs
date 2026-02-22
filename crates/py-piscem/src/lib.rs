@@ -9,13 +9,14 @@
 //! - `KmerHit` — result of a k-mer lookup
 //! - `RefPos` — position on a reference
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use sshash_lib::{dispatch_on_k, Kmer, KmerBits, LookupResult, StreamingQuery};
 
+use piscem_rs::index::build_poison::{build_poison_table, verify_poison_table};
 use piscem_rs::index::reference_index::ReferenceIndex;
 use piscem_rs::mapping::binning::BinPos;
 use piscem_rs::mapping::cache::MappingCache;
@@ -798,10 +799,13 @@ impl PyReferenceIndex {
     /// :param threads: Number of threads (default 4, 0 = all cores).
     /// :param build_ec: Whether to build the equivalence class table.
     /// :param canonical: Whether to use canonical k-mers.
+    /// :param decoys: Optional list of decoy FASTA file paths for building a
+    ///     poison k-mer table. Compressed files (gzip, bzip2, zstd) are
+    ///     supported. If omitted, no poison table is built.
     /// :returns: A ready-to-use :class:`ReferenceIndex`.
     /// :raises RuntimeError: If the build fails.
     #[staticmethod]
-    #[pyo3(signature = (input_prefix, output_prefix, *, k=31, m=19, threads=4, build_ec=true, canonical=true))]
+    #[pyo3(signature = (input_prefix, output_prefix, *, k=31, m=19, threads=4, build_ec=true, canonical=true, decoys=None))]
     fn build(
         py: Python<'_>,
         input_prefix: &str,
@@ -811,6 +815,7 @@ impl PyReferenceIndex {
         threads: usize,
         build_ec: bool,
         canonical: bool,
+        decoys: Option<Vec<String>>,
     ) -> PyResult<Self> {
         use piscem_rs::index::build::BuildConfig;
 
@@ -826,13 +831,56 @@ impl PyReferenceIndex {
             single_mphf: false,
         };
         let out_prefix = output_prefix.to_owned();
-        py.detach(move || {
-            piscem_rs::index::build::build_index(&config)
-        })
-        .map_err(|e| PyRuntimeError::new_err(format!("Build failed: {}", e)))?;
+        let has_poison = decoys.is_some();
+        let decoy_paths: Option<Vec<PathBuf>> =
+            decoys.map(|v| v.into_iter().map(PathBuf::from).collect());
 
-        // Load the just-built index
-        let index = ReferenceIndex::load(Path::new(&out_prefix), true, false)
+        py.detach(move || -> Result<(), String> {
+            piscem_rs::index::build::build_index(&config).map_err(|e| format!("Build failed: {e}"))?;
+
+            // If decoy paths were provided, build the poison table
+            if let Some(ref paths) = decoy_paths {
+                let index = ReferenceIndex::load(Path::new(&out_prefix), false, false)
+                    .map_err(|e| format!("Failed to load index for poison build: {e}"))?;
+
+                let k = index.k();
+                let table = dispatch_on_k!(k, K => {
+                    build_poison_table::<K>(&index, paths, threads)
+                        .map_err(|e| format!("Poison table build failed: {e}"))?
+                });
+
+                // Verify: no poison k-mers should be in the dictionary
+                let found_in_dict = dispatch_on_k!(k, K => {
+                    verify_poison_table::<K>(&table, &index)
+                });
+                if found_in_dict > 0 {
+                    return Err(format!(
+                        "{found_in_dict} poison k-mers are also present in the reference dictionary"
+                    ));
+                }
+
+                // Save poison table and stats JSON
+                let mut poison_path = PathBuf::from(&out_prefix);
+                poison_path.add_extension("poison");
+                let mut f = std::fs::File::create(&poison_path)
+                    .map_err(|e| format!("Failed to create {}: {e}", poison_path.display()))?;
+                table.save(&mut f)
+                    .map_err(|e| format!("Failed to save poison table: {e}"))?;
+
+                let mut json_path = poison_path;
+                json_path.add_extension("json");
+                let mut f = std::fs::File::create(&json_path)
+                    .map_err(|e| format!("Failed to create {}: {e}", json_path.display()))?;
+                table.save_stats_json(&mut f)
+                    .map_err(|e| format!("Failed to save poison stats: {e}"))?;
+            }
+
+            Ok(())
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))?;
+
+        // Load the final index (with poison if decoys were provided)
+        let index = ReferenceIndex::load(Path::new(output_prefix), true, has_poison)
             .map_err(|e| {
                 PyRuntimeError::new_err(format!("Failed to load built index: {}", e))
             })?;
