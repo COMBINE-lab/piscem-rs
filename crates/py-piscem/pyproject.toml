@@ -6,6 +6,7 @@ build-backend = "maturin"
 name = "piscem"
 version = "0.1.0"
 requires-python = ">=3.8"
+readme = "README.md"
 description = "Python bindings for the piscem k-mer mapping engine"
 keywords = ["bioinformatics", "k-mer", "genomics", "read-mapping"]
 classifiers = [
