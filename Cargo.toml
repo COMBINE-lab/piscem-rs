@@ -10,6 +10,7 @@ license = "MIT"
 description = "Rust implementation of piscem with semantic parity harness"
 
 [features]
+default = ["mimalloc"]
 parity-test = ["dep:libradicl"]
 
 [dependencies]
@@ -41,7 +42,7 @@ mem_dbg = "0.4.0"
 
 # RAD file parsing — optional, enabled by parity-test feature
 libradicl = { git = "https://github.com/COMBINE-lab/libradicl.git", branch = "develop", optional = true }
-mimalloc = "0.1.48"
+mimalloc = { version = "0.1.48", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

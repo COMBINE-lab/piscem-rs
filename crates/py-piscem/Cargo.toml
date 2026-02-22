@@ -9,6 +9,6 @@ name = "piscem"
 crate-type = ["cdylib"]
 
 [dependencies]
-piscem-rs = { path = "../.." }
+piscem-rs = { path = "../..", default-features = false }
 sshash-lib = "0.3"
 pyo3 = { version = "0.28", features = ["extension-module", "abi3-py38"] }
