@@ -37,7 +37,7 @@ if git rev-parse "$TAG" &>/dev/null; then
     die "tag $TAG already exists — bump the version in Cargo.toml first"
 fi
 
-if ! git diff --quiet; then
+if ! git diff --quiet -- ':!Cargo.lock'; then
     die "working tree has unstaged changes — commit or stash them first"
 fi
 
@@ -47,9 +47,11 @@ fi
 
 # ── dry run ──────────────────────────────────────────────────────────────────
 
+# --allow-dirty: untracked dirs (test_data/, piscem-cpp/) and Cargo.lock
+# changes from local .cargo/config.toml patches are expected.
 echo "Running cargo publish --dry-run ..."
 echo ""
-cargo publish --dry-run
+cargo publish --dry-run --allow-dirty
 echo ""
 echo "Dry run passed."
 
@@ -64,7 +66,7 @@ fi
 
 echo ""
 echo "Publishing piscem-rs $VERSION to crates.io ..."
-cargo publish
+cargo publish --allow-dirty
 
 # ── tag and push ─────────────────────────────────────────────────────────────
 
