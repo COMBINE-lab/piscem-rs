@@ -188,20 +188,19 @@ fn bulk_pe_rad_parity() {
     ensure_cpp_index().expect("failed to build C++ index");
     ensure_rust_index().expect("failed to build Rust index");
 
-    // 2. Create temp directories
+    // 2. Create temp directory
     let tmpdir = tempfile::tempdir().expect("failed to create tempdir");
     let cpp_out_stem = tmpdir.path().join("cpp_out");
-    let rust_out_dir = tmpdir.path().join("rust_out");
-    std::fs::create_dir_all(&rust_out_dir).unwrap();
+    let rust_out_stem = tmpdir.path().join("rust_out");
 
     // 3. Run both mappers with 1 thread for determinism
     run_cpp_bulk(&cpp_out_stem, 1, true).expect("C++ mapper failed");
-    run_rust_bulk(&rust_out_dir, RUST_INDEX_PREFIX, 1, true)
+    run_rust_bulk(&rust_out_stem, RUST_INDEX_PREFIX, 1, true)
         .expect("Rust mapper failed");
 
     // 4. Compare RAD files
     let cpp_rad = cpp_out_stem.with_extension("rad");
-    let rust_rad = rust_out_dir.join("map.rad");
+    let rust_rad = rust_out_stem.with_extension("rad");
 
     assert!(cpp_rad.exists(), "C++ RAD file not found: {}", cpp_rad.display());
     assert!(rust_rad.exists(), "Rust RAD file not found: {}", rust_rad.display());
@@ -299,16 +298,15 @@ fn bulk_pe_rad_parity_multithreaded() {
 
     let tmpdir = tempfile::tempdir().expect("failed to create tempdir");
     let cpp_out_stem = tmpdir.path().join("cpp_out");
-    let rust_out_dir = tmpdir.path().join("rust_out");
-    std::fs::create_dir_all(&rust_out_dir).unwrap();
+    let rust_out_stem = tmpdir.path().join("rust_out");
 
     // Run with 4 threads — record order will differ but multisets should match
     run_cpp_bulk(&cpp_out_stem, 4, true).expect("C++ mapper failed");
-    run_rust_bulk(&rust_out_dir, RUST_INDEX_PREFIX, 4, true)
+    run_rust_bulk(&rust_out_stem, RUST_INDEX_PREFIX, 4, true)
         .expect("Rust mapper failed");
 
     let cpp_rad = cpp_out_stem.with_extension("rad");
-    let rust_rad = rust_out_dir.join("map.rad");
+    let rust_rad = rust_out_stem.with_extension("rad");
 
     let result = compare_bulk_rad_full(&cpp_rad, &rust_rad)
         .expect("failed to compare RAD files");
@@ -354,8 +352,7 @@ fn bulk_pe_rad_parity_strict() {
 
     let tmpdir = tempfile::tempdir().expect("failed to create tempdir");
     let cpp_out_stem = tmpdir.path().join("cpp_out");
-    let rust_out_dir = tmpdir.path().join("rust_out");
-    std::fs::create_dir_all(&rust_out_dir).unwrap();
+    let rust_out_stem = tmpdir.path().join("rust_out");
 
     // Run C++ mapper with strict
     let status = Command::new(CPP_BULK_BIN)
@@ -380,7 +377,7 @@ fn bulk_pe_rad_parity_strict() {
     let status = Command::new(&bin)
         .arg("map-bulk")
         .arg("-i").arg(RUST_INDEX_PREFIX)
-        .arg("-o").arg(&rust_out_dir)
+        .arg("-o").arg(&rust_out_stem)
         .arg("-t").arg("1")
         .arg("-1").arg(READ1)
         .arg("-2").arg(READ2)
@@ -391,7 +388,7 @@ fn bulk_pe_rad_parity_strict() {
     assert!(status.success(), "Rust strict mapper failed");
 
     let cpp_rad = cpp_out_stem.with_extension("rad");
-    let rust_rad = rust_out_dir.join("map.rad");
+    let rust_rad = rust_out_stem.with_extension("rad");
 
     eprintln!("Comparing STRICT mode RAD files...");
     let result = compare_bulk_rad_full(&cpp_rad, &rust_rad)
@@ -970,21 +967,20 @@ fn bulk_pe_rad_parity_with_poison() {
         );
     }
 
-    // 3. Create temp directories
+    // 3. Create temp directory
     let tmpdir = tempfile::tempdir().expect("failed to create tempdir");
     let cpp_out_stem = tmpdir.path().join("cpp_out");
-    let rust_out_dir = tmpdir.path().join("rust_out");
-    std::fs::create_dir_all(&rust_out_dir).unwrap();
+    let rust_out_stem = tmpdir.path().join("rust_out");
 
     // 4. Run both mappers WITH poison (not passing --no-poison)
     run_cpp_bulk_with_poison_index(&cpp_out_stem, 1)
         .expect("C++ mapper with poison failed");
-    run_rust_bulk(&rust_out_dir, RUST_INDEX_PREFIX, 1, false)
+    run_rust_bulk(&rust_out_stem, RUST_INDEX_PREFIX, 1, false)
         .expect("Rust mapper with poison failed");
 
     // 5. Compare RAD files
     let cpp_rad = cpp_out_stem.with_extension("rad");
-    let rust_rad = rust_out_dir.join("map.rad");
+    let rust_rad = rust_out_stem.with_extension("rad");
 
     assert!(cpp_rad.exists(), "C++ RAD file not found: {}", cpp_rad.display());
     assert!(rust_rad.exists(), "Rust RAD file not found: {}", rust_rad.display());

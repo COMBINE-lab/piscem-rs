@@ -429,6 +429,33 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_split_bc_extract() {
+        // Geometry: R1 has 8bp BC + 12bp UMI + bio read,
+        //           R2 has 8bp BC + bio read.
+        let proto = parse_custom_geometry("1{b[8]u[12]r:}2{b[8]r:}").unwrap();
+
+        let r1 = b"AAAACCCCGGGGTTTTAAAAMAPPABLE_R1";
+        //         |--BC1--|---UMI----|--bio--->
+        //         8       12              ...
+        let r2 = b"TTTTGGGGBIOLOGICAL_R2";
+        //         |--BC2--|--bio-------->
+        //         8            ...
+
+        // extract_tech_seqs returns the first BC slice only (R1's 8bp),
+        // not the concatenated 16bp split barcode.
+        let tech = proto.extract_tech_seqs(r1, r2);
+        assert_eq!(tech.barcode.unwrap(), b"AAAACCCC");
+        assert_eq!(tech.umi.unwrap(), b"GGGGTTTTAAAA");
+
+        // extract_mappable_reads returns the bio segments from both reads
+        let reads = proto.extract_mappable_reads(r1, r2);
+        // R1: skip 8 BC + 12 UMI = offset 20, rest is bio
+        assert_eq!(reads.seq1.unwrap(), b"MAPPABLE_R1");
+        // R2: skip 8 BC = offset 8, rest is bio
+        assert_eq!(reads.seq2.unwrap(), b"BIOLOGICAL_R2");
+    }
+
+    #[test]
     fn test_parse_5prime() {
         // "1{b[16]u[12]x[13]r:}2{r:}" matches chromium_v3_5p
         let proto = parse_custom_geometry("1{b[16]u[12]x[13]r:}2{r:}").unwrap();
