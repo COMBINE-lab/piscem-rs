@@ -6,8 +6,28 @@ name = "piscem-rs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
-license = "MIT"
+license = "BSD-3-Clause"
 description = "Rust implementation of piscem with semantic parity harness"
+repository = "https://github.com/COMBINE-lab/piscem-rs"
+homepage = "https://github.com/COMBINE-lab/piscem-rs"
+documentation = "https://docs.rs/piscem-rs"
+
+# Keep the published crate small — exclude large local-only dirs.
+exclude = [
+  "test_data/",
+  "piscem-cpp/",
+  "piscem/",
+  "examples/",
+  "tests/",
+  "crates/",
+  "sshash-rs/",
+  "sshash_tmp/",
+  "*.json",
+  "*.json.gz",
+  "*.time",
+  "publish.sh",
+  "release-py.sh",
+]
 
 [features]
 default = ["mimalloc"]
