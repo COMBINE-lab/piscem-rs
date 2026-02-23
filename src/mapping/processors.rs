@@ -35,6 +35,7 @@ use crate::mapping::merge_pairs::{remove_duplicate_hits_pub, simple_hit_cmp_bins
 use crate::mapping::overlap::{find_overlap, OverlapType};
 use crate::mapping::protocols::scrna::{barcode_has_n, count_ns, is_all_acgt, recover_barcode};
 use crate::mapping::protocols::Protocol;
+use crate::mapping::hits::SketchHitInfo;
 use crate::mapping::sketch_hit_simple::SketchHitInfoSimple;
 use crate::mapping::streaming_query::PiscemStreamingQuery;
 use crate::mapping::unitig_end_cache::UnitigEndCache;
@@ -97,15 +98,19 @@ impl MappingOpts {
 // ===========================================================================
 
 /// Common per-thread mapping state shared across all processor types.
-struct CommonThreadState<'a, const K: usize>
+///
+/// Generic over `S: SketchHitInfo` to support both the default
+/// `SketchHitInfoSimple` (no structural constraints) and
+/// `SketchHitInfoChained` (structural constraints enabled via `-c`).
+struct CommonThreadState<'a, const K: usize, S: SketchHitInfo + Send + 'static = SketchHitInfoSimple>
 where
     Kmer<K>: KmerBits,
 {
     hs: HitSearcher<'a>,
     query: PiscemStreamingQuery<'a, K>,
-    cache_out: MappingCache<SketchHitInfoSimple>,
-    cache_left: MappingCache<SketchHitInfoSimple>,
-    cache_right: MappingCache<SketchHitInfoSimple>,
+    cache_out: MappingCache<S>,
+    cache_left: MappingCache<S>,
+    cache_right: MappingCache<S>,
     poison_state: PoisonState<'a>,
     rad_writer: RadWriter,
     local_reads: u64,
@@ -115,7 +120,7 @@ where
     chunk_in_progress: bool,
 }
 
-impl<'a, const K: usize> CommonThreadState<'a, K>
+impl<'a, const K: usize, S: SketchHitInfo + Send + 'static> CommonThreadState<'a, K, S>
 where
     Kmer<K>: KmerBits,
 {
@@ -204,7 +209,11 @@ where
 /// Parallel processor for bulk RNA-seq mapping.
 ///
 /// Implements `PairedParallelProcessor` for PE and `ParallelProcessor` for SE.
-pub struct BulkProcessor<'a, const K: usize>
+///
+/// Generic over `S: SketchHitInfo` so that structural constraints can be enabled
+/// at compile time by instantiating with `SketchHitInfoChained` rather than the
+/// default `SketchHitInfoSimple`.
+pub struct BulkProcessor<'a, const K: usize, S: SketchHitInfo + Send + 'static = SketchHitInfoSimple>
 where
     Kmer<K>: KmerBits,
 {
@@ -215,10 +224,10 @@ where
     progress: &'a ProgressBar,
     strat: SkippingStrategy,
     opts: MappingOpts,
-    state: Option<CommonThreadState<'a, K>>,
+    state: Option<CommonThreadState<'a, K, S>>,
 }
 
-impl<'a, const K: usize> BulkProcessor<'a, K>
+impl<'a, const K: usize, S: SketchHitInfo + Send + 'static> BulkProcessor<'a, K, S>
 where
     Kmer<K>: KmerBits,
 {
@@ -244,7 +253,7 @@ where
     }
 }
 
-impl<const K: usize> Clone for BulkProcessor<'_, K>
+impl<const K: usize, S: SketchHitInfo + Send + 'static> Clone for BulkProcessor<'_, K, S>
 where
     Kmer<K>: KmerBits,
 {
@@ -262,13 +271,16 @@ where
     }
 }
 
-// Safety: all fields are either `Copy` references or `None`.
-unsafe impl<const K: usize> Send for BulkProcessor<'_, K> where Kmer<K>: KmerBits {}
+// Safety: all shared fields are `Copy` references; `state` is always `None` at clone time.
+unsafe impl<const K: usize, S: SketchHitInfo + Send + 'static> Send for BulkProcessor<'_, K, S>
+where
+    Kmer<K>: KmerBits,
+{}
 
 // --- Bulk PE ---
 
-impl<'a, 'r, const K: usize> PairedParallelProcessor<paraseq::fastx::RefRecord<'r>>
-    for BulkProcessor<'a, K>
+impl<'a, 'r, const K: usize, S: SketchHitInfo + Send + 'static>
+    PairedParallelProcessor<paraseq::fastx::RefRecord<'r>> for BulkProcessor<'a, K, S>
 where
     Kmer<K>: KmerBits,
 {
@@ -292,7 +304,7 @@ where
             let seq2 = rec2.seq();
 
             s.poison_state.paired_for_mapping = true;
-            map_pe_fragment::<K>(
+            map_pe_fragment::<K, S>(
                 &seq1,
                 &seq2,
                 &mut s.hs,
@@ -345,8 +357,8 @@ where
 
 // --- Bulk SE ---
 
-impl<'a, 'r, const K: usize> ParallelProcessor<paraseq::fastx::RefRecord<'r>>
-    for BulkProcessor<'a, K>
+impl<'a, 'r, const K: usize, S: SketchHitInfo + Send + 'static>
+    ParallelProcessor<paraseq::fastx::RefRecord<'r>> for BulkProcessor<'a, K, S>
 where
     Kmer<K>: KmerBits,
 {
@@ -369,7 +381,7 @@ where
             let seq1 = rec.seq();
 
             s.poison_state.paired_for_mapping = false;
-            map_se_fragment::<K>(
+            map_se_fragment::<K, S>(
                 &seq1,
                 &mut s.hs,
                 &mut s.query,
@@ -422,17 +434,20 @@ where
 // ===========================================================================
 
 /// Per-thread state for scRNA mapping (extends common state).
-struct ScrnaThreadState<'a, const K: usize>
+struct ScrnaThreadState<'a, const K: usize, S: SketchHitInfo + Send + 'static = SketchHitInfoSimple>
 where
     Kmer<K>: KmerBits,
 {
-    common: CommonThreadState<'a, K>,
+    common: CommonThreadState<'a, K, S>,
     local_rlen_samples: Vec<u32>,
     unmapped_bc_counts: AHashMap<u64, u32>,
 }
 
 /// Parallel processor for scRNA-seq mapping.
-pub struct ScrnaProcessor<'a, const K: usize>
+///
+/// Generic over `S: SketchHitInfo` so that structural constraints can be enabled
+/// by instantiating with `SketchHitInfoChained`.
+pub struct ScrnaProcessor<'a, const K: usize, S: SketchHitInfo + Send + 'static = SketchHitInfoSimple>
 where
     Kmer<K>: KmerBits,
 {
@@ -448,10 +463,10 @@ where
     umi_len: u16,
     with_position: bool,
     read_length_samples: &'a Mutex<Vec<u32>>,
-    state: Option<ScrnaThreadState<'a, K>>,
+    state: Option<ScrnaThreadState<'a, K, S>>,
 }
 
-impl<'a, const K: usize> ScrnaProcessor<'a, K>
+impl<'a, const K: usize, S: SketchHitInfo + Send + 'static> ScrnaProcessor<'a, K, S>
 where
     Kmer<K>: KmerBits,
 {
@@ -488,7 +503,7 @@ where
     }
 }
 
-impl<const K: usize> Clone for ScrnaProcessor<'_, K>
+impl<const K: usize, S: SketchHitInfo + Send + 'static> Clone for ScrnaProcessor<'_, K, S>
 where
     Kmer<K>: KmerBits,
 {
@@ -511,10 +526,15 @@ where
     }
 }
 
-unsafe impl<const K: usize> Send for ScrnaProcessor<'_, K> where Kmer<K>: KmerBits {}
+// Safety: all shared fields are `Copy` references; `state` is always `None` at clone time.
+unsafe impl<const K: usize, S: SketchHitInfo + Send + 'static> Send for ScrnaProcessor<'_, K, S>
+where
+    Kmer<K>: KmerBits,
+{
+}
 
-impl<'a, 'r, const K: usize> PairedParallelProcessor<paraseq::fastx::RefRecord<'r>>
-    for ScrnaProcessor<'a, K>
+impl<'a, 'r, const K: usize, S: SketchHitInfo + Send + 'static>
+    PairedParallelProcessor<paraseq::fastx::RefRecord<'r>> for ScrnaProcessor<'a, K, S>
 where
     Kmer<K>: KmerBits,
 {
@@ -532,7 +552,7 @@ where
         let is_bio_paired = protocol.is_bio_paired_end();
         let max_rlen_samples: usize = 10;
 
-        let st = self.state.get_or_insert_with(|| ScrnaThreadState {
+        let st = self.state.get_or_insert_with(|| ScrnaThreadState::<K, S> {
             common: CommonThreadState::new(index, end_cache, &self.opts),
             local_rlen_samples: Vec::new(),
             unmapped_bc_counts: AHashMap::new(),
@@ -604,7 +624,7 @@ where
                     continue;
                 }
                 s.poison_state.paired_for_mapping = true;
-                map_pe_fragment::<K>(
+                map_pe_fragment::<K, S>(
                     seq1,
                     seq2,
                     &mut s.hs,
@@ -626,7 +646,7 @@ where
                     continue;
                 }
                 s.poison_state.paired_for_mapping = false;
-                map_se_fragment::<K>(
+                map_se_fragment::<K, S>(
                     seq1,
                     &mut s.hs,
                     &mut s.query,

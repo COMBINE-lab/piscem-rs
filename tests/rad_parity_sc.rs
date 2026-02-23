@@ -380,6 +380,157 @@ fn sc_v3_rad_parity() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Struct-constraints parity test
+// ---------------------------------------------------------------------------
+
+/// Pre-built no-poison C++ index (used for struct-constraints test).
+const CPP_INDEX_NOPOISON_PREFIX: &str =
+    "test_data/gencode_pc_v44_index_nopoison/gencode_pc_v44_index";
+
+/// Pre-built optimised Rust index (used for struct-constraints test).
+const RUST_INDEX_OPT_PREFIX: &str =
+    "test_data/gencode_pc_v44_index_rust_optimized_build/gencode_pc_v44_index_rust_optimized_build";
+
+/// Real PBMC 10k reads used for struct-constraints SC parity test.
+const SC_READ1: &str = "test_data/pbmc_10k_r1.fq.gz";
+const SC_READ2: &str = "test_data/pbmc_10k_r2.fq.gz";
+
+/// Run the C++ SC mapper with `--struct-constraints`.
+fn run_cpp_sc_struct_constraints(output_dir: &Path, threads: usize) -> Result<()> {
+    std::fs::create_dir_all(output_dir)?;
+    let mut cmd = Command::new(CPP_SC_BIN);
+    cmd.arg("-i").arg(CPP_INDEX_NOPOISON_PREFIX)
+        .arg("-o").arg(output_dir)
+        .arg("-g").arg("chromium_v3")
+        .arg("-t").arg(threads.to_string())
+        .arg("-1").arg(SC_READ1)
+        .arg("-2").arg(SC_READ2)
+        .arg("--no-poison")
+        .arg("--struct-constraints")
+        .arg("--quiet");
+    eprintln!("Running C++ SC mapper (struct-constraints): {:?}", cmd);
+    let status = cmd.status().context("failed to run C++ SC mapper")?;
+    if !status.success() {
+        anyhow::bail!("C++ SC mapper exited with status: {}", status);
+    }
+    Ok(())
+}
+
+/// Run the Rust SC mapper with `--struct-constraints`.
+fn run_rust_sc_struct_constraints(output_dir: &Path, threads: usize) -> Result<()> {
+    let bin = PathBuf::from("target/release/piscem-rs");
+    let bin = if bin.exists() {
+        bin
+    } else {
+        PathBuf::from("target/debug/piscem-rs")
+    };
+
+    let mut cmd = Command::new(&bin);
+    cmd.arg("map-scrna")
+        .arg("-i").arg(RUST_INDEX_OPT_PREFIX)
+        .arg("-o").arg(output_dir)
+        .arg("-g").arg("chromium_v3")
+        .arg("-t").arg(threads.to_string())
+        .arg("-1").arg(SC_READ1)
+        .arg("-2").arg(SC_READ2)
+        .arg("--no-poison")
+        .arg("--struct-constraints");
+    eprintln!("Running Rust SC mapper (struct-constraints): {:?}", cmd);
+    let status = cmd.status().context("failed to run Rust SC mapper")?;
+    if !status.success() {
+        anyhow::bail!("Rust SC mapper exited with status: {}", status);
+    }
+    Ok(())
+}
+
+/// SC V3 RAD parity test with structural constraints enabled.
+///
+/// Uses pre-built no-poison indices and real PBMC 10k reads.
+///
+/// Run with:
+///   cargo test --features parity-test --release --test rad_parity_sc \
+///     -- sc_v3_rad_parity_struct_constraints --ignored --nocapture
+#[test]
+#[ignore]
+fn sc_v3_rad_parity_struct_constraints() {
+    if !Path::new(SC_READ1).exists() {
+        eprintln!("SKIP: {} not found", SC_READ1);
+        return;
+    }
+    if !Path::new(CPP_SC_BIN).exists() {
+        eprintln!("SKIP: C++ SC binary not found at {}", CPP_SC_BIN);
+        return;
+    }
+    let cpp_marker = format!("{CPP_INDEX_NOPOISON_PREFIX}.sshash");
+    if !Path::new(&cpp_marker).exists() {
+        eprintln!("SKIP: C++ no-poison index not found at {}", cpp_marker);
+        return;
+    }
+    let rust_marker = format!("{RUST_INDEX_OPT_PREFIX}.ssi");
+    if !Path::new(&rust_marker).exists() {
+        eprintln!("SKIP: Rust optimized index not found at {}", rust_marker);
+        return;
+    }
+
+    let tmpdir = tempfile::tempdir().expect("failed to create tempdir");
+    let cpp_out_dir = tmpdir.path().join("cpp_out");
+    let rust_out_dir = tmpdir.path().join("rust_out");
+
+    run_cpp_sc_struct_constraints(&cpp_out_dir, 1)
+        .expect("C++ SC mapper (struct-constraints) failed");
+    run_rust_sc_struct_constraints(&rust_out_dir, 1)
+        .expect("Rust SC mapper (struct-constraints) failed");
+
+    let cpp_rad = cpp_out_dir.join("map.rad");
+    let rust_rad = rust_out_dir.join("map.rad");
+
+    assert!(cpp_rad.exists(), "C++ RAD file not found: {}", cpp_rad.display());
+    assert!(rust_rad.exists(), "Rust RAD file not found: {}", rust_rad.display());
+
+    eprintln!("Comparing SC RAD files (struct-constraints)...");
+    let result = compare_sc_rad_full(&cpp_rad, &rust_rad)
+        .expect("failed to compare SC RAD files");
+
+    eprintln!("SC struct-constraints comparison result:");
+    eprintln!("  Header match: {}", result.header_match);
+    eprintln!("  Records A (C++): {}", result.total_records_a);
+    eprintln!("  Records B (Rust): {}", result.total_records_b);
+    eprintln!("  Matching: {}", result.matching_records);
+    eprintln!("  Missing in A: {}", result.missing_in_a);
+    eprintln!("  Missing in B: {}", result.missing_in_b);
+    eprintln!("  Notes: {}", result.notes);
+    if !result.first_mismatches.is_empty() {
+        eprintln!("  First mismatches:");
+        for m in &result.first_mismatches {
+            eprintln!("    - {}", m);
+        }
+    }
+
+    assert!(
+        result.header_match,
+        "RAD headers differ between C++ and Rust: {}",
+        result.notes,
+    );
+
+    let match_rate = if result.total_records_a > 0 {
+        result.matching_records as f64 / result.total_records_a as f64 * 100.0
+    } else {
+        0.0
+    };
+    eprintln!(
+        "  Record match rate: {:.2}% ({}/{})",
+        match_rate, result.matching_records, result.total_records_a
+    );
+
+    assert!(
+        (match_rate - 100.0).abs() < 1e-9,
+        "Record-level match rate is not 100% with struct-constraints ({:.2}%): {}",
+        match_rate,
+        result.notes,
+    );
+}
+
 /// SC V3 RAD parity test with 1M reads (slower, more thorough).
 #[test]
 #[ignore]

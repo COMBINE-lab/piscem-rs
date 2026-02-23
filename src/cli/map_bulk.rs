@@ -17,8 +17,11 @@ use crate::io::fastx::{Collection, CollectionType, open_with_decompression};
 use crate::io::map_info::{MapInfoParams, write_map_info};
 use crate::io::rad::write_rad_header_bulk;
 use crate::io::threads::{MappingStats, OutputInfo};
+use crate::mapping::chain_state::SketchHitInfoChained;
 use crate::mapping::hit_searcher::SkippingStrategy;
+use crate::mapping::hits::SketchHitInfo;
 use crate::mapping::processors::{BulkProcessor, MappingOpts};
+use crate::mapping::sketch_hit_simple::SketchHitInfoSimple;
 
 #[derive(Args, Debug)]
 #[command(group(
@@ -70,6 +73,11 @@ pub struct MapBulkArgs {
     /// Reads with more than this many accepted mappings are discarded
     #[arg(long, default_value = "2500")]
     pub max_read_occ: usize,
+    /// Apply structural constraints: require k-mers to form positionally
+    /// coherent chains (max stretch 31 bp, up to 8 chains per orientation).
+    /// Equivalent to the C++ `-c`/`--struct-constraints` flag.
+    #[arg(short = 'c', long)]
+    pub struct_constraints: bool,
     /// Suppress progress output
     #[arg(short = 'q', long)]
     pub quiet: bool,
@@ -155,20 +163,30 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
         max_read_occ: args.max_read_occ,
         max_ec_card: if args.ignore_ambig_hits { 0 } else { args.max_ec_card },
     };
+    let struct_constraints = args.struct_constraints;
 
-    // Dispatch on K and run the pipeline via paraseq
+    // Dispatch on K and hit-info type, then run the pipeline via paraseq
     dispatch_on_k!(k, K => {
         let (r1_paths, r2_paths) = if is_paired {
             (args.read1.as_slice(), args.read2.as_slice())
         } else {
             (args.reads.as_slice(), [].as_slice())
         };
-        run_bulk_pipeline::<K>(
-            r1_paths, r2_paths,
-            &output_info, &stats,
-            &index, strat, opts, is_paired,
-            num_threads, &progress,
-        )?;
+        if struct_constraints {
+            run_bulk_pipeline::<K, SketchHitInfoChained>(
+                r1_paths, r2_paths,
+                &output_info, &stats,
+                &index, strat, opts, is_paired,
+                num_threads, &progress,
+            )?;
+        } else {
+            run_bulk_pipeline::<K, SketchHitInfoSimple>(
+                r1_paths, r2_paths,
+                &output_info, &stats,
+                &index, strat, opts, is_paired,
+                num_threads, &progress,
+            )?;
+        }
     });
 
     progress.finish_and_clear();
@@ -223,7 +241,7 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_bulk_pipeline<const K: usize>(
+fn run_bulk_pipeline<const K: usize, S: SketchHitInfo + Send + 'static>(
     read1_paths: &[PathBuf],
     read2_paths: &[PathBuf],
     output: &OutputInfo,
@@ -238,7 +256,7 @@ fn run_bulk_pipeline<const K: usize>(
 where
     Kmer<K>: KmerBits,
 {
-    let mut processor = BulkProcessor::<K>::new(index, None, output, stats, strat, opts, progress);
+    let mut processor = BulkProcessor::<K, S>::new(index, None, output, stats, strat, opts, progress);
 
     if is_paired {
         let mut readers = Vec::with_capacity(read1_paths.len() * 2);

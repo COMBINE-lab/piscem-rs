@@ -1059,6 +1059,158 @@ fn run_cpp_bulk_with_poison_index(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Struct-constraints parity test
+// ---------------------------------------------------------------------------
+
+/// Pre-built no-poison C++ index (used for struct-constraints test).
+const CPP_INDEX_NOPOISON_PREFIX: &str =
+    "test_data/gencode_pc_v44_index_nopoison/gencode_pc_v44_index";
+
+/// Pre-built optimised Rust index (used for struct-constraints test).
+const RUST_INDEX_OPT_PREFIX: &str =
+    "test_data/gencode_pc_v44_index_rust_optimized_build/gencode_pc_v44_index_rust_optimized_build";
+
+/// Run the C++ bulk mapper with `--struct-constraints`.
+fn run_cpp_bulk_struct_constraints(output_stem: &Path, threads: usize) -> Result<()> {
+    let mut cmd = Command::new(CPP_BULK_BIN);
+    cmd.arg("-i").arg(CPP_INDEX_NOPOISON_PREFIX)
+        .arg("-o").arg(output_stem)
+        .arg("-t").arg(threads.to_string())
+        .arg("-1").arg(READ1)
+        .arg("-2").arg(READ2)
+        .arg("--no-poison")
+        .arg("--struct-constraints")
+        .arg("--quiet");
+    eprintln!("Running C++ mapper (struct-constraints): {:?}", cmd);
+    let status = cmd.status().context("failed to run C++ bulk mapper")?;
+    if !status.success() {
+        anyhow::bail!("C++ bulk mapper exited with status: {}", status);
+    }
+    Ok(())
+}
+
+/// Run the Rust bulk mapper with `--struct-constraints`.
+///
+/// `output_stem` is used as a file stem; the mapper creates `<stem>.rad`.
+fn run_rust_bulk_struct_constraints(output_stem: &Path, threads: usize) -> Result<()> {
+    let bin = PathBuf::from("target/release/piscem-rs");
+    let bin = if bin.exists() {
+        bin
+    } else {
+        PathBuf::from("target/debug/piscem-rs")
+    };
+
+    let mut cmd = Command::new(&bin);
+    cmd.arg("map-bulk")
+        .arg("-i").arg(RUST_INDEX_OPT_PREFIX)
+        .arg("-o").arg(output_stem)
+        .arg("-t").arg(threads.to_string())
+        .arg("-1").arg(READ1)
+        .arg("-2").arg(READ2)
+        .arg("--no-poison")
+        .arg("--struct-constraints");
+    eprintln!("Running Rust mapper (struct-constraints): {:?}", cmd);
+    let status = cmd.status().context("failed to run Rust bulk mapper")?;
+    if !status.success() {
+        anyhow::bail!("Rust bulk mapper exited with status: {}", status);
+    }
+    Ok(())
+}
+
+/// Bulk PE RAD parity test with structural constraints enabled.
+///
+/// Uses pre-built no-poison indices so no index build step is needed.
+///
+/// Run with:
+///   cargo test --features parity-test --release --test rad_parity_bulk \
+///     -- bulk_pe_rad_parity_struct_constraints --ignored --nocapture
+#[test]
+#[ignore]
+fn bulk_pe_rad_parity_struct_constraints() {
+    if !Path::new(READ1).exists() {
+        eprintln!("SKIP: {} not found", READ1);
+        return;
+    }
+    if !Path::new(CPP_BULK_BIN).exists() {
+        eprintln!("SKIP: C++ binary not found at {}", CPP_BULK_BIN);
+        return;
+    }
+    let cpp_marker = format!("{CPP_INDEX_NOPOISON_PREFIX}.sshash");
+    if !Path::new(&cpp_marker).exists() {
+        eprintln!("SKIP: C++ no-poison index not found at {}", cpp_marker);
+        return;
+    }
+    let rust_marker = format!("{RUST_INDEX_OPT_PREFIX}.ssi");
+    if !Path::new(&rust_marker).exists() {
+        eprintln!("SKIP: Rust optimized index not found at {}", rust_marker);
+        return;
+    }
+
+    let tmpdir = tempfile::tempdir().expect("failed to create tempdir");
+    let cpp_out_stem = tmpdir.path().join("cpp_out");
+    let rust_out_stem = tmpdir.path().join("rust_out");
+
+    run_cpp_bulk_struct_constraints(&cpp_out_stem, 1)
+        .expect("C++ mapper (struct-constraints) failed");
+    run_rust_bulk_struct_constraints(&rust_out_stem, 1)
+        .expect("Rust mapper (struct-constraints) failed");
+
+    let cpp_rad = cpp_out_stem.with_extension("rad");
+    let rust_rad = rust_out_stem.with_extension("rad");
+
+    assert!(cpp_rad.exists(), "C++ RAD file not found: {}", cpp_rad.display());
+    assert!(rust_rad.exists(), "Rust RAD file not found: {}", rust_rad.display());
+
+    eprintln!("Comparing RAD files (struct-constraints)...");
+    let result = compare_bulk_rad_full(&cpp_rad, &rust_rad)
+        .expect("failed to compare RAD files");
+
+    eprintln!("Struct-constraints comparison result:");
+    eprintln!("  Header match: {}", result.header_match);
+    eprintln!("  Records A (C++): {}", result.total_records_a);
+    eprintln!("  Records B (Rust): {}", result.total_records_b);
+    eprintln!("  Matching: {}", result.matching_records);
+    eprintln!("  Missing in A: {}", result.missing_in_a);
+    eprintln!("  Missing in B: {}", result.missing_in_b);
+    eprintln!("  Mismatch categories:");
+    eprintln!("    Same targets, diff detail: {}", result.same_targets_diff_detail);
+    eprintln!("    Different targets: {}", result.different_targets);
+    eprintln!("    Diff position only: {}", result.diff_pos_only);
+    eprintln!("    Diff frag_len only: {}", result.diff_frag_len_only);
+    eprintln!("    Diff num alignments: {}", result.diff_num_alns);
+    eprintln!("  Notes: {}", result.notes);
+    if !result.first_mismatches.is_empty() {
+        eprintln!("  First mismatches:");
+        for m in &result.first_mismatches {
+            eprintln!("    - {}", m);
+        }
+    }
+
+    assert!(
+        result.header_match,
+        "RAD headers differ between C++ and Rust: {}",
+        result.notes,
+    );
+
+    let match_rate = if result.total_records_a > 0 {
+        result.matching_records as f64 / result.total_records_a as f64 * 100.0
+    } else {
+        0.0
+    };
+    eprintln!(
+        "  Record match rate: {:.2}% ({}/{})",
+        match_rate, result.matching_records, result.total_records_a
+    );
+
+    assert!(
+        (match_rate - 100.0).abs() < 1e-9,
+        "Record-level match rate is not 100% with struct-constraints ({:.2}%): {}",
+        match_rate,
+        result.notes,
+    );
+}
+
 #[test]
 fn resolve_refs() {
     use std::io::BufReader;

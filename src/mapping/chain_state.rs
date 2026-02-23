@@ -150,6 +150,12 @@ impl SketchHitInfoChained {
     }
 
     /// Process a hit at rank > 0 by extending an existing chain.
+    ///
+    /// Matches C++ `process_hit()`: binary-searches chains by `prev_pos`
+    /// (the last reference position each chain was extended to) to find the
+    /// chain whose endpoint is closest to `next_hit_pos`. For FW hits the
+    /// predecessor chain (prev_pos < next_hit_pos) is checked; for RC hits
+    /// the successor chain (prev_pos >= next_hit_pos).
     fn process_hit(
         is_fw_hit: bool,
         read_start_pos: i32,
@@ -161,16 +167,22 @@ impl SketchHitInfoChained {
             return false;
         }
 
-        // Binary search for the chain matching this read_start_pos.
+        // Binary search by prev_pos to find the first chain with
+        // prev_pos >= next_hit_pos (matching C++ lower_bound on prev_pos).
         let probe_idx = chains
-            .binary_search_by(|c| c.read_start_pos.cmp(&read_start_pos))
+            .binary_search_by(|c| c.prev_pos.cmp(&next_hit_pos))
             .unwrap_or_else(|i| i);
 
-        // For FW hits, start at the match or just before it and scan backward.
-        // For RC hits, start at the match or insertion point and scan forward.
+        // For FW hits: back up one position to the predecessor chain
+        // (prev_pos < next_hit_pos). If none exists, no chain to extend.
+        // For RC hits: use the found position as-is (first chain with
+        // prev_pos >= next_hit_pos).
         let start_idx = if is_fw_hit {
-            // Start at probe_idx itself (if valid) or the last element
-            probe_idx.min(chains.len() - 1)
+            if probe_idx > 0 {
+                probe_idx - 1
+            } else {
+                return false;
+            }
         } else {
             probe_idx
         };
@@ -314,7 +326,7 @@ impl SketchHitInfo for SketchHitInfoChained {
             self.last_read_pos_rc = read_pos;
         }
 
-        let mut added = if self.rc_rank == 0 {
+        if self.rc_rank == 0 {
             Self::process_rank0_hit(
                 approx_map_pos,
                 ref_pos,
@@ -324,22 +336,18 @@ impl SketchHitInfo for SketchHitInfoChained {
                 &mut self.rc_hits,
             )
         } else {
-            Self::process_hit(
+            let added = Self::process_hit(
                 false,
                 approx_map_pos,
                 ref_pos,
                 &mut self.rc_chains,
                 &mut self.rc_hits,
-            )
-        };
-
-        if added {
-            self.approx_pos_rc = approx_map_pos;
+            );
+            if added {
+                self.approx_pos_rc = approx_map_pos;
+            }
+            added
         }
-        // For RC rank 0, the C++ always sets added = true via process_rank0_hit
-        // and the "added" variable above handles that.
-        let _ = &mut added; // suppress unused-mut if needed
-        added
     }
 
     #[inline]

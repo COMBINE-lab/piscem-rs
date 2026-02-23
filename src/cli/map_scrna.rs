@@ -17,11 +17,14 @@ use crate::io::fastx::{open_with_decompression, Collection, CollectionType};
 use crate::io::map_info::{MapInfoParams, write_map_info};
 use crate::io::rad::write_rad_header_sc;
 use crate::io::threads::{MappingStats, OutputInfo};
+use crate::mapping::chain_state::SketchHitInfoChained;
 use crate::mapping::hit_searcher::SkippingStrategy;
+use crate::mapping::hits::SketchHitInfo;
 use crate::mapping::processors::{MappingOpts, ScrnaProcessor};
 use crate::mapping::protocols::custom::parse_custom_geometry;
 use crate::mapping::protocols::scrna::ChromiumProtocol;
 use crate::mapping::protocols::Protocol;
+use crate::mapping::sketch_hit_simple::SketchHitInfoSimple;
 
 use super::map_bulk::make_progress_bar;
 
@@ -70,6 +73,11 @@ pub struct MapScrnaArgs {
     /// Include mapping positions in RAD output
     #[arg(long)]
     pub with_position: bool,
+    /// Apply structural constraints: require k-mers to form positionally
+    /// coherent chains (max stretch 31 bp, up to 8 chains per orientation).
+    /// Equivalent to the C++ `-c`/`--struct-constraints` flag.
+    #[arg(short = 'c', long)]
+    pub struct_constraints: bool,
     /// Suppress progress output
     #[arg(short = 'q', long)]
     pub quiet: bool,
@@ -167,16 +175,27 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
         max_read_occ: args.max_read_occ,
         max_ec_card: if args.ignore_ambig_hits { 0 } else { args.max_ec_card },
     };
+    let struct_constraints = args.struct_constraints;
 
-    // Dispatch on K and run the pipeline via paraseq
+    // Dispatch on K and hit-info type, then run the pipeline via paraseq
     dispatch_on_k!(k, K => {
-        run_scrna_pipeline::<K>(
-            &args.read1, &args.read2,
-            &output_info, &stats,
-            &index, strat, opts, protocol.as_ref(), bc_len, umi_len,
-            with_position, &read_length_samples,
-            num_threads, &progress,
-        )?;
+        if struct_constraints {
+            run_scrna_pipeline::<K, SketchHitInfoChained>(
+                &args.read1, &args.read2,
+                &output_info, &stats,
+                &index, strat, opts, protocol.as_ref(), bc_len, umi_len,
+                with_position, &read_length_samples,
+                num_threads, &progress,
+            )?;
+        } else {
+            run_scrna_pipeline::<K, SketchHitInfoSimple>(
+                &args.read1, &args.read2,
+                &output_info, &stats,
+                &index, strat, opts, protocol.as_ref(), bc_len, umi_len,
+                with_position, &read_length_samples,
+                num_threads, &progress,
+            )?;
+        }
     });
 
     progress.finish_and_clear();
@@ -246,7 +265,7 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_scrna_pipeline<const K: usize>(
+fn run_scrna_pipeline<const K: usize, S: SketchHitInfo + Send + 'static>(
     read1_paths: &[PathBuf],
     read2_paths: &[PathBuf],
     output: &OutputInfo,
@@ -265,7 +284,7 @@ fn run_scrna_pipeline<const K: usize>(
 where
     Kmer<K>: KmerBits,
 {
-    let mut processor = ScrnaProcessor::<K>::new(
+    let mut processor = ScrnaProcessor::<K, S>::new(
         index, None, output, stats, strat, opts, protocol, bc_len, umi_len, with_position,
         read_length_samples, progress,
     );

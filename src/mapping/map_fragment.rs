@@ -14,7 +14,7 @@ use crate::mapping::cache::MappingCache;
 use crate::mapping::engine::{map_read, map_read_atac};
 use crate::mapping::filters::PoisonState;
 use crate::mapping::hit_searcher::{HitSearcher, SkippingStrategy};
-use crate::mapping::hits::FragmentEnd;
+use crate::mapping::hits::{FragmentEnd, SketchHitInfo};
 use crate::mapping::merge_pairs::{merge_se_mappings, merge_se_mappings_binned};
 use crate::mapping::sketch_hit_simple::SketchHitInfoSimple;
 use crate::mapping::streaming_query::PiscemStreamingQuery;
@@ -22,11 +22,11 @@ use crate::mapping::streaming_query::PiscemStreamingQuery;
 /// Map a single-end read fragment.
 ///
 /// Returns `true` for early stop.
-pub fn map_se_fragment<const K: usize>(
+pub fn map_se_fragment<const K: usize, S: SketchHitInfo>(
     seq: &[u8],
     hs: &mut HitSearcher<'_>,
     query: &mut PiscemStreamingQuery<'_, K>,
-    cache_out: &mut MappingCache<SketchHitInfoSimple>,
+    cache_out: &mut MappingCache<S>,
     index: &ReferenceIndex,
     poison_state: &mut PoisonState<'_>,
     strat: SkippingStrategy,
@@ -35,7 +35,7 @@ where
     Kmer<K>: KmerBits,
 {
     poison_state.clear();
-    map_read::<K, SketchHitInfoSimple>(seq, cache_out, hs, query, index, poison_state, strat)
+    map_read::<K, S>(seq, cache_out, hs, query, index, poison_state, strat)
 }
 
 /// Map a paired-end read fragment.
@@ -43,14 +43,14 @@ where
 /// Maps both ends independently, then merges results.
 /// Returns `true` for early stop.
 #[allow(clippy::too_many_arguments)]
-pub fn map_pe_fragment<const K: usize>(
+pub fn map_pe_fragment<const K: usize, S: SketchHitInfo>(
     seq1: &[u8],
     seq2: &[u8],
     hs: &mut HitSearcher<'_>,
     query: &mut PiscemStreamingQuery<'_, K>,
-    cache_left: &mut MappingCache<SketchHitInfoSimple>,
-    cache_right: &mut MappingCache<SketchHitInfoSimple>,
-    cache_out: &mut MappingCache<SketchHitInfoSimple>,
+    cache_left: &mut MappingCache<S>,
+    cache_right: &mut MappingCache<S>,
+    cache_out: &mut MappingCache<S>,
     index: &ReferenceIndex,
     poison_state: &mut PoisonState<'_>,
     strat: SkippingStrategy,
@@ -63,14 +63,14 @@ where
 
     poison_state.set_fragment_end(FragmentEnd::Left);
     let early_left =
-        map_read::<K, SketchHitInfoSimple>(seq1, cache_left, hs, query, index, poison_state, strat);
+        map_read::<K, S>(seq1, cache_left, hs, query, index, poison_state, strat);
     if poison_state.is_poisoned() {
         return false;
     }
 
     poison_state.set_fragment_end(FragmentEnd::Right);
     let early_right =
-        map_read::<K, SketchHitInfoSimple>(seq2, cache_right, hs, query, index, poison_state, strat);
+        map_read::<K, S>(seq2, cache_right, hs, query, index, poison_state, strat);
     if poison_state.is_poisoned() {
         return false;
     }
