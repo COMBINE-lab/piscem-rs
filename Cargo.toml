@@ -30,9 +30,13 @@ dashmap = "6"
 smallvec = "1.13"
 crossbeam = "0.8"
 paraseq = "0.4"
-niffler = { version = "3", default-features = false, features = ["gz", "bz2", "zstd"] }
+niffler = { version = "3", default-features = false, features = [
+  "gz",
+  "bz2",
+  "zstd",
+] }
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
-indicatif = "0.17"
+indicatif = "0.18"
 
 # Succinct data structures (same versions as sshash-rs)
 sux = { version = "0.12", features = ["epserde"] }
@@ -41,13 +45,13 @@ value-traits = "0.2"
 mem_dbg = "0.4.0"
 
 # RAD file parsing — optional, enabled by parity-test feature
-libradicl = { git = "https://github.com/COMBINE-lab/libradicl.git", branch = "develop", optional = true }
+libradicl = { version = "0.11", optional = true }
 mimalloc = { version = "0.1.48", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
-libradicl = { git = "https://github.com/COMBINE-lab/libradicl.git", branch = "develop" }
+libradicl = "0.11"
 
 [[example]]
 name = "atac_mismatch_diag"
