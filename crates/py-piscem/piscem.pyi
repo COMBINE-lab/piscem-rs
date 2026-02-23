@@ -105,6 +105,7 @@ class ReferenceIndex:
         strategy: str = "permissive",
         max_hit_occ: int = 256,
         max_read_occ: int = 2500,
+        struct_constraints: bool = False,
     ) -> MappingEngine: ...
     def vcolor_engine(
         self,

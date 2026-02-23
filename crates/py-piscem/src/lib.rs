@@ -26,6 +26,8 @@ use piscem_rs::mapping::hits::{MappingType, INVALID_FRAG_LEN, INVALID_MATE_POS};
 use piscem_rs::mapping::map_fragment::{
     map_pe_fragment, map_pe_fragment_atac, map_se_fragment, map_se_fragment_atac,
 };
+use piscem_rs::mapping::chain_state::SketchHitInfoChained;
+use piscem_rs::mapping::hits::SketchHitInfo;
 use piscem_rs::mapping::sketch_hit_simple::SketchHitInfoSimple;
 use piscem_rs::mapping::streaming_query::PiscemStreamingQuery;
 
@@ -58,6 +60,7 @@ trait DynIndex: Send + Sync {
         &self,
         strat: SkippingStrategy,
         opts: MappingOpts,
+        struct_constraints: bool,
     ) -> Box<dyn DynMappingEngine>;
 
     fn make_vcolor_engine(
@@ -96,16 +99,27 @@ where
         &self,
         strat: SkippingStrategy,
         opts: MappingOpts,
+        struct_constraints: bool,
     ) -> Box<dyn DynMappingEngine> {
-        Box::new(ConcreteMappingEngine::<K> {
-            index: Arc::clone(&self.inner),
-            strat,
-            opts,
-            binning: None,
-            cache_left: MappingCache::new(K),
-            cache_right: MappingCache::new(K),
-            cache_out: MappingCache::new(K),
-        })
+        if struct_constraints {
+            Box::new(ConcreteMappingEngine::<K, SketchHitInfoChained> {
+                index: Arc::clone(&self.inner),
+                strat,
+                opts,
+                cache_left: MappingCache::new(K),
+                cache_right: MappingCache::new(K),
+                cache_out: MappingCache::new(K),
+            })
+        } else {
+            Box::new(ConcreteMappingEngine::<K, SketchHitInfoSimple> {
+                index: Arc::clone(&self.inner),
+                strat,
+                opts,
+                cache_left: MappingCache::new(K),
+                cache_right: MappingCache::new(K),
+                cache_out: MappingCache::new(K),
+            })
+        }
     }
 
     fn make_vcolor_engine(
@@ -116,11 +130,10 @@ where
         thr: f32,
     ) -> Box<dyn DynMappingEngine> {
         let binning = BinPos::new(&self.inner, bin_size, overlap, thr);
-        Box::new(ConcreteMappingEngine::<K> {
+        Box::new(ConcreteAtacEngine::<K> {
             index: Arc::clone(&self.inner),
-            strat: SkippingStrategy::Permissive,
             opts,
-            binning: Some(binning),
+            binning,
             cache_left: MappingCache::new(K),
             cache_right: MappingCache::new(K),
             cache_out: MappingCache::new(K),
@@ -181,79 +194,85 @@ trait DynMappingEngine: Send {
     fn uses_virtual_colors(&self) -> bool;
 }
 
-struct ConcreteMappingEngine<const K: usize>
+struct ConcreteMappingEngine<const K: usize, S: SketchHitInfo + Send + 'static = SketchHitInfoSimple>
 where
     Kmer<K>: KmerBits,
 {
     index: Arc<ReferenceIndex>,
     strat: SkippingStrategy,
     opts: MappingOpts,
-    binning: Option<BinPos>,
+    cache_left: MappingCache<S>,
+    cache_right: MappingCache<S>,
+    cache_out: MappingCache<S>,
+}
+
+/// ATAC-specific engine (always uses `SketchHitInfoSimple` + binning).
+struct ConcreteAtacEngine<const K: usize>
+where
+    Kmer<K>: KmerBits,
+{
+    index: Arc<ReferenceIndex>,
+    opts: MappingOpts,
+    binning: BinPos,
     cache_left: MappingCache<SketchHitInfoSimple>,
     cache_right: MappingCache<SketchHitInfoSimple>,
     cache_out: MappingCache<SketchHitInfoSimple>,
 }
 
-impl<const K: usize> ConcreteMappingEngine<K>
-where
-    Kmer<K>: KmerBits,
-{
-    fn apply_opts(cache: &mut MappingCache<SketchHitInfoSimple>, opts: &MappingOpts) {
-        cache.max_hit_occ = opts.max_hit_occ;
-        cache.max_read_occ = opts.max_read_occ;
-        cache.max_ec_card = opts.max_ec_card;
-    }
-
-    fn extract_result(&self, cache: &MappingCache<SketchHitInfoSimple>) -> MappingResultData {
-        let index = &*self.index;
-        let hits: Vec<MappingHitData> = cache
-            .accepted_hits
-            .iter()
-            .map(|h| {
-                let ref_name = if (h.tid as usize) < index.num_refs() {
-                    index.ref_name(h.tid as usize).to_owned()
+fn extract_result(index: &ReferenceIndex, cache: &MappingCache<impl SketchHitInfo>) -> MappingResultData {
+    let hits: Vec<MappingHitData> = cache
+        .accepted_hits
+        .iter()
+        .map(|h| {
+            let ref_name = if (h.tid as usize) < index.num_refs() {
+                index.ref_name(h.tid as usize).to_owned()
+            } else {
+                String::new()
+            };
+            MappingHitData {
+                tid: h.tid,
+                ref_name,
+                pos: h.pos,
+                is_fw: h.is_fw,
+                score: h.score,
+                num_kmer_hits: h.num_hits,
+                mate_pos: if h.mate_pos != INVALID_MATE_POS {
+                    Some(h.mate_pos)
                 } else {
-                    String::new()
-                };
-                MappingHitData {
-                    tid: h.tid,
-                    ref_name,
-                    pos: h.pos,
-                    is_fw: h.is_fw,
-                    score: h.score,
-                    num_kmer_hits: h.num_hits,
-                    mate_pos: if h.mate_pos != INVALID_MATE_POS {
-                        Some(h.mate_pos)
-                    } else {
-                        None
-                    },
-                    mate_is_fw: if h.mate_pos != INVALID_MATE_POS {
-                        Some(h.mate_is_fw)
-                    } else {
-                        None
-                    },
-                    fragment_length: if h.fragment_length != INVALID_FRAG_LEN {
-                        Some(h.fragment_length)
-                    } else {
-                        None
-                    },
-                    bin_id: if h.bin_id != u64::MAX {
-                        Some(h.bin_id)
-                    } else {
-                        None
-                    },
-                }
-            })
-            .collect();
+                    None
+                },
+                mate_is_fw: if h.mate_pos != INVALID_MATE_POS {
+                    Some(h.mate_is_fw)
+                } else {
+                    None
+                },
+                fragment_length: if h.fragment_length != INVALID_FRAG_LEN {
+                    Some(h.fragment_length)
+                } else {
+                    None
+                },
+                bin_id: if h.bin_id != u64::MAX {
+                    Some(h.bin_id)
+                } else {
+                    None
+                },
+            }
+        })
+        .collect();
 
-        MappingResultData {
-            mapping_type: cache.map_type,
-            hits,
-        }
+    MappingResultData {
+        mapping_type: cache.map_type,
+        hits,
     }
 }
 
-impl<const K: usize> DynMappingEngine for ConcreteMappingEngine<K>
+fn apply_opts(cache: &mut MappingCache<impl SketchHitInfo>, opts: &MappingOpts) {
+    cache.max_hit_occ = opts.max_hit_occ;
+    cache.max_read_occ = opts.max_read_occ;
+    cache.max_ec_card = opts.max_ec_card;
+}
+
+impl<const K: usize, S: SketchHitInfo + Send + 'static> DynMappingEngine for ConcreteMappingEngine<K, S>
 where
     Kmer<K>: KmerBits,
 {
@@ -263,31 +282,19 @@ where
         let mut query = PiscemStreamingQuery::<K>::new(index.dict());
         let mut poison = PoisonState::new(index.poison_table());
 
-        Self::apply_opts(&mut self.cache_out, &self.opts);
+        apply_opts(&mut self.cache_out, &self.opts);
 
-        if let Some(ref binning) = self.binning {
-            map_se_fragment_atac::<K>(
-                seq,
-                &mut hs,
-                &mut query,
-                &mut self.cache_out,
-                index,
-                &mut poison,
-                binning,
-            );
-        } else {
-            map_se_fragment::<K>(
-                seq,
-                &mut hs,
-                &mut query,
-                &mut self.cache_out,
-                index,
-                &mut poison,
-                self.strat,
-            );
-        }
+        map_se_fragment::<K, S>(
+            seq,
+            &mut hs,
+            &mut query,
+            &mut self.cache_out,
+            index,
+            &mut poison,
+            self.strat,
+        );
 
-        self.extract_result(&self.cache_out)
+        extract_result(index, &self.cache_out)
     }
 
     fn map_read_pair(&mut self, seq1: &[u8], seq2: &[u8]) -> MappingResultData {
@@ -296,43 +303,84 @@ where
         let mut query = PiscemStreamingQuery::<K>::new(index.dict());
         let mut poison = PoisonState::new(index.poison_table());
 
-        Self::apply_opts(&mut self.cache_left, &self.opts);
-        Self::apply_opts(&mut self.cache_right, &self.opts);
-        Self::apply_opts(&mut self.cache_out, &self.opts);
+        apply_opts(&mut self.cache_left, &self.opts);
+        apply_opts(&mut self.cache_right, &self.opts);
+        apply_opts(&mut self.cache_out, &self.opts);
 
-        if let Some(ref binning) = self.binning {
-            map_pe_fragment_atac::<K>(
-                seq1,
-                seq2,
-                &mut hs,
-                &mut query,
-                &mut self.cache_left,
-                &mut self.cache_right,
-                &mut self.cache_out,
-                index,
-                &mut poison,
-                binning,
-            );
-        } else {
-            map_pe_fragment::<K>(
-                seq1,
-                seq2,
-                &mut hs,
-                &mut query,
-                &mut self.cache_left,
-                &mut self.cache_right,
-                &mut self.cache_out,
-                index,
-                &mut poison,
-                self.strat,
-            );
-        }
+        map_pe_fragment::<K, S>(
+            seq1,
+            seq2,
+            &mut hs,
+            &mut query,
+            &mut self.cache_left,
+            &mut self.cache_right,
+            &mut self.cache_out,
+            index,
+            &mut poison,
+            self.strat,
+        );
 
-        self.extract_result(&self.cache_out)
+        extract_result(index, &self.cache_out)
     }
 
     fn uses_virtual_colors(&self) -> bool {
-        self.binning.is_some()
+        false
+    }
+}
+
+impl<const K: usize> DynMappingEngine for ConcreteAtacEngine<K>
+where
+    Kmer<K>: KmerBits,
+{
+    fn map_read(&mut self, seq: &[u8]) -> MappingResultData {
+        let index: &ReferenceIndex = &self.index;
+        let mut hs = HitSearcher::new(index);
+        let mut query = PiscemStreamingQuery::<K>::new(index.dict());
+        let mut poison = PoisonState::new(index.poison_table());
+
+        apply_opts(&mut self.cache_out, &self.opts);
+
+        map_se_fragment_atac::<K>(
+            seq,
+            &mut hs,
+            &mut query,
+            &mut self.cache_out,
+            index,
+            &mut poison,
+            &self.binning,
+        );
+
+        extract_result(index, &self.cache_out)
+    }
+
+    fn map_read_pair(&mut self, seq1: &[u8], seq2: &[u8]) -> MappingResultData {
+        let index: &ReferenceIndex = &self.index;
+        let mut hs = HitSearcher::new(index);
+        let mut query = PiscemStreamingQuery::<K>::new(index.dict());
+        let mut poison = PoisonState::new(index.poison_table());
+
+        apply_opts(&mut self.cache_left, &self.opts);
+        apply_opts(&mut self.cache_right, &self.opts);
+        apply_opts(&mut self.cache_out, &self.opts);
+
+        map_pe_fragment_atac::<K>(
+            seq1,
+            seq2,
+            &mut hs,
+            &mut query,
+            &mut self.cache_left,
+            &mut self.cache_right,
+            &mut self.cache_out,
+            index,
+            &mut poison,
+            &self.binning,
+        );
+
+        extract_result(index, &self.cache_out)
+    }
+
+    fn uses_virtual_colors(&self) -> bool {
+        true
     }
 }
 
@@ -977,13 +1025,16 @@ impl PyReferenceIndex {
     /// :param strategy: ``"permissive"`` (default) or ``"strict"``.
     /// :param max_hit_occ: Maximum k-mer occurrence threshold (default 256).
     /// :param max_read_occ: Maximum mappings per read before discarding (default 2500).
+    /// :param struct_constraints: If ``True``, require k-mers to form positionally
+    ///     coherent chains (matching C++ ``-c``/``--struct-constraints`` flag).
     /// :returns: A :class:`MappingEngine`.
-    #[pyo3(signature = (*, strategy="permissive", max_hit_occ=256, max_read_occ=2500))]
+    #[pyo3(signature = (*, strategy="permissive", max_hit_occ=256, max_read_occ=2500, struct_constraints=false))]
     fn mapping_engine(
         &self,
         strategy: &str,
         max_hit_occ: usize,
         max_read_occ: usize,
+        struct_constraints: bool,
     ) -> PyResult<PyMappingEngine> {
         let strat = match strategy {
             "permissive" => SkippingStrategy::Permissive,
@@ -1001,7 +1052,7 @@ impl PyReferenceIndex {
             ..MappingOpts::default()
         };
         Ok(PyMappingEngine {
-            engine: self.inner.make_mapping_engine(strat, opts),
+            engine: self.inner.make_mapping_engine(strat, opts, struct_constraints),
         })
     }
 

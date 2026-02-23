@@ -150,6 +150,25 @@ class TestMappingEngine:
         result = eng.map_read(b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         assert result.mapping_type == "unmapped"
 
+    def test_create_struct_constraints_engine(self, index):
+        eng = index.mapping_engine(struct_constraints=True)
+        assert not eng.uses_virtual_colors
+
+    @pytest.mark.skipif(not _have_reads(), reason="Test reads not found")
+    def test_map_struct_constraints_se(self, index):
+        seq1, _ = _read_first_pair()
+        eng = index.mapping_engine(struct_constraints=True)
+        result = eng.map_read(seq1.encode())
+        assert result.is_mapped
+        assert result.mapping_type == "single_mapped"
+
+    @pytest.mark.skipif(not _have_reads(), reason="Test reads not found")
+    def test_map_struct_constraints_pe(self, index):
+        seq1, seq2 = _read_first_pair()
+        eng = index.mapping_engine(struct_constraints=True)
+        result = eng.map_read_pair(seq1.encode(), seq2.encode())
+        assert result.is_mapped
+
 
 # ── Virtual colors engine ────────────────────────────────────────────────────
 
