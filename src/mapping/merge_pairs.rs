@@ -312,7 +312,7 @@ fn merge_lists_binned(
                     let frag_len = pos_rc - pos_fw;
 
                     if frag_len > -20 && frag_len < 1000 {
-                        let right_is_rc = !list2.first().map_or(false, |h| h.is_fw);
+                        let right_is_rc = !list2.first().is_some_and(|h| h.is_fw);
                         let tlen = if right_is_rc {
                             (f2.pos + right_len - f1.pos) + 1
                         } else {

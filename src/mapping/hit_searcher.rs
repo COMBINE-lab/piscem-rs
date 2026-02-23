@@ -100,23 +100,6 @@ where
     Some(Kmer::<K>::from_ascii_unchecked(bytes))
 }
 
-/// Parse a k-mer from a byte slice that may contain invalid bases (e.g. N).
-/// Returns `None` if the slice has wrong length or any non-ACGT character.
-#[inline]
-fn parse_read_kmer<const K: usize>(bytes: &[u8]) -> Option<Kmer<K>>
-where
-    Kmer<K>: KmerBits,
-{
-    if bytes.len() != K {
-        return None;
-    }
-    for &b in bytes {
-        if !is_valid_base(b) {
-            return None;
-        }
-    }
-    Some(Kmer::<K>::from_ascii_unchecked(bytes))
-}
 
 // ---------------------------------------------------------------------------
 // ReadKmerIter
@@ -343,10 +326,10 @@ impl<'idx> HitSearcher<'idx> {
 
             let result = query.lookup_at(kmer_bytes, read_pos);
 
-            if let Some(phit) = index.resolve_lookup(&result) {
-                if !phit.is_empty() {
-                    raw_hits.push((read_pos, phit));
-                }
+            if let Some(phit) = index.resolve_lookup(&result)
+                && !phit.is_empty()
+            {
+                raw_hits.push((read_pos, phit));
             }
 
             iter.advance();
@@ -551,24 +534,24 @@ impl<'idx> HitSearcher<'idx> {
                         .as_ref()
                         .is_some_and(|p| !p.is_empty());
 
-                    if let Some(ref check_phit) = alt_phit {
-                        if !check_phit.is_empty() {
-                            let accept = check_phit.contig_id() == phit.contig_id()
-                                && check_phit.hit_fw_on_contig()
-                                    == phit.hit_fw_on_contig()
-                                && if direction > 0 {
-                                    check_phit.contig_pos() > phit.contig_pos()
-                                } else {
-                                    check_phit.contig_pos() < phit.contig_pos()
-                                };
+                    if let Some(ref check_phit) = alt_phit
+                        && !check_phit.is_empty()
+                    {
+                        let accept = check_phit.contig_id() == phit.contig_id()
+                            && check_phit.hit_fw_on_contig()
+                                == phit.hit_fw_on_contig()
+                            && if direction > 0 {
+                                check_phit.contig_pos() > phit.contig_pos()
+                            } else {
+                                check_phit.contig_pos() < phit.contig_pos()
+                            };
 
-                            if accept {
-                                let mut accepted = check_phit.clone();
-                                accepted.set_resulted_from_open_search(false);
-                                raw_hits.push((iter.pos(), accepted));
-                                iter.advance();
-                                continue;
-                            }
+                        if accept {
+                            let mut accepted = check_phit.clone();
+                            accepted.set_resulted_from_open_search(false);
+                            raw_hits.push((iter.pos(), accepted));
+                            iter.advance();
+                            continue;
                         }
                     }
 
@@ -584,44 +567,32 @@ impl<'idx> HitSearcher<'idx> {
                             let mid_result = query.lookup_at(mid_bytes, mid_iter.pos());
                             if let Some(mid_phit) =
                                 index.resolve_lookup(&mid_result)
+                                && !mid_phit.is_empty()
                             {
-                                if !mid_phit.is_empty() {
-                                    if mid_phit.contig_id() == phit.contig_id() {
-                                        // Matched first contig: add mid hit,
-                                        // optionally add alt hit.
-                                        let mut mp = mid_phit;
-                                        mp.set_resulted_from_open_search(false);
-                                        raw_hits.push((mid_iter.pos(), mp));
-                                        if alt_found {
-                                            if let Some(ref ap) = alt_phit {
-                                                let mut ap_clone = ap.clone();
-                                                ap_clone
-                                                    .set_resulted_from_open_search(
-                                                        true,
-                                                    );
-                                                raw_hits
-                                                    .push((alt_iter.pos(), ap_clone));
-                                            }
-                                        }
-                                        mid_acceptable = true;
-                                    } else if alt_found {
-                                        if let Some(ref ap) = alt_phit {
-                                            if !ap.is_empty()
-                                                && mid_phit.contig_id()
-                                                    == ap.contig_id()
-                                            {
-                                                // Matched second contig.
-                                                let mut ap_clone = ap.clone();
-                                                ap_clone
-                                                    .set_resulted_from_open_search(
-                                                        true,
-                                                    );
-                                                raw_hits
-                                                    .push((alt_iter.pos(), ap_clone));
-                                                mid_acceptable = true;
-                                            }
-                                        }
+                                if mid_phit.contig_id() == phit.contig_id() {
+                                    // Matched first contig: add mid hit,
+                                    // optionally add alt hit.
+                                    let mut mp = mid_phit;
+                                    mp.set_resulted_from_open_search(false);
+                                    raw_hits.push((mid_iter.pos(), mp));
+                                    if alt_found
+                                        && let Some(ref ap) = alt_phit
+                                    {
+                                        let mut ap_clone = ap.clone();
+                                        ap_clone.set_resulted_from_open_search(true);
+                                        raw_hits.push((alt_iter.pos(), ap_clone));
                                     }
+                                    mid_acceptable = true;
+                                } else if alt_found
+                                    && let Some(ref ap) = alt_phit
+                                    && !ap.is_empty()
+                                    && mid_phit.contig_id() == ap.contig_id()
+                                {
+                                    // Matched second contig.
+                                    let mut ap_clone = ap.clone();
+                                    ap_clone.set_resulted_from_open_search(true);
+                                    raw_hits.push((alt_iter.pos(), ap_clone));
+                                    mid_acceptable = true;
                                 }
                             }
                         }
@@ -1072,20 +1043,6 @@ mod tests {
         assert!(!is_valid_base(b'n'));
         assert!(!is_valid_base(b'X'));
         assert!(!is_valid_base(b' '));
-    }
-
-    #[test]
-    fn test_parse_read_kmer() {
-        let kmer: Option<Kmer<5>> = parse_read_kmer(b"ACGTG");
-        assert!(kmer.is_some());
-
-        // N in sequence returns None
-        let bad: Option<Kmer<5>> = parse_read_kmer(b"ACNGT");
-        assert!(bad.is_none());
-
-        // Wrong length returns None
-        let short: Option<Kmer<5>> = parse_read_kmer(b"ACGT");
-        assert!(short.is_none());
     }
 
     #[test]

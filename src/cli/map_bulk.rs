@@ -107,12 +107,12 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
     );
 
     // Treat -o as a file stem: create parent dirs, then append extensions
-    if let Some(parent) = args.output.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create output directory: {}", parent.display())
-            })?;
-        }
+    if let Some(parent) = args.output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create output directory: {}", parent.display())
+        })?;
     }
     let mut rad_path = args.output.clone();
     rad_path.add_extension("rad");

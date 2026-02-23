@@ -103,21 +103,21 @@ where
         self.prev_query_pos = read_pos;
 
         // Try cache if we're at a unitig boundary
-        if self.cache_end {
-            if let Some(cache) = self.cache {
-                let kmer = Kmer::<K>::from_ascii_unchecked(kmer_bytes);
-                let canonical = kmer.canonical();
-                let canonical_hash =
-                    CanonicalKmer::new(<Kmer<K> as KmerBits>::to_u64(canonical.bits()));
-                let fw_is_canonical = kmer.bits() == canonical.bits();
+        if self.cache_end
+            && let Some(cache) = self.cache
+        {
+            let kmer = Kmer::<K>::from_ascii_unchecked(kmer_bytes);
+            let canonical = kmer.canonical();
+            let canonical_hash =
+                CanonicalKmer::new(<Kmer<K> as KmerBits>::to_u64(canonical.bits()));
+            let fw_is_canonical = kmer.bits() == canonical.bits();
 
-                if let Some(result) = cache.get(canonical_hash, fw_is_canonical) {
-                    self.num_cache_hits += 1;
-                    self.cache_end = false;
-                    // Reset engine state since we bypassed it
-                    self.engine.reset();
-                    return result;
-                }
+            if let Some(result) = cache.get(canonical_hash, fw_is_canonical) {
+                self.num_cache_hits += 1;
+                self.cache_end = false;
+                // Reset engine state since we bypassed it
+                self.engine.reset();
+                return result;
             }
         }
 
@@ -128,15 +128,15 @@ where
         let result = self.engine.lookup(kmer_bytes);
 
         // If the lookup succeeded and we were at a unitig boundary, cache it
-        if was_cache_end && result.is_found() {
-            if let Some(cache) = self.cache {
-                let kmer = Kmer::<K>::from_ascii_unchecked(kmer_bytes);
-                let canonical = kmer.canonical();
-                let canonical_hash =
-                    CanonicalKmer::new(<Kmer<K> as KmerBits>::to_u64(canonical.bits()));
-                let fw_is_canonical = kmer.bits() == canonical.bits();
-                cache.insert(canonical_hash, &result, fw_is_canonical);
-            }
+        if was_cache_end && result.is_found()
+            && let Some(cache) = self.cache
+        {
+            let kmer = Kmer::<K>::from_ascii_unchecked(kmer_bytes);
+            let canonical = kmer.canonical();
+            let canonical_hash =
+                CanonicalKmer::new(<Kmer<K> as KmerBits>::to_u64(canonical.bits()));
+            let fw_is_canonical = kmer.bits() == canonical.bits();
+            cache.insert(canonical_hash, &result, fw_is_canonical);
         }
 
         // Track remaining bases to detect unitig boundaries

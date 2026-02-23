@@ -372,12 +372,16 @@ impl EqClassMapBuilder {
             self.max_transcript_id = self.max_transcript_id.max(tid);
         }
 
-        // Look up or create EC
-        let next_ec = self.labels.len() as u32;
-        let ec_id = *self.label_to_ec.entry(label.clone()).or_insert_with(|| {
-            self.labels.push(label);
-            next_ec
-        });
+        // Look up existing EC without cloning the label
+        if let Some(&ec_id) = self.label_to_ec.get(&label) {
+            self.tile_to_ec[tile_id] = ec_id;
+            return;
+        }
+
+        // New EC — clone only for the map key, move original into labels
+        let ec_id = self.labels.len() as u32;
+        self.label_to_ec.insert(label.clone(), ec_id);
+        self.labels.push(label);
         self.tile_to_ec[tile_id] = ec_id;
     }
 

@@ -14,7 +14,7 @@ use std::io::BufRead;
 use std::path::PathBuf;
 use tracing::info;
 
-use super::contig_table::ContigTableBuilder;
+use super::contig_table::ContigTableDirectBuilder;
 use super::eq_classes::{EqClassMapBuilder, Orientation};
 use super::reference_index::ReferenceIndex;
 use super::refinfo::RefInfo;
@@ -55,6 +55,8 @@ struct SegmentInfo {
     rank: u32,
     /// Sequence length in bases.
     len: u32,
+    /// Number of occurrences across all references (counted in first pass).
+    count: u32,
 }
 
 /// Parsed tile from a .cf_seq tiling line.
@@ -117,28 +119,17 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
 
     // Step 1: Parse .cf_seg — collect segment IDs, sequences, and lengths
     info!("Parsing segment file: {}", cf_seg_path);
-    let cf_data = parse_cf_seg(&cf_seg_path)
+    let mut cf_data = parse_cf_seg(&cf_seg_path)
         .with_context(|| format!("failed to parse {cf_seg_path}"))?;
 
     let num_segments = cf_data.len();
     info!("  {num_segments} segments");
 
-    // Build segment info map: segment_id → SegmentInfo
-    let mut id_to_info: HashMap<u64, SegmentInfo> = HashMap::with_capacity(num_segments);
-    for (rank, (seg_id, seq)) in cf_data
-        .segment_ids
-        .iter()
-        .zip(cf_data.sequences.iter())
-        .enumerate()
-    {
-        id_to_info.insert(
-            *seg_id,
-            SegmentInfo {
-                rank: rank as u32,
-                len: seq.len() as u32,
-            },
-        );
-    }
+    // Extract segment IDs and lengths before moving sequences to dictionary builder.
+    // We defer building the full id_to_info HashMap (~2-4 GB for 50M segments) until
+    // AFTER dictionary build to reduce peak RSS during the memory-intensive MPHF phase.
+    let segment_lens: Vec<u32> = cf_data.sequences.iter().map(|s| s.len() as u32).collect();
+    let segment_ids = std::mem::take(&mut cf_data.segment_ids);
 
     // Step 2: Build SSHash dictionary from unitig sequences
     info!("Building SSHash dictionary (k={}, m={})", config.k, config.m);
@@ -151,24 +142,45 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
 
     let dict_builder = DictionaryBuilder::new(build_cfg)
         .map_err(|e| anyhow::anyhow!("failed to create dictionary builder: {e}"))?;
-    // Moves sequences into the builder
+    // Moves sequences into the builder — cf_data.sequences consumed here
     let dict = dict_builder
         .build_from_sequences(cf_data.sequences)
         .map_err(|e| anyhow::anyhow!("failed to build dictionary: {e}"))?;
     info!("  Dictionary built: {} strings", dict.num_strings());
 
-    // Step 3: First pass over .cf_seq — collect reference names, lengths
+    // Now build id_to_info from the lightweight arrays (after peak RSS has passed)
+    let mut id_to_info: HashMap<u64, SegmentInfo> = HashMap::with_capacity(num_segments);
+    for (rank, (&seg_id, &len)) in segment_ids.iter().zip(segment_lens.iter()).enumerate() {
+        id_to_info.insert(
+            seg_id,
+            SegmentInfo {
+                rank: rank as u32,
+                len,
+                count: 0,
+            },
+        );
+    }
+    drop(segment_ids);
+    drop(segment_lens);
+
+    // Step 3: First pass over .cf_seq — collect reference names, lengths,
+    //         and count per-unitig occurrences for the direct-write builder.
     info!("First pass over {cf_seq_path}");
     let (ref_names, ref_lens, max_ref_len) =
-        first_pass_cf_seq(&cf_seq_path, &json_path, k, &id_to_info)?;
+        first_pass_cf_seq(&cf_seq_path, &json_path, k, &mut id_to_info)?;
     let num_refs = ref_names.len();
     info!("  {num_refs} references, max_ref_len={max_ref_len}");
 
-    // Step 4: Second pass over .cf_seq — build ContigTable
+    // Step 4: Second pass over .cf_seq — build ContigTable using direct-write builder
     info!("Second pass over {cf_seq_path} to fill contig entries");
     let contig_table = {
+        // Extract per-rank counts from id_to_info
+        let mut counts = vec![0u32; num_segments];
+        for info in id_to_info.values() {
+            counts[info.rank as usize] = info.count;
+        }
         let mut ctab_builder =
-            ContigTableBuilder::new(num_segments, max_ref_len, num_refs as u64);
+            ContigTableDirectBuilder::new(&counts, max_ref_len, num_refs as u64);
         second_pass_cf_seq(&cf_seq_path, k, &id_to_info, &mut ctab_builder)?;
         ctab_builder.build()
     };
@@ -177,6 +189,8 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
         contig_table.num_contigs(),
         contig_table.num_entries()
     );
+    // Free segment metadata — no longer needed after both passes
+    drop(id_to_info);
 
     // Step 5: Build EqClassMap (optional)
     let ec_table = if config.build_ec_table {
@@ -231,11 +245,12 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
     let index = ReferenceIndex::from_parts(dict, contig_table, ref_info, ec_table, None);
 
     // Create output directory if needed
-    if let Some(parent) = config.output_prefix.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create output directory: {}", parent.display()))?;
-        }
+    if let Some(parent) = config.output_prefix.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create output directory: {}", parent.display()))?;
     }
 
     index.save(&config.output_prefix)?;
@@ -257,7 +272,7 @@ fn first_pass_cf_seq(
     cf_seq_path: &str,
     json_path: &str,
     k: usize,
-    id_to_info: &HashMap<u64, SegmentInfo>,
+    id_to_info: &mut HashMap<u64, SegmentInfo>,
 ) -> Result<(Vec<String>, Vec<u64>, u64)> {
     let file = std::fs::File::open(cf_seq_path)
         .with_context(|| format!("failed to open {cf_seq_path}"))?;
@@ -287,14 +302,15 @@ fn first_pass_cf_seq(
             .map(|pos| &header[pos + 9..])
             .with_context(|| format!("line {} header missing 'Sequence:'", line_num + 1))?;
 
-        // Parse tiles to compute reference length
+        // Parse tiles to compute reference length and count per-unitig occurrences
         let mut current_offset: u64 = 0;
         for tok in tiles_str.split_whitespace() {
             match parse_tile(tok)? {
                 Tile::Segment { id, .. } => {
-                    let info = id_to_info.get(&id).with_context(|| {
+                    let info = id_to_info.get_mut(&id).with_context(|| {
                         format!("unknown segment id {id} on line {}", line_num + 1)
                     })?;
+                    info.count += 1;
                     current_offset += info.len as u64 - k_minus_1;
                 }
                 Tile::Gap { count } => {
@@ -311,7 +327,7 @@ fn first_pass_cf_seq(
         ref_names.push(name.to_string());
         ref_lens.push(ref_len);
 
-        if ref_names.len() % 10000 == 0 {
+        if ref_names.len().is_multiple_of(10000) {
             info!("  processed {} references", ref_names.len());
         }
     }
@@ -332,7 +348,7 @@ fn second_pass_cf_seq(
     cf_seq_path: &str,
     k: usize,
     id_to_info: &HashMap<u64, SegmentInfo>,
-    builder: &mut ContigTableBuilder,
+    builder: &mut ContigTableDirectBuilder,
 ) -> Result<()> {
     let file = std::fs::File::open(cf_seq_path)
         .with_context(|| format!("failed to open {cf_seq_path}"))?;
@@ -373,7 +389,7 @@ fn second_pass_cf_seq(
             }
         }
 
-        if ref_id % 10000 == 0 {
+        if ref_id.is_multiple_of(10000) {
             info!("  processing reference #{ref_id}");
         }
 

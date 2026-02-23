@@ -356,7 +356,7 @@ where
             }
         }
         checked += 1;
-        if checked % 500_000 == 0 {
+        if checked.is_multiple_of(500_000) {
             info!("Verified {}/{} poison k-mers ({} in dict so far)",
                 checked, table.num_poison_kmers(), found_in_dict);
         }

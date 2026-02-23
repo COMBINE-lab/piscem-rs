@@ -442,6 +442,92 @@ impl ContigTableBuilder {
     }
 }
 
+/// Memory-efficient builder that writes entries directly into a packed
+/// `BitFieldVec`, avoiding the intermediate `Vec<Vec<u64>>` of
+/// [`ContigTableBuilder`].
+///
+/// Requires pre-counted occurrence counts per unitig (obtained during the
+/// first pass over the `.cf_seq` file). This mirrors the C++ approach in
+/// `build_contig_table.cpp`.
+///
+/// Usage:
+/// 1. Count occurrences per unitig during the first `.cf_seq` pass.
+/// 2. Create with `new(counts, max_ref_len, num_refs)`.
+/// 3. Call `add_occurrence()` for each (unitig, ref, pos, orientation) tuple
+///    during the second `.cf_seq` pass.
+/// 4. Call `build()` to produce the final `ContigTable`.
+pub struct ContigTableDirectBuilder {
+    encoding: EntryEncoding,
+    ctg_offsets: EfSeq,
+    ctg_entries: BitFieldVec<usize>,
+    /// Per-unitig write cursor (index into ctg_entries).
+    cursors: Vec<u64>,
+}
+
+impl ContigTableDirectBuilder {
+    /// Create a new direct builder from pre-counted occurrence data.
+    ///
+    /// - `counts`: `counts[rank]` = number of occurrences for the unitig with
+    ///   that rank (in segment file order)
+    /// - `max_ref_len`: length of the longest reference (determines position bit width)
+    /// - `num_refs`: total number of reference sequences (determines ref_id bit width)
+    pub fn new(counts: &[u32], max_ref_len: u64, num_refs: u64) -> Self {
+        let encoding = EntryEncoding::from_data(max_ref_len, num_refs);
+        let num_unitigs = counts.len();
+
+        // Build cumulative offsets and per-unitig cursors
+        let mut offsets = Vec::with_capacity(num_unitigs + 1);
+        offsets.push(0u64);
+        let mut cursors = Vec::with_capacity(num_unitigs);
+        let mut total: u64 = 0;
+        for &c in counts {
+            cursors.push(total);
+            total += c as u64;
+            offsets.push(total);
+        }
+
+        // Build Elias-Fano from offsets
+        let n = offsets.len();
+        let u = if n > 0 { offsets[n - 1] as usize + 1 } else { 1 };
+        let mut ef_builder = EliasFanoBuilder::new(n, u);
+        for &v in &offsets {
+            ef_builder.push(v as usize);
+        }
+        let ctg_offsets = ef_builder.build_with_seq();
+        drop(offsets);
+
+        // Allocate entries at exact final size
+        let entry_width = encoding.entry_width as usize;
+        let ctg_entries = BitFieldVec::new(entry_width, total as usize);
+
+        Self {
+            encoding,
+            ctg_offsets,
+            ctg_entries,
+            cursors,
+        }
+    }
+
+    /// Write one occurrence directly into the packed `BitFieldVec`.
+    #[inline]
+    pub fn add_occurrence(&mut self, unitig_rank: u32, ref_id: u32, position: u32, is_fw: bool) {
+        let encoded = self.encoding.encode(ref_id, position, is_fw);
+        let idx = self.cursors[unitig_rank as usize];
+        self.ctg_entries.set_value(idx as usize, encoded as usize);
+        self.cursors[unitig_rank as usize] = idx + 1;
+    }
+
+    /// Finalize into a `ContigTable`, consuming the builder.
+    pub fn build(self) -> ContigTable {
+        ContigTable {
+            ref_len_bits: self.encoding.ref_len_bits,
+            num_ref_bits: self.encoding.num_ref_bits,
+            ctg_offsets: self.ctg_offsets,
+            ctg_entries: self.ctg_entries,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

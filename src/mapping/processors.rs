@@ -688,17 +688,17 @@ where
                 samples.extend_from_slice(&st.local_rlen_samples);
             }
             // Write unmapped barcode counts to shared file
-            if let Some(ref unmapped_file) = output.unmapped_bc_file {
-                if !st.unmapped_bc_counts.is_empty() {
-                    let mut buf = Vec::with_capacity(st.unmapped_bc_counts.len() * 12);
-                    for (&bc, &count) in &st.unmapped_bc_counts {
-                        buf.extend_from_slice(&bc.to_le_bytes());
-                        buf.extend_from_slice(&count.to_le_bytes());
-                    }
-                    let mut file = unmapped_file.lock().unwrap();
-                    use std::io::Write;
-                    file.write_all(&buf).ok();
+            if let Some(ref unmapped_file) = output.unmapped_bc_file
+                && !st.unmapped_bc_counts.is_empty()
+            {
+                let mut buf = Vec::with_capacity(st.unmapped_bc_counts.len() * 12);
+                for (&bc, &count) in &st.unmapped_bc_counts {
+                    buf.extend_from_slice(&bc.to_le_bytes());
+                    buf.extend_from_slice(&count.to_le_bytes());
                 }
+                let mut file = unmapped_file.lock().unwrap();
+                use std::io::Write;
+                file.write_all(&buf).ok();
             }
         }
         Ok(())
@@ -1024,17 +1024,17 @@ where
             st.common.finalize_chunk(output);
             st.common.flush_stats(stats);
             // Write unmapped barcode counts to shared file
-            if let Some(ref unmapped_file) = output.unmapped_bc_file {
-                if !st.unmapped_bc_counts.is_empty() {
-                    let mut buf = Vec::with_capacity(st.unmapped_bc_counts.len() * 12);
-                    for (&bc, &count) in &st.unmapped_bc_counts {
-                        buf.extend_from_slice(&bc.to_le_bytes());
-                        buf.extend_from_slice(&count.to_le_bytes());
-                    }
-                    let mut file = unmapped_file.lock().unwrap();
-                    use std::io::Write;
-                    file.write_all(&buf).ok();
+            if let Some(ref unmapped_file) = output.unmapped_bc_file
+                && !st.unmapped_bc_counts.is_empty()
+            {
+                let mut buf = Vec::with_capacity(st.unmapped_bc_counts.len() * 12);
+                for (&bc, &count) in &st.unmapped_bc_counts {
+                    buf.extend_from_slice(&bc.to_le_bytes());
+                    buf.extend_from_slice(&count.to_le_bytes());
                 }
+                let mut file = unmapped_file.lock().unwrap();
+                use std::io::Write;
+                file.write_all(&buf).ok();
             }
         }
         Ok(())
