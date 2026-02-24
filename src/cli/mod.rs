@@ -1,10 +1,10 @@
 pub mod build;
-mod inspect;
 pub mod map_bulk;
 pub mod map_scatac;
 pub mod map_scrna;
 mod parity;
 pub mod poison;
+mod stats;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -24,7 +24,7 @@ enum Commands {
     MapBulk(map_bulk::MapBulkArgs),
     MapScatac(map_scatac::MapScatacArgs),
     BuildPoison(poison::BuildPoisonArgs),
-    Inspect(inspect::InspectArgs),
+    Stats(stats::StatsArgs),
     Parity(parity::ParityArgs),
 }
 
@@ -36,7 +36,7 @@ pub fn run() -> Result<()> {
         Commands::MapBulk(args) => map_bulk::run(args),
         Commands::MapScatac(args) => map_scatac::run(args),
         Commands::BuildPoison(args) => poison::run(args),
-        Commands::Inspect(args) => inspect::run(args),
+        Commands::Stats(args) => stats::run(args),
         Commands::Parity(args) => parity::run(args),
     }
 }

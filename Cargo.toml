@@ -73,6 +73,7 @@ tempfile = "3"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 libradicl = "0.11"
 
+# Examples that need optional features (excluded from publish but needed locally).
 [[example]]
 name = "atac_mismatch_diag"
 required-features = ["parity-test"]
