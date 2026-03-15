@@ -15,13 +15,14 @@ use sshash_lib::{Kmer, KmerBits, dispatch_on_k};
 use crate::index::reference_index::ReferenceIndex;
 use crate::io::fastx::{open_with_decompression, Collection, CollectionType};
 use crate::io::map_info::{MapInfoParams, write_map_info};
-use crate::io::rad::write_rad_header_sc;
+use crate::io::rad::{write_rad_header_sc, write_rad_header_sc_multi_bc};
 use crate::io::threads::{MappingStats, OutputInfo};
 use crate::mapping::chain_state::SketchHitInfoChained;
 use crate::mapping::hit_searcher::SkippingStrategy;
 use crate::mapping::hits::SketchHitInfo;
 use crate::mapping::processors::{MappingOpts, ScrnaProcessor};
 use crate::mapping::protocols::custom::parse_custom_geometry;
+use crate::mapping::protocols::flex::ChromiumFlexProtocol;
 use crate::mapping::protocols::scrna::ChromiumProtocol;
 use crate::mapping::protocols::Protocol;
 use crate::mapping::sketch_hit_simple::SketchHitInfoSimple;
@@ -96,6 +97,8 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
     let protocol: Box<dyn Protocol> =
         if let Some(chromium) = ChromiumProtocol::from_name(&args.geometry) {
             Box::new(chromium)
+        } else if let Some(flex) = ChromiumFlexProtocol::from_name(&args.geometry) {
+            Box::new(flex)
         } else {
             match parse_custom_geometry(&args.geometry) {
                 Ok(custom) => Box::new(custom),
@@ -106,12 +109,23 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
                 ),
             }
         };
-    info!(
-        "Protocol: {} (bc_len={}, umi_len={})",
-        protocol.name(),
-        protocol.barcode_len(),
-        protocol.umi_len(),
-    );
+    if protocol.is_multi_barcode() {
+        let descs = protocol.barcode_descs();
+        let bc_desc_str: Vec<String> = descs.iter().map(|d| format!("{}={}", d.tag_name, d.len)).collect();
+        info!(
+            "Protocol: {} (multi-barcode: [{}], umi_len={})",
+            protocol.name(),
+            bc_desc_str.join(", "),
+            protocol.umi_len(),
+        );
+    } else {
+        info!(
+            "Protocol: {} (bc_len={}, umi_len={})",
+            protocol.name(),
+            protocol.barcode_len(),
+            protocol.umi_len(),
+        );
+    }
 
     // --ignore-ambig-hits disables EC table loading
     let check_ambig = !args.ignore_ambig_hits;
@@ -129,18 +143,30 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
     let mut rad_file = std::fs::File::create(&rad_path)
         .with_context(|| format!("failed to create {}", rad_path.display()))?;
 
-    // Write SC RAD header
+    // Write SC RAD header (single or multi-barcode)
     let ref_names: Vec<&str> = (0..index.num_refs()).map(|i| index.ref_name(i)).collect();
     let bc_len = protocol.barcode_len() as u16;
     let umi_len = protocol.umi_len() as u16;
-    let (chunk_count_offset, read_length_offset) = write_rad_header_sc(
-        &mut rad_file,
-        index.num_refs() as u64,
-        &ref_names,
-        bc_len,
-        umi_len,
-        args.with_position,
-    )?;
+    let (chunk_count_offset, read_length_offset) = if protocol.is_multi_barcode() {
+        let descs = protocol.barcode_descs();
+        write_rad_header_sc_multi_bc(
+            &mut rad_file,
+            index.num_refs() as u64,
+            &ref_names,
+            &descs,
+            umi_len,
+            args.with_position,
+        )?
+    } else {
+        write_rad_header_sc(
+            &mut rad_file,
+            index.num_refs() as u64,
+            &ref_names,
+            bc_len,
+            umi_len,
+            args.with_position,
+        )?
+    };
 
     // Create unmapped barcode count file
     let unmapped_bc_path = out_dir.join("unmapped_bc_count.bin");

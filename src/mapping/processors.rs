@@ -21,6 +21,7 @@ use sshash_lib::{Kmer, KmerBits};
 use crate::index::reference_index::ReferenceIndex;
 use crate::io::rad::{
     RadWriter, pack_bases_2bit, write_atac_record, write_bulk_record, write_sc_record,
+    write_sc_record_multi_bc,
 };
 use crate::io::threads::{MappingStats, OutputInfo};
 use crate::mapping::binning::BinPos;
@@ -571,48 +572,69 @@ where
             // Extract technical sequences
             // C++ returns nullptr if R1 too short for BC or UMI → skip read
             let tech = protocol.extract_tech_seqs(&r1, &r2);
-            let bc_raw = match tech.barcode() {
-                Some(bc) if !bc.is_empty() => bc,
-                _ => continue,
-            };
+
+            // UMI validation (matching C++ umi_kmer.fromChars check)
             let umi_raw = match tech.umi {
                 Some(umi) if !umi.is_empty() => umi,
                 _ => continue,
             };
-
-            // Barcode validation + recovery (matching C++ recover_barcode + fromChars)
-            // C++ uses find_first_not_of("ACTGactg") which catches any non-ACGT char
-            let n_count = count_ns(bc_raw);
-            if n_count > 1 {
-                continue;
-            }
-            let recovered_bc = if n_count == 1 {
-                recover_barcode(bc_raw)
-            } else {
-                None
-            };
-            let bc_to_pack = match &recovered_bc {
-                Some(bc) => bc.as_slice(),
-                None => {
-                    // No recovery needed/attempted — validate original BC
-                    if !is_all_acgt(bc_raw) {
-                        continue;
-                    }
-                    bc_raw
-                }
-            };
-            // Validate recovered BC (C++ fromChars check)
-            if !is_all_acgt(bc_to_pack) {
-                continue;
-            }
-
-            // UMI validation (matching C++ umi_kmer.fromChars check)
             if !is_all_acgt(umi_raw) {
                 continue;
             }
-
-            let bc_packed = pack_bases_2bit(bc_to_pack);
             let umi_packed = pack_bases_2bit(umi_raw);
+
+            // Multi-barcode path: validate and pack each barcode independently
+            let is_multi_bc = protocol.is_multi_barcode();
+            let mut multi_bc_packed: SmallVec<[u64; 2]> = SmallVec::new();
+            let mut multi_bc_lens: SmallVec<[u16; 2]> = SmallVec::new();
+            let bc_packed: u64;
+
+            if is_multi_bc {
+                let descs = protocol.barcode_descs();
+                let mut all_valid = true;
+                for (i, desc) in descs.iter().enumerate() {
+                    let bc_raw = match tech.barcodes.get(i) {
+                        Some(Some(bc)) if !bc.is_empty() => *bc,
+                        _ => { all_valid = false; break; }
+                    };
+                    let n_count = count_ns(bc_raw);
+                    if n_count > 1 { all_valid = false; break; }
+                    let recovered = if n_count == 1 { recover_barcode(bc_raw) } else { None };
+                    let bc_to_pack = match &recovered {
+                        Some(r) => {
+                            if !is_all_acgt(r) { all_valid = false; break; }
+                            r.as_slice()
+                        }
+                        None => {
+                            if !is_all_acgt(bc_raw) { all_valid = false; break; }
+                            bc_raw
+                        }
+                    };
+                    multi_bc_packed.push(pack_bases_2bit(bc_to_pack));
+                    multi_bc_lens.push(desc.len);
+                }
+                if !all_valid { continue; }
+                // For unmapped tracking, use the cell barcode (last level)
+                bc_packed = *multi_bc_packed.last().unwrap_or(&0);
+            } else {
+                // Single-barcode path (unchanged)
+                let bc_raw = match tech.barcode() {
+                    Some(bc) if !bc.is_empty() => bc,
+                    _ => continue,
+                };
+                let n_count = count_ns(bc_raw);
+                if n_count > 1 { continue; }
+                let recovered_bc = if n_count == 1 { recover_barcode(bc_raw) } else { None };
+                let bc_to_pack = match &recovered_bc {
+                    Some(bc) => bc.as_slice(),
+                    None => {
+                        if !is_all_acgt(bc_raw) { continue; }
+                        bc_raw
+                    }
+                };
+                if !is_all_acgt(bc_to_pack) { continue; }
+                bc_packed = pack_bases_2bit(bc_to_pack);
+            }
 
             // Extract mappable reads
             let alignable = protocol.extract_mappable_reads(&r1, &r2);
@@ -668,16 +690,29 @@ where
 
             if s.cache_out.map_type != MappingType::Unmapped {
                 s.local_mapped += 1;
-                write_sc_record(
-                    bc_packed,
-                    umi_packed,
-                    bc_len,
-                    umi_len,
-                    s.cache_out.map_type,
-                    &s.cache_out.accepted_hits,
-                    with_position,
-                    &mut s.rad_writer,
-                );
+                if is_multi_bc {
+                    write_sc_record_multi_bc(
+                        &multi_bc_packed,
+                        &multi_bc_lens,
+                        umi_packed,
+                        umi_len,
+                        s.cache_out.map_type,
+                        &s.cache_out.accepted_hits,
+                        with_position,
+                        &mut s.rad_writer,
+                    );
+                } else {
+                    write_sc_record(
+                        bc_packed,
+                        umi_packed,
+                        bc_len,
+                        umi_len,
+                        s.cache_out.map_type,
+                        &s.cache_out.accepted_hits,
+                        with_position,
+                        &mut s.rad_writer,
+                    );
+                }
                 s.num_reads_in_chunk += 1;
             } else {
                 *st.unmapped_bc_counts.entry(bc_packed).or_insert(0) += 1;
