@@ -571,7 +571,7 @@ where
             // Extract technical sequences
             // C++ returns nullptr if R1 too short for BC or UMI → skip read
             let tech = protocol.extract_tech_seqs(&r1, &r2);
-            let bc_raw = match tech.barcode {
+            let bc_raw = match tech.barcode() {
                 Some(bc) if !bc.is_empty() => bc,
                 _ => continue,
             };

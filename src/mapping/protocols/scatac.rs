@@ -44,7 +44,7 @@ impl Protocol for ScatacProtocol {
         // Barcodes come from a separate file in scATAC, not from R1/R2.
         // The CLI handles barcode extraction from the third file.
         TechSeqs {
-            barcode: None,
+            barcodes: smallvec::smallvec![],
             umi: None,
         }
     }
@@ -98,7 +98,7 @@ mod tests {
 
         // Tech seqs come from separate barcode file, not R1/R2
         let tech = proto.extract_tech_seqs(r1, r2);
-        assert!(tech.barcode.is_none());
+        assert!(tech.barcode().is_none());
         assert!(tech.umi.is_none());
     }
 }

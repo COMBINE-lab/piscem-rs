@@ -6,10 +6,39 @@
 //! variation so protocol-specific logic can be plugged into the generic
 //! mapping pipeline.
 
+use smallvec::SmallVec;
+
 pub mod bulk;
 pub mod custom;
+pub mod flex;
 pub mod scatac;
 pub mod scrna;
+
+// ---------------------------------------------------------------------------
+// BarcodeRole / BarcodeDesc
+// ---------------------------------------------------------------------------
+
+/// The semantic role of a barcode in the experiment hierarchy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarcodeRole {
+    /// Sample/library-level barcode (outermost collation level)
+    Sample,
+    /// Cell-level barcode
+    Cell,
+    /// Feature barcode (e.g., CITE-seq antibody tag)
+    Feature,
+}
+
+/// Descriptor for a single barcode component in a multi-barcode protocol.
+#[derive(Debug, Clone)]
+pub struct BarcodeDesc {
+    /// Short tag name used in RAD header (e.g., "b0", "b1")
+    pub tag_name: String,
+    /// Semantic role
+    pub role: BarcodeRole,
+    /// Length in bases
+    pub len: u16,
+}
 
 // ---------------------------------------------------------------------------
 // AlignableReads
@@ -28,12 +57,23 @@ pub struct AlignableReads<'a> {
 // TechSeqs
 // ---------------------------------------------------------------------------
 
-/// Technical sequences (barcode, UMI) extracted from a read pair.
+/// Technical sequences (barcodes, UMI) extracted from a read pair.
 ///
-/// For bulk protocols, both fields are `None`.
+/// For single-barcode protocols, `barcodes` has exactly one entry.
+/// For multi-barcode protocols (e.g., 10x Flex), `barcodes` has N entries
+/// matching the order of `Protocol::barcode_descs()`.
+/// For bulk protocols, `barcodes` is empty and `umi` is `None`.
 pub struct TechSeqs<'a> {
-    pub barcode: Option<&'a [u8]>,
+    pub barcodes: SmallVec<[Option<&'a [u8]>; 2]>,
     pub umi: Option<&'a [u8]>,
+}
+
+impl<'a> TechSeqs<'a> {
+    /// Convenience: get the primary (first) barcode. For single-barcode
+    /// protocols this is the cell barcode. For backward compatibility.
+    pub fn barcode(&self) -> Option<&'a [u8]> {
+        self.barcodes.first().copied().flatten()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -52,7 +92,7 @@ pub trait Protocol: Send + Sync {
     /// Whether the biological read is paired-end for mapping purposes.
     fn is_bio_paired_end(&self) -> bool;
 
-    /// Extract technical sequences (barcode, UMI) from raw reads.
+    /// Extract technical sequences (barcodes, UMI) from raw reads.
     ///
     /// `r1` is always present. `r2` may be empty for single-end data.
     fn extract_tech_seqs<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> TechSeqs<'a>;
@@ -62,11 +102,30 @@ pub trait Protocol: Send + Sync {
     /// `r1` is always present. `r2` may be empty for single-end data.
     fn extract_mappable_reads<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> AlignableReads<'a>;
 
-    /// Expected barcode length in bases (0 for bulk).
+    /// Expected primary (cell) barcode length in bases (0 for bulk).
     fn barcode_len(&self) -> usize;
 
     /// Expected UMI length in bases (0 for bulk).
     fn umi_len(&self) -> usize;
+
+    /// Number of distinct barcode components. Default: 1.
+    fn num_barcodes(&self) -> usize {
+        1
+    }
+
+    /// Descriptors for each barcode component. Default: single cell barcode.
+    fn barcode_descs(&self) -> Vec<BarcodeDesc> {
+        vec![BarcodeDesc {
+            tag_name: "b".to_string(),
+            role: BarcodeRole::Cell,
+            len: self.barcode_len() as u16,
+        }]
+    }
+
+    /// Whether this protocol has multiple barcode components.
+    fn is_multi_barcode(&self) -> bool {
+        self.num_barcodes() > 1
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -91,10 +150,10 @@ mod tests {
     #[test]
     fn test_tech_seqs_none() {
         let ts = TechSeqs {
-            barcode: None,
+            barcodes: smallvec::smallvec![],
             umi: None,
         };
-        assert!(ts.barcode.is_none());
+        assert!(ts.barcode().is_none());
         assert!(ts.umi.is_none());
     }
 }

@@ -27,7 +27,7 @@ impl Protocol for BulkProtocol {
 
     fn extract_tech_seqs<'a>(&self, _r1: &'a [u8], _r2: &'a [u8]) -> TechSeqs<'a> {
         TechSeqs {
-            barcode: None,
+            barcodes: smallvec::smallvec![],
             umi: None,
         }
     }
@@ -65,7 +65,7 @@ mod tests {
         assert!(reads.seq2.is_none());
 
         let tech = proto.extract_tech_seqs(b"ACGT", b"");
-        assert!(tech.barcode.is_none());
+        assert!(tech.barcode().is_none());
         assert!(tech.umi.is_none());
     }
 

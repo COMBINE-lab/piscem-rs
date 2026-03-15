@@ -917,3 +917,147 @@ mod tests {
         assert_eq!(pos, 42);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Multi-barcode RAD header + record writers
+// ---------------------------------------------------------------------------
+
+use crate::mapping::protocols::BarcodeDesc;
+
+/// Write a RAD header for multi-barcode single-cell mode (e.g., 10x Flex).
+///
+/// Returns `(chunk_count_offset, Option<read_length_offset>)` for backpatching.
+///
+/// File-level tags: num_barcodes, b0len, b1len, ..., ulen, known_rad_type [, rlen]
+/// Read-level tags: b0, b1, ..., u
+/// Alignment-level tags: compressed_ori_refid [, pos]
+pub fn write_rad_header_sc_multi_bc<W: Write>(
+    writer: &mut W,
+    num_refs: u64,
+    ref_names: &[&str],
+    barcode_descs: &[BarcodeDesc],
+    umi_len: u16,
+    with_position: bool,
+) -> Result<(u64, Option<u64>)> {
+    let mut buf = RadWriter::new();
+
+    // is_paired flag (always 0 for SC)
+    buf.write_u8(0);
+
+    // Reference count and names
+    buf.write_u64(num_refs);
+    for name in ref_names {
+        buf.write_string(name);
+    }
+
+    // num_chunks placeholder
+    let chunk_count_offset = buf.len() as u64;
+    buf.write_u64(0);
+
+    // --- Tag descriptions ---
+
+    // File-level tags: num_barcodes + per-BC lengths + ulen + known_rad_type [+ rlen]
+    let num_file_tags: u16 =
+        1 + barcode_descs.len() as u16 + 1 + 1 + if with_position { 1 } else { 0 };
+    buf.write_u16(num_file_tags);
+    buf.write_tag_desc("num_barcodes", TAG_U16);
+    for desc in barcode_descs {
+        let len_tag = format!("{}len", desc.tag_name);
+        buf.write_tag_desc(&len_tag, TAG_U16);
+    }
+    buf.write_tag_desc("ulen", TAG_U16);
+    buf.write_tag_desc("known_rad_type", TAG_STRING);
+    if with_position {
+        buf.write_tag_desc("rlen", TAG_U32);
+    }
+
+    // Read-level tags: one per barcode + UMI
+    buf.write_u16(barcode_descs.len() as u16 + 1);
+    for desc in barcode_descs {
+        let tag_type = if desc.len <= 16 { TAG_U32 } else { TAG_U64 };
+        buf.write_tag_desc(&desc.tag_name, tag_type);
+    }
+    let umi_tag_type = if umi_len <= 16 { TAG_U32 } else { TAG_U64 };
+    buf.write_tag_desc("u", umi_tag_type);
+
+    // Alignment-level tags
+    let num_aln_tags: u16 = if with_position { 2 } else { 1 };
+    buf.write_u16(num_aln_tags);
+    buf.write_tag_desc("compressed_ori_refid", TAG_U32);
+    if with_position {
+        buf.write_tag_desc("pos", TAG_U32);
+    }
+
+    // --- File-level tag values ---
+    buf.write_u16(barcode_descs.len() as u16);
+    for desc in barcode_descs {
+        buf.write_u16(desc.len);
+    }
+    buf.write_u16(umi_len);
+    buf.write_string("sc_rna_multi_bc");
+
+    // read_length placeholder (only with_position)
+    let read_length_offset = if with_position {
+        let off = buf.len() as u64;
+        buf.write_u32(0);
+        Some(off)
+    } else {
+        None
+    };
+
+    buf.flush_to(writer)?;
+    Ok((chunk_count_offset, read_length_offset))
+}
+
+/// Write a multi-barcode single-cell RAD record.
+///
+/// `bc_packed` contains one packed barcode per level, in order matching barcode_descs.
+/// `bc_lens` contains the length in bases for each barcode (for u32/u64 dispatch).
+#[allow(clippy::too_many_arguments)]
+pub fn write_sc_record_multi_bc(
+    bc_packed: &[u64],
+    bc_lens: &[u16],
+    umi_packed: u64,
+    umi_len: u16,
+    map_type: MappingType,
+    accepted_hits: &[SimpleHit],
+    with_position: bool,
+    writer: &mut RadWriter,
+) {
+    // Number of mappings
+    writer.write_u32(accepted_hits.len() as u32);
+
+    // Write each barcode component
+    for (packed, len) in bc_packed.iter().zip(bc_lens.iter()) {
+        if *len <= 16 {
+            writer.write_u32(*packed as u32);
+        } else {
+            writer.write_u64(*packed);
+        }
+    }
+
+    // UMI
+    if umi_len <= 16 {
+        writer.write_u32(umi_packed as u32);
+    } else {
+        writer.write_u64(umi_packed);
+    }
+
+    // Per-alignment data (same as single-barcode)
+    let invert_ori = map_type == MappingType::MappedSecondOrphan;
+    for hit in accepted_hits {
+        let fw_mask: u32 = if invert_ori {
+            if hit.is_fw { 0 } else { 0x80000000 }
+        } else if hit.is_fw {
+            0x80000000
+        } else {
+            0
+        };
+        let compressed = hit.tid | fw_mask;
+        writer.write_u32(compressed);
+
+        if with_position {
+            writer.write_u32(hit.pos as u32);
+        }
+    }
+}

@@ -2,6 +2,8 @@
 //!
 //! Port of C++ `piscem-cpp/include/sc/util.hpp` protocol classes.
 
+use smallvec::smallvec;
+
 use super::{AlignableReads, Protocol, TechSeqs};
 
 // ---------------------------------------------------------------------------
@@ -112,7 +114,10 @@ impl Protocol for ChromiumProtocol {
         } else {
             None
         };
-        TechSeqs { barcode, umi }
+        TechSeqs {
+            barcodes: smallvec![barcode],
+            umi,
+        }
     }
 
     fn extract_mappable_reads<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> AlignableReads<'a> {
@@ -205,7 +210,7 @@ mod tests {
         let r2 = b"TGCATGCATGCA";
 
         let tech = proto.extract_tech_seqs(r1, r2);
-        assert_eq!(tech.barcode.unwrap(), b"ACGTACGTACGTACGT");
+        assert_eq!(tech.barcode().unwrap(), b"ACGTACGTACGTACGT");
         assert_eq!(tech.umi.unwrap(), b"AAAAAAAAAAAA");
 
         // 3' protocol: map R2 only
@@ -228,7 +233,7 @@ mod tests {
         let r2 = b"SECOND_READ_BIO";
 
         let tech = proto.extract_tech_seqs(r1, r2);
-        assert_eq!(tech.barcode.unwrap().len(), 16);
+        assert_eq!(tech.barcode().unwrap().len(), 16);
         assert_eq!(tech.umi.unwrap().len(), 10);
 
         let reads = proto.extract_mappable_reads(r1, r2);

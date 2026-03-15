@@ -22,6 +22,8 @@
 use anyhow::{bail, Result};
 use smallvec::SmallVec;
 
+use smallvec::smallvec;
+
 use super::{AlignableReads, Protocol, TechSeqs};
 
 // ---------------------------------------------------------------------------
@@ -116,7 +118,10 @@ impl Protocol for CustomProtocol {
         let umi = extract_first_slice(&self.umi_slices_r1, r1)
             .or_else(|| extract_first_slice(&self.umi_slices_r2, r2));
 
-        TechSeqs { barcode, umi }
+        TechSeqs {
+            barcodes: smallvec![barcode],
+            umi,
+        }
     }
 
     fn extract_mappable_reads<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> AlignableReads<'a> {
@@ -411,7 +416,7 @@ mod tests {
         let r2 = b"TGCATGCATGCA";
 
         let tech = proto.extract_tech_seqs(r1, r2);
-        assert_eq!(tech.barcode.unwrap(), b"ACGTACGTACGTACGT");
+        assert_eq!(tech.barcode().unwrap(), b"ACGTACGTACGTACGT");
         assert_eq!(tech.umi.unwrap(), b"AAAAAAAAAAAA");
 
         let reads = proto.extract_mappable_reads(r1, r2);
@@ -444,7 +449,7 @@ mod tests {
         // extract_tech_seqs returns the first BC slice only (R1's 8bp),
         // not the concatenated 16bp split barcode.
         let tech = proto.extract_tech_seqs(r1, r2);
-        assert_eq!(tech.barcode.unwrap(), b"AAAACCCC");
+        assert_eq!(tech.barcode().unwrap(), b"AAAACCCC");
         assert_eq!(tech.umi.unwrap(), b"GGGGTTTTAAAA");
 
         // extract_mappable_reads returns the bio segments from both reads
@@ -467,7 +472,7 @@ mod tests {
         let r2 = b"SECOND_READ_BIO";
 
         let tech = proto.extract_tech_seqs(r1, r2);
-        assert_eq!(tech.barcode.unwrap().len(), 16);
+        assert_eq!(tech.barcode().unwrap().len(), 16);
         assert_eq!(tech.umi.unwrap().len(), 12);
 
         let reads = proto.extract_mappable_reads(r1, r2);
@@ -513,7 +518,7 @@ mod tests {
         let r2 = b"BIOLOGICAL_READ_2";
 
         let tech = proto.extract_tech_seqs(r1, r2);
-        assert_eq!(tech.barcode.unwrap(), b"ACGTACGTACGTACGT");
+        assert_eq!(tech.barcode().unwrap(), b"ACGTACGTACGTACGT");
         assert_eq!(tech.umi.unwrap(), b"BBBBBBBBBB");
 
         let reads = proto.extract_mappable_reads(r1, r2);
