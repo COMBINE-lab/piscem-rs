@@ -35,7 +35,7 @@ use crate::mapping::map_fragment::{
 use crate::mapping::merge_pairs::{remove_duplicate_hits_pub, simple_hit_cmp_bins};
 use crate::mapping::overlap::{find_overlap, OverlapType};
 use crate::mapping::protocols::scrna::{barcode_has_n, count_ns, is_all_acgt, recover_barcode};
-use crate::mapping::protocols::Protocol;
+use crate::mapping::protocols::{AlignableReads, Protocol};
 use crate::mapping::hits::SketchHitInfo;
 use crate::mapping::sketch_hit_simple::SketchHitInfoSimple;
 use crate::mapping::streaming_query::PiscemStreamingQuery;
@@ -550,7 +550,6 @@ where
         let bc_len = self.bc_len;
         let umi_len = self.umi_len;
         let with_position = self.with_position;
-        let is_bio_paired = protocol.is_bio_paired_end();
         let max_rlen_samples: usize = 10;
 
         let st = self.state.get_or_insert_with(|| ScrnaThreadState::<K, S> {
@@ -636,55 +635,51 @@ where
                 bc_packed = pack_bases_2bit(bc_to_pack);
             }
 
-            // Extract mappable reads
+            // Extract mappable reads — the protocol returns exactly what the
+            // mapper needs: Single for SE mapping, Paired for PE mapping.
             let alignable = protocol.extract_mappable_reads(&r1, &r2);
 
-            if is_bio_paired {
-                let seq1 = alignable.seq1.unwrap_or(&[]);
-                let seq2 = alignable.seq2.unwrap_or(&[]);
-                if seq1.is_empty() && seq2.is_empty() {
-                    continue;
-                }
-                s.poison_state.paired_for_mapping = true;
-                map_pe_fragment::<K, S>(
-                    seq1,
-                    seq2,
-                    &mut s.hs,
-                    &mut s.query,
-                    &mut s.cache_left,
-                    &mut s.cache_right,
-                    &mut s.cache_out,
-                    index,
-                    &mut s.poison_state,
-                    strat,
-                );
+            match alignable {
+                AlignableReads::Paired { read1, read2 } => {
+                    if read1.is_empty() && read2.is_empty() {
+                        continue;
+                    }
+                    s.poison_state.paired_for_mapping = true;
+                    map_pe_fragment::<K, S>(
+                        read1,
+                        read2,
+                        &mut s.hs,
+                        &mut s.query,
+                        &mut s.cache_left,
+                        &mut s.cache_right,
+                        &mut s.cache_out,
+                        index,
+                        &mut s.poison_state,
+                        strat,
+                    );
 
-                if with_position && st.local_rlen_samples.len() < max_rlen_samples {
-                    st.local_rlen_samples.push(seq2.len() as u32);
+                    if with_position && st.local_rlen_samples.len() < max_rlen_samples {
+                        st.local_rlen_samples.push(read2.len() as u32);
+                    }
                 }
-            } else {
-                // SE mapping: bio read may be on R1 (seq1) or R2 (seq2).
-                // For 3'-end protocols and Flex, the bio read is on R2 (seq2).
-                let bio_seq = alignable.seq1
-                    .filter(|s| !s.is_empty())
-                    .or(alignable.seq2.filter(|s| !s.is_empty()));
-                let bio_seq = match bio_seq {
-                    Some(s) => s,
-                    None => continue,
-                };
-                s.poison_state.paired_for_mapping = false;
-                map_se_fragment::<K, S>(
-                    bio_seq,
-                    &mut s.hs,
-                    &mut s.query,
-                    &mut s.cache_out,
-                    index,
-                    &mut s.poison_state,
-                    strat,
-                );
+                AlignableReads::Single(bio_seq) => {
+                    if bio_seq.is_empty() {
+                        continue;
+                    }
+                    s.poison_state.paired_for_mapping = false;
+                    map_se_fragment::<K, S>(
+                        bio_seq,
+                        &mut s.hs,
+                        &mut s.query,
+                        &mut s.cache_out,
+                        index,
+                        &mut s.poison_state,
+                        strat,
+                    );
 
-                if with_position && st.local_rlen_samples.len() < max_rlen_samples {
-                    st.local_rlen_samples.push(bio_seq.len() as u32);
+                    if with_position && st.local_rlen_samples.len() < max_rlen_samples {
+                        st.local_rlen_samples.push(bio_seq.len() as u32);
+                    }
                 }
             }
 

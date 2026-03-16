@@ -102,13 +102,9 @@ impl Protocol for ChromiumFlexProtocol {
     }
 
     fn extract_mappable_reads<'a>(&self, _r1: &'a [u8], r2: &'a [u8]) -> AlignableReads<'a> {
-        // Map the probe sequence on R2 (up to the sample BC offset)
+        // Single bio read: probe sequence on R2 (up to the sample BC offset)
         let end = self.sample_bc_offset.min(r2.len());
-        let bio = &r2[..end];
-        AlignableReads {
-            seq1: if bio.is_empty() { None } else { Some(bio) },
-            seq2: None,
-        }
+        AlignableReads::Single(&r2[..end])
     }
 
     fn barcode_len(&self) -> usize {
@@ -187,9 +183,11 @@ mod tests {
         let r2 = b"PROBE_SEQUENCE_25_BASES__SSSSSSSS";
 
         let reads = proto.extract_mappable_reads(r1, r2);
-        // Biological read is R2 up to sample BC offset (25 bytes)
-        assert_eq!(reads.seq1.unwrap(), b"PROBE_SEQUENCE_25_BASES__");
-        assert!(reads.seq2.is_none());
+        // Single bio read: R2 probe region up to sample BC offset (25 bytes)
+        match reads {
+            AlignableReads::Single(bio) => assert_eq!(bio, b"PROBE_SEQUENCE_25_BASES__"),
+            _ => panic!("Flex should return Single"),
+        }
     }
 
     #[test]

@@ -50,11 +50,8 @@ impl Protocol for ScatacProtocol {
     }
 
     fn extract_mappable_reads<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> AlignableReads<'a> {
-        // Both R1 and R2 are biological reads
-        AlignableReads {
-            seq1: if r1.is_empty() { None } else { Some(r1) },
-            seq2: if r2.is_empty() { None } else { Some(r2) },
-        }
+        // Both R1 and R2 are biological reads (always paired for ATAC)
+        AlignableReads::Paired { read1: r1, read2: r2 }
     }
 
     fn barcode_len(&self) -> usize {
@@ -91,10 +88,15 @@ mod tests {
         let r1 = b"ACGTACGTACGT";
         let r2 = b"TGCATGCATGCA";
 
-        // Both reads are biological
+        // Both reads are biological (always paired for ATAC)
         let reads = proto.extract_mappable_reads(r1, r2);
-        assert_eq!(reads.seq1.unwrap(), b"ACGTACGTACGT");
-        assert_eq!(reads.seq2.unwrap(), b"TGCATGCATGCA");
+        match reads {
+            AlignableReads::Paired { read1, read2 } => {
+                assert_eq!(read1, b"ACGTACGTACGT");
+                assert_eq!(read2, b"TGCATGCATGCA");
+            }
+            _ => panic!("ATAC should return Paired"),
+        }
 
         // Tech seqs come from separate barcode file, not R1/R2
         let tech = proto.extract_tech_seqs(r1, r2);

@@ -46,11 +46,31 @@ pub struct BarcodeDesc {
 
 /// Biological sequences extracted from a read (pair) for mapping.
 ///
-/// For single-end protocols, only `seq1` is `Some`.
-/// For paired-end protocols, both `seq1` and `seq2` are `Some`.
-pub struct AlignableReads<'a> {
-    pub seq1: Option<&'a [u8]>,
-    pub seq2: Option<&'a [u8]>,
+/// The protocol determines which physical reads (R1, R2) contribute
+/// biological sequence and returns exactly what the mapper needs:
+/// - `Single`: one biological read (SE mapping)
+/// - `Paired`: two biological reads (PE mapping)
+///
+/// The cardinality is encoded in the variant, so the processor can
+/// match on it directly without needing `is_bio_paired_end()`.
+pub enum AlignableReads<'a> {
+    /// Single biological read for SE mapping.
+    /// The protocol has already selected the correct physical read
+    /// (which may be R1 or R2, depending on the protocol).
+    Single(&'a [u8]),
+    /// Two biological reads for PE mapping.
+    /// `read1` and `read2` are the two ends of the fragment.
+    Paired {
+        read1: &'a [u8],
+        read2: &'a [u8],
+    },
+}
+
+impl<'a> AlignableReads<'a> {
+    /// Whether this is a paired-end mapping request.
+    pub fn is_paired(&self) -> bool {
+        matches!(self, AlignableReads::Paired { .. })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -137,14 +157,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_alignable_reads_single_end() {
+    fn test_alignable_reads_single() {
         let seq = b"ACGTACGT";
-        let ar = AlignableReads {
-            seq1: Some(seq),
-            seq2: None,
+        let ar = AlignableReads::Single(seq);
+        assert!(!ar.is_paired());
+    }
+
+    #[test]
+    fn test_alignable_reads_paired() {
+        let ar = AlignableReads::Paired {
+            read1: b"ACGT",
+            read2: b"TGCA",
         };
-        assert!(ar.seq1.is_some());
-        assert!(ar.seq2.is_none());
+        assert!(ar.is_paired());
     }
 
     #[test]

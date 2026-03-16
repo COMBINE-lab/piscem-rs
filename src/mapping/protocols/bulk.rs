@@ -33,9 +33,10 @@ impl Protocol for BulkProtocol {
     }
 
     fn extract_mappable_reads<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> AlignableReads<'a> {
-        AlignableReads {
-            seq1: Some(r1),
-            seq2: if self.is_paired { Some(r2) } else { None },
+        if self.is_paired {
+            AlignableReads::Paired { read1: r1, read2: r2 }
+        } else {
+            AlignableReads::Single(r1)
         }
     }
 
@@ -61,8 +62,10 @@ mod tests {
         assert_eq!(proto.umi_len(), 0);
 
         let reads = proto.extract_mappable_reads(b"ACGT", b"");
-        assert_eq!(reads.seq1.unwrap(), b"ACGT");
-        assert!(reads.seq2.is_none());
+        match reads {
+            AlignableReads::Single(bio) => assert_eq!(bio, b"ACGT"),
+            _ => panic!("SE bulk should return Single"),
+        }
 
         let tech = proto.extract_tech_seqs(b"ACGT", b"");
         assert!(tech.barcode().is_none());
@@ -75,7 +78,12 @@ mod tests {
         assert!(proto.is_bio_paired_end());
 
         let reads = proto.extract_mappable_reads(b"ACGT", b"TGCA");
-        assert_eq!(reads.seq1.unwrap(), b"ACGT");
-        assert_eq!(reads.seq2.unwrap(), b"TGCA");
+        match reads {
+            AlignableReads::Paired { read1, read2 } => {
+                assert_eq!(read1, b"ACGT");
+                assert_eq!(read2, b"TGCA");
+            }
+            _ => panic!("PE bulk should return Paired"),
+        }
     }
 }

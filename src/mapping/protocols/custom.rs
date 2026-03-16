@@ -148,10 +148,23 @@ impl Protocol for CustomProtocol {
     }
 
     fn extract_mappable_reads<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> AlignableReads<'a> {
-        let seq1 = extract_read_region(&self.read_slices_r1, r1);
-        let seq2 = extract_read_region(&self.read_slices_r2, r2);
-
-        AlignableReads { seq1, seq2 }
+        if self.is_paired_bio {
+            // Both R1 and R2 have biological read segments
+            AlignableReads::Paired {
+                read1: extract_read_region(&self.read_slices_r1, r1).unwrap_or(&[]),
+                read2: extract_read_region(&self.read_slices_r2, r2).unwrap_or(&[]),
+            }
+        } else if !self.read_slices_r1.is_empty() {
+            // Bio read is on R1 — the geometry specified r[N] or r: in the 1{...} block
+            AlignableReads::Single(
+                extract_read_region(&self.read_slices_r1, r1).unwrap_or(&[]),
+            )
+        } else {
+            // Bio read is on R2 — the geometry specified r[N] or r: in the 2{...} block
+            AlignableReads::Single(
+                extract_read_region(&self.read_slices_r2, r2).unwrap_or(&[]),
+            )
+        }
     }
 
     fn barcode_len(&self) -> usize {
@@ -603,10 +616,12 @@ mod tests {
         assert_eq!(tech.barcode().unwrap(), b"ACGTACGTACGTACGT");
         assert_eq!(tech.umi.unwrap(), b"AAAAAAAAAAAA");
 
-        // 3' protocol: R2 bio read is on seq2, seq1 is None (R1 has no 'r' segment)
+        // 3' protocol: single bio read from R2
         let reads = proto.extract_mappable_reads(r1, r2);
-        assert!(reads.seq1.is_none());
-        assert_eq!(reads.seq2.unwrap(), b"TGCATGCATGCA");
+        match reads {
+            AlignableReads::Single(bio) => assert_eq!(bio, b"TGCATGCATGCA"),
+            _ => panic!("SE custom protocol should return Single"),
+        }
     }
 
     #[test]
@@ -637,12 +652,15 @@ mod tests {
         assert_eq!(tech.barcode().unwrap(), b"AAAACCCC");
         assert_eq!(tech.umi.unwrap(), b"GGGGTTTTAAAA");
 
-        // extract_mappable_reads returns the bio segments from both reads
+        // extract_mappable_reads returns paired bio segments from both reads
         let reads = proto.extract_mappable_reads(r1, r2);
-        // R1: skip 8 BC + 12 UMI = offset 20, rest is bio
-        assert_eq!(reads.seq1.unwrap(), b"MAPPABLE_R1");
-        // R2: skip 8 BC = offset 8, rest is bio
-        assert_eq!(reads.seq2.unwrap(), b"BIOLOGICAL_R2");
+        match reads {
+            AlignableReads::Paired { read1, read2 } => {
+                assert_eq!(read1, b"MAPPABLE_R1");
+                assert_eq!(read2, b"BIOLOGICAL_R2");
+            }
+            _ => panic!("split BC protocol should return Paired"),
+        }
     }
 
     #[test]
@@ -661,9 +679,13 @@ mod tests {
         assert_eq!(tech.umi.unwrap().len(), 12);
 
         let reads = proto.extract_mappable_reads(r1, r2);
-        // R1: skip 16 BC + 12 UMI + 13 discard = 41, rest is bio
-        assert_eq!(reads.seq1.unwrap(), b"MAPPABLE_BIO");
-        assert_eq!(reads.seq2.unwrap(), b"SECOND_READ_BIO");
+        match reads {
+            AlignableReads::Paired { read1, read2 } => {
+                assert_eq!(read1, b"MAPPABLE_BIO");
+                assert_eq!(read2, b"SECOND_READ_BIO");
+            }
+            _ => panic!("5' custom protocol should return Paired"),
+        }
     }
 
     #[test]
@@ -707,9 +729,13 @@ mod tests {
         assert_eq!(tech.umi.unwrap(), b"BBBBBBBBBB");
 
         let reads = proto.extract_mappable_reads(r1, r2);
-        // R1 read starts after BC(16) + UMI(10) = offset 26
-        assert_eq!(reads.seq1.unwrap(), b"REST_OF_R1");
-        assert_eq!(reads.seq2.unwrap(), b"BIOLOGICAL_READ_2");
+        match reads {
+            AlignableReads::Paired { read1, read2 } => {
+                assert_eq!(read1, b"REST_OF_R1");
+                assert_eq!(read2, b"BIOLOGICAL_READ_2");
+            }
+            _ => panic!("PE custom protocol should return Paired"),
+        }
     }
 
     #[test]
@@ -723,8 +749,14 @@ mod tests {
         let r1 = b"ACGTACGTACGTACGTBBBBBBBBBBBBACGT_BIO_READ_1";
         let r2 = b"BIO_READ_2";
         let reads = proto.extract_mappable_reads(r1, r2);
-        // R1: 16 BC + 12 UMI + 4 fixed = 32, rest is bio
-        assert_eq!(reads.seq1.unwrap(), b"_BIO_READ_1");
+        match reads {
+            AlignableReads::Paired { read1, read2 } => {
+                // R1: 16 BC + 12 UMI + 4 fixed = 32, rest is bio
+                assert_eq!(read1, b"_BIO_READ_1");
+                assert_eq!(read2, b"BIO_READ_2");
+            }
+            _ => panic!("PE fixed sequence protocol should return Paired"),
+        }
     }
 
     #[test]
