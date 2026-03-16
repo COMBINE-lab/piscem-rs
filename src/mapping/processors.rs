@@ -663,13 +663,18 @@ where
                     st.local_rlen_samples.push(seq2.len() as u32);
                 }
             } else {
-                let seq1 = alignable.seq1.unwrap_or(&[]);
-                if seq1.is_empty() {
-                    continue;
-                }
+                // SE mapping: bio read may be on R1 (seq1) or R2 (seq2).
+                // For 3'-end protocols and Flex, the bio read is on R2 (seq2).
+                let bio_seq = alignable.seq1
+                    .filter(|s| !s.is_empty())
+                    .or(alignable.seq2.filter(|s| !s.is_empty()));
+                let bio_seq = match bio_seq {
+                    Some(s) => s,
+                    None => continue,
+                };
                 s.poison_state.paired_for_mapping = false;
                 map_se_fragment::<K, S>(
-                    seq1,
+                    bio_seq,
                     &mut s.hs,
                     &mut s.query,
                     &mut s.cache_out,
@@ -679,7 +684,7 @@ where
                 );
 
                 if with_position && st.local_rlen_samples.len() < max_rlen_samples {
-                    st.local_rlen_samples.push(seq1.len() as u32);
+                    st.local_rlen_samples.push(bio_seq.len() as u32);
                 }
             }
 

@@ -603,8 +603,9 @@ mod tests {
         assert_eq!(tech.barcode().unwrap(), b"ACGTACGTACGTACGT");
         assert_eq!(tech.umi.unwrap(), b"AAAAAAAAAAAA");
 
+        // 3' protocol: R2 bio read is on seq2, seq1 is None (R1 has no 'r' segment)
         let reads = proto.extract_mappable_reads(r1, r2);
-        assert!(reads.seq1.is_none()); // R1 has no read segment
+        assert!(reads.seq1.is_none());
         assert_eq!(reads.seq2.unwrap(), b"TGCATGCATGCA");
     }
 
