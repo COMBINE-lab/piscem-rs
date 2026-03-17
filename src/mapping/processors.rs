@@ -667,6 +667,15 @@ where
         let s = &mut st.common;
         s.ensure_chunk_started();
 
+        // Pre-compute multi-barcode lens (invariant across reads) and
+        // allocate the packed barcode buffer once, cleared each iteration.
+        let multi_bc_lens: SmallVec<[u16; 2]> = if is_multi_bc {
+            bc_descs.iter().map(|d| d.len).collect()
+        } else {
+            SmallVec::new()
+        };
+        let mut multi_bc_packed: SmallVec<[u64; 2]> = SmallVec::new();
+
         let mut batch_reads: u64 = 0;
         for (rec1, rec2) in record_pairs {
             s.local_reads += 1;
@@ -690,14 +699,12 @@ where
             let umi_packed = pack_bases_2bit(umi_raw);
 
             // Multi-barcode path: validate and pack each barcode independently
-            let mut multi_bc_packed: SmallVec<[u64; 2]> = SmallVec::new();
-            let mut multi_bc_lens: SmallVec<[u16; 2]> = SmallVec::new();
             let bc_packed: u64;
 
             if is_multi_bc {
-                let descs = &bc_descs;
+                multi_bc_packed.clear();
                 let mut all_valid = true;
-                for (i, desc) in descs.iter().enumerate() {
+                for (i, desc) in bc_descs.iter().enumerate() {
                     let bc_raw = match tech.barcodes.get(i) {
                         Some(Some(bc)) if !bc.is_empty() => *bc,
                         _ => { all_valid = false; break; }
@@ -716,7 +723,6 @@ where
                         }
                     };
                     multi_bc_packed.push(pack_bases_2bit(bc_to_pack));
-                    multi_bc_lens.push(desc.len);
                 }
                 if !all_valid { continue; }
                 // For unmapped tracking, use the cell barcode (last level)
