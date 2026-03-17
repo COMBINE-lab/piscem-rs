@@ -715,7 +715,17 @@ where
                 }
                 s.num_reads_in_chunk += 1;
             } else {
-                *st.unmapped_bc_counts.entry(bc_packed).or_insert(0) += 1;
+                // For multi-barcode protocols, encode sample BC in the unmapped
+                // count key so downstream tools can attribute unmapped reads to
+                // specific (sample, cell) pairs.
+                if is_multi_bc && multi_bc_packed.len() >= 2 {
+                    let sample_bc = multi_bc_packed[0];
+                    let cell_bc = bc_packed;
+                    let composite = (sample_bc << 32) | (cell_bc & 0xFFFFFFFF);
+                    *st.unmapped_bc_counts.entry(composite).or_insert(0) += 1;
+                } else {
+                    *st.unmapped_bc_counts.entry(bc_packed).or_insert(0) += 1;
+                }
             }
         }
         self.progress.inc(batch_reads);
