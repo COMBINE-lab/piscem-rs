@@ -434,6 +434,105 @@ where
 // ScrnaProcessor
 // ===========================================================================
 
+/// Unmapped barcode counts — two variants for zero overhead in the common case.
+///
+/// For single-barcode protocols: `Single(AHashMap<u64, u32>)` — same as the
+/// pre-multi-barcode code, no SmallVec allocation per lookup.
+///
+/// For multi-barcode protocols: `Multi(AHashMap<SmallVec<[u64; 2]>, u32>)` —
+/// stores per-field barcode values for structured output.
+enum UnmappedBcCounts {
+    /// Single barcode field — zero overhead compared to pre-multi-barcode code.
+    Single {
+        counts: AHashMap<u64, u32>,
+        bc_len: u16,
+    },
+    /// Multiple barcode fields — stores per-field values.
+    Multi {
+        counts: AHashMap<SmallVec<[u64; 2]>, u32>,
+        bc_lens: SmallVec<[u16; 2]>,
+    },
+}
+
+impl UnmappedBcCounts {
+    fn new_single(bc_len: u16) -> Self {
+        UnmappedBcCounts::Single {
+            counts: AHashMap::new(),
+            bc_len,
+        }
+    }
+
+    fn new_multi(bc_lens: SmallVec<[u16; 2]>) -> Self {
+        UnmappedBcCounts::Multi {
+            counts: AHashMap::default(),
+            bc_lens,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            UnmappedBcCounts::Single { counts, .. } => counts.is_empty(),
+            UnmappedBcCounts::Multi { counts, .. } => counts.is_empty(),
+        }
+    }
+
+    /// Increment count for a single-barcode key.
+    #[inline]
+    fn inc_single(&mut self, bc: u64) {
+        if let UnmappedBcCounts::Single { counts, .. } = self {
+            *counts.entry(bc).or_insert(0) += 1;
+        }
+    }
+
+    /// Increment count for a multi-barcode key.
+    #[inline]
+    fn inc_multi(&mut self, bcs: &SmallVec<[u64; 2]>) {
+        if let UnmappedBcCounts::Multi { counts, .. } = self {
+            *counts.entry(bcs.clone()).or_insert(0) += 1;
+        }
+    }
+
+    /// Write a single barcode value at its declared width (bases → bytes).
+    #[inline]
+    fn write_bc_at_width(buf: &mut Vec<u8>, val: u64, bc_len_bases: u16) {
+        if bc_len_bases <= 4 {
+            buf.extend_from_slice(&(val as u8).to_le_bytes());
+        } else if bc_len_bases <= 8 {
+            buf.extend_from_slice(&(val as u16).to_le_bytes());
+        } else if bc_len_bases <= 16 {
+            buf.extend_from_slice(&(val as u32).to_le_bytes());
+        } else {
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+    }
+
+    /// Write all accumulated counts to the given writer.
+    /// The format header must have already been written to the file.
+    fn flush_to(&self, writer: &mut impl std::io::Write) {
+        match self {
+            UnmappedBcCounts::Single { counts, bc_len } => {
+                let mut buf = Vec::with_capacity(counts.len() * 8);
+                for (&bc, &count) in counts {
+                    Self::write_bc_at_width(&mut buf, bc, *bc_len);
+                    buf.extend_from_slice(&count.to_le_bytes());
+                }
+                writer.write_all(&buf).ok();
+            }
+            UnmappedBcCounts::Multi { counts, bc_lens } => {
+                let mut buf = Vec::with_capacity(counts.len() * 16);
+                for (bc_fields, &count) in counts {
+                    for (i, &bc_len) in bc_lens.iter().enumerate() {
+                        let val = if i < bc_fields.len() { bc_fields[i] } else { 0u64 };
+                        Self::write_bc_at_width(&mut buf, val, bc_len);
+                    }
+                    buf.extend_from_slice(&count.to_le_bytes());
+                }
+                writer.write_all(&buf).ok();
+            }
+        }
+    }
+}
+
 /// Per-thread state for scRNA mapping (extends common state).
 struct ScrnaThreadState<'a, const K: usize, S: SketchHitInfo + Send + 'static = SketchHitInfoSimple>
 where
@@ -441,11 +540,7 @@ where
 {
     common: CommonThreadState<'a, K, S>,
     local_rlen_samples: Vec<u32>,
-    /// Unmapped barcode counts. Key is per-barcode-field values:
-    /// single-barcode: [cell_bc], multi-barcode: [sample_bc, cell_bc].
-    unmapped_bc_counts: AHashMap<SmallVec<[u64; 2]>, u32>,
-    /// Barcode lengths (in bases) for each field, used for writing at correct widths.
-    bc_lens: SmallVec<[u16; 2]>,
+    unmapped_bc_counts: UnmappedBcCounts,
 }
 
 /// Parallel processor for scRNA-seq mapping.
@@ -556,11 +651,18 @@ where
         let with_position = self.with_position;
         let max_rlen_samples: usize = 10;
 
+        let is_multi_bc = protocol.is_multi_barcode();
+        let bc_descs = protocol.barcode_descs();
+
         let st = self.state.get_or_insert_with(|| ScrnaThreadState::<K, S> {
             common: CommonThreadState::new(index, end_cache, &self.opts),
             local_rlen_samples: Vec::new(),
-            unmapped_bc_counts: AHashMap::default(),
-            bc_lens: protocol.barcode_descs().iter().map(|d| d.len).collect(),
+            unmapped_bc_counts: if is_multi_bc {
+                let bc_lens = protocol.barcode_descs().iter().map(|d| d.len).collect();
+                UnmappedBcCounts::new_multi(bc_lens)
+            } else {
+                UnmappedBcCounts::new_single(bc_len)
+            },
         });
         let s = &mut st.common;
         s.ensure_chunk_started();
@@ -588,13 +690,12 @@ where
             let umi_packed = pack_bases_2bit(umi_raw);
 
             // Multi-barcode path: validate and pack each barcode independently
-            let is_multi_bc = protocol.is_multi_barcode();
             let mut multi_bc_packed: SmallVec<[u64; 2]> = SmallVec::new();
             let mut multi_bc_lens: SmallVec<[u16; 2]> = SmallVec::new();
             let bc_packed: u64;
 
             if is_multi_bc {
-                let descs = protocol.barcode_descs();
+                let descs = &bc_descs;
                 let mut all_valid = true;
                 for (i, desc) in descs.iter().enumerate() {
                     let bc_raw = match tech.barcodes.get(i) {
@@ -720,12 +821,10 @@ where
                 }
                 s.num_reads_in_chunk += 1;
             } else {
-                // Store per-field barcode values for structured unmapped count output.
                 if is_multi_bc {
-                    let key: SmallVec<[u64; 2]> = multi_bc_packed.clone();
-                    *st.unmapped_bc_counts.entry(key).or_insert(0) += 1;
+                    st.unmapped_bc_counts.inc_multi(&multi_bc_packed);
                 } else {
-                    *st.unmapped_bc_counts.entry(smallvec![bc_packed]).or_insert(0) += 1;
+                    st.unmapped_bc_counts.inc_single(bc_packed);
                 }
             }
         }
@@ -758,26 +857,9 @@ where
             if let Some(ref unmapped_file) = output.unmapped_bc_file
                 && !st.unmapped_bc_counts.is_empty()
             {
-                let mut buf = Vec::with_capacity(st.unmapped_bc_counts.len() * 16);
-                for (bc_fields, &count) in &st.unmapped_bc_counts {
-                    for (i, &bc_len) in st.bc_lens.iter().enumerate() {
-                        let val = if i < bc_fields.len() { bc_fields[i] } else { 0u64 };
-                        // Write at the minimal width for this barcode length (in bases)
-                        if bc_len <= 4 {
-                            buf.extend_from_slice(&(val as u8).to_le_bytes());
-                        } else if bc_len <= 8 {
-                            buf.extend_from_slice(&(val as u16).to_le_bytes());
-                        } else if bc_len <= 16 {
-                            buf.extend_from_slice(&(val as u32).to_le_bytes());
-                        } else {
-                            buf.extend_from_slice(&val.to_le_bytes());
-                        }
-                    }
-                    buf.extend_from_slice(&count.to_le_bytes());
-                }
                 let mut file = unmapped_file.lock().unwrap();
                 use std::io::Write;
-                file.write_all(&buf).ok();
+                st.unmapped_bc_counts.flush_to(&mut *file);
             }
         }
         Ok(())
