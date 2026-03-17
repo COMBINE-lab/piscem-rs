@@ -15,7 +15,7 @@ use ahash::AHashMap;
 use indicatif::ProgressBar;
 use paraseq::parallel::{MultiParallelProcessor, PairedParallelProcessor, ParallelProcessor};
 use paraseq::Record;
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 use sshash_lib::{Kmer, KmerBits};
 
 use crate::index::reference_index::ReferenceIndex;
@@ -441,7 +441,11 @@ where
 {
     common: CommonThreadState<'a, K, S>,
     local_rlen_samples: Vec<u32>,
-    unmapped_bc_counts: AHashMap<u64, u32>,
+    /// Unmapped barcode counts. Key is per-barcode-field values:
+    /// single-barcode: [cell_bc], multi-barcode: [sample_bc, cell_bc].
+    unmapped_bc_counts: AHashMap<SmallVec<[u64; 2]>, u32>,
+    /// Barcode lengths (in bases) for each field, used for writing at correct widths.
+    bc_lens: SmallVec<[u16; 2]>,
 }
 
 /// Parallel processor for scRNA-seq mapping.
@@ -555,7 +559,8 @@ where
         let st = self.state.get_or_insert_with(|| ScrnaThreadState::<K, S> {
             common: CommonThreadState::new(index, end_cache, &self.opts),
             local_rlen_samples: Vec::new(),
-            unmapped_bc_counts: AHashMap::new(),
+            unmapped_bc_counts: AHashMap::default(),
+            bc_lens: protocol.barcode_descs().iter().map(|d| d.len).collect(),
         });
         let s = &mut st.common;
         s.ensure_chunk_started();
@@ -715,16 +720,12 @@ where
                 }
                 s.num_reads_in_chunk += 1;
             } else {
-                // For multi-barcode protocols, encode sample BC in the unmapped
-                // count key so downstream tools can attribute unmapped reads to
-                // specific (sample, cell) pairs.
-                if is_multi_bc && multi_bc_packed.len() >= 2 {
-                    let sample_bc = multi_bc_packed[0];
-                    let cell_bc = bc_packed;
-                    let composite = (sample_bc << 32) | (cell_bc & 0xFFFFFFFF);
-                    *st.unmapped_bc_counts.entry(composite).or_insert(0) += 1;
+                // Store per-field barcode values for structured unmapped count output.
+                if is_multi_bc {
+                    let key: SmallVec<[u64; 2]> = multi_bc_packed.clone();
+                    *st.unmapped_bc_counts.entry(key).or_insert(0) += 1;
                 } else {
-                    *st.unmapped_bc_counts.entry(bc_packed).or_insert(0) += 1;
+                    *st.unmapped_bc_counts.entry(smallvec![bc_packed]).or_insert(0) += 1;
                 }
             }
         }
@@ -752,13 +753,26 @@ where
                 let mut samples = read_length_samples.lock().unwrap();
                 samples.extend_from_slice(&st.local_rlen_samples);
             }
-            // Write unmapped barcode counts to shared file
+            // Write unmapped barcode counts to shared file using the
+            // self-describing format (header already written by map_scrna.rs).
             if let Some(ref unmapped_file) = output.unmapped_bc_file
                 && !st.unmapped_bc_counts.is_empty()
             {
-                let mut buf = Vec::with_capacity(st.unmapped_bc_counts.len() * 12);
-                for (&bc, &count) in &st.unmapped_bc_counts {
-                    buf.extend_from_slice(&bc.to_le_bytes());
+                let mut buf = Vec::with_capacity(st.unmapped_bc_counts.len() * 16);
+                for (bc_fields, &count) in &st.unmapped_bc_counts {
+                    for (i, &bc_len) in st.bc_lens.iter().enumerate() {
+                        let val = if i < bc_fields.len() { bc_fields[i] } else { 0u64 };
+                        // Write at the minimal width for this barcode length (in bases)
+                        if bc_len <= 4 {
+                            buf.extend_from_slice(&(val as u8).to_le_bytes());
+                        } else if bc_len <= 8 {
+                            buf.extend_from_slice(&(val as u16).to_le_bytes());
+                        } else if bc_len <= 16 {
+                            buf.extend_from_slice(&(val as u32).to_le_bytes());
+                        } else {
+                            buf.extend_from_slice(&val.to_le_bytes());
+                        }
+                    }
                     buf.extend_from_slice(&count.to_le_bytes());
                 }
                 let mut file = unmapped_file.lock().unwrap();

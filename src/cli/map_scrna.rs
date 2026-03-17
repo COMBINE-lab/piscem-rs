@@ -168,10 +168,31 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
         )?
     };
 
-    // Create unmapped barcode count file
+    // Create unmapped barcode count file with self-describing header.
+    // The header encodes the number and widths of barcode fields so the
+    // reader can parse records without hardcoding barcode widths.
     let unmapped_bc_path = out_dir.join("unmapped_bc_count.bin");
-    let unmapped_bc_file = std::fs::File::create(&unmapped_bc_path)
+    let mut unmapped_bc_file = std::fs::File::create(&unmapped_bc_path)
         .with_context(|| format!("failed to create {}", unmapped_bc_path.display()))?;
+
+    // Write the unmapped BC format header
+    {
+        use std::io::Write;
+        let descs = protocol.barcode_descs();
+        // version
+        unmapped_bc_file.write_all(&[1u8])?;
+        // num_fields
+        unmapped_bc_file.write_all(&[descs.len() as u8])?;
+        // field types: use the RAD tag type IDs based on barcode length in bases.
+        // 2 bits per base: <=4bp fits u8, <=8bp fits u16, <=16bp fits u32, <=32bp fits u64
+        for desc in &descs {
+            let type_id: u8 = if desc.len <= 4 { 1 }     // U8  (≤8 bits)
+                else if desc.len <= 8 { 2 }   // U16 (≤16 bits)
+                else if desc.len <= 16 { 3 }  // U32 (≤32 bits)
+                else { 4 };                    // U64 (≤64 bits)
+            unmapped_bc_file.write_all(&[type_id])?;
+        }
+    }
 
     // Setup shared state
     let stats = MappingStats::new();
