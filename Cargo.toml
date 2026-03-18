@@ -3,7 +3,7 @@ members = [".", "crates/py-piscem"]
 
 [package]
 name = "piscem-rs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.91"
 license = "BSD-3-Clause"
