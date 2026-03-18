@@ -28,3 +28,12 @@ target
 # sshash-rs is an independent repo; use a local checkout for development
 # and override in .cargo/config.toml if needed
 sshash-rs/
+
+crates/py-piscem/tests/__pycache__/
+gencode_pc_v44_index.sigs.json
+piscem-cpp/
+piscem/
+piscem_build_stats.time
+piscem_build_stats_cpp.time
+profile.json.gz
+test_data/
