@@ -2,8 +2,8 @@
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -13,17 +13,18 @@ use tracing::info;
 use sshash_lib::{Kmer, KmerBits, dispatch_on_k};
 
 use crate::index::reference_index::ReferenceIndex;
-use crate::io::fastx::{open_with_decompression, Collection, CollectionType};
+use crate::io::fastx::{Collection, CollectionType, open_with_decompression};
 use crate::io::map_info::{MapInfoParams, write_map_info};
-use crate::io::rad::write_rad_header_sc;
+use crate::io::rad::{write_rad_header_sc, write_rad_header_sc_multi_bc};
 use crate::io::threads::{MappingStats, OutputInfo};
 use crate::mapping::chain_state::SketchHitInfoChained;
 use crate::mapping::hit_searcher::SkippingStrategy;
 use crate::mapping::hits::SketchHitInfo;
 use crate::mapping::processors::{MappingOpts, ScrnaProcessor};
-use crate::mapping::protocols::custom::parse_custom_geometry;
-use crate::mapping::protocols::scrna::ChromiumProtocol;
 use crate::mapping::protocols::Protocol;
+use crate::mapping::protocols::custom::parse_custom_geometry;
+use crate::mapping::protocols::flex::ChromiumFlexProtocol;
+use crate::mapping::protocols::scrna::ChromiumProtocol;
 use crate::mapping::sketch_hit_simple::SketchHitInfoSimple;
 
 use super::map_bulk::make_progress_bar;
@@ -96,6 +97,8 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
     let protocol: Box<dyn Protocol> =
         if let Some(chromium) = ChromiumProtocol::from_name(&args.geometry) {
             Box::new(chromium)
+        } else if let Some(flex) = ChromiumFlexProtocol::from_name(&args.geometry) {
+            Box::new(flex)
         } else {
             match parse_custom_geometry(&args.geometry) {
                 Ok(custom) => Box::new(custom),
@@ -106,12 +109,26 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
                 ),
             }
         };
-    info!(
-        "Protocol: {} (bc_len={}, umi_len={})",
-        protocol.name(),
-        protocol.barcode_len(),
-        protocol.umi_len(),
-    );
+    if protocol.is_multi_barcode() {
+        let descs = protocol.barcode_descs();
+        let bc_desc_str: Vec<String> = descs
+            .iter()
+            .map(|d| format!("{}={}", d.tag_name, d.len))
+            .collect();
+        info!(
+            "Protocol: {} (multi-barcode: [{}], umi_len={})",
+            protocol.name(),
+            bc_desc_str.join(", "),
+            protocol.umi_len(),
+        );
+    } else {
+        info!(
+            "Protocol: {} (bc_len={}, umi_len={})",
+            protocol.name(),
+            protocol.barcode_len(),
+            protocol.umi_len(),
+        );
+    }
 
     // --ignore-ambig-hits disables EC table loading
     let check_ambig = !args.ignore_ambig_hits;
@@ -129,23 +146,67 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
     let mut rad_file = std::fs::File::create(&rad_path)
         .with_context(|| format!("failed to create {}", rad_path.display()))?;
 
-    // Write SC RAD header
+    // Write SC RAD header (single or multi-barcode)
     let ref_names: Vec<&str> = (0..index.num_refs()).map(|i| index.ref_name(i)).collect();
     let bc_len = protocol.barcode_len() as u16;
     let umi_len = protocol.umi_len() as u16;
-    let (chunk_count_offset, read_length_offset) = write_rad_header_sc(
-        &mut rad_file,
-        index.num_refs() as u64,
-        &ref_names,
-        bc_len,
-        umi_len,
-        args.with_position,
-    )?;
+    let (chunk_count_offset, read_length_offset) = if protocol.is_multi_barcode() {
+        let descs = protocol.barcode_descs();
+        write_rad_header_sc_multi_bc(
+            &mut rad_file,
+            index.num_refs() as u64,
+            &ref_names,
+            &descs,
+            umi_len,
+            args.with_position,
+        )?
+    } else {
+        write_rad_header_sc(
+            &mut rad_file,
+            index.num_refs() as u64,
+            &ref_names,
+            bc_len,
+            umi_len,
+            args.with_position,
+        )?
+    };
 
-    // Create unmapped barcode count file
+    // Create unmapped barcode count file with self-describing header.
+    // The header encodes the number and widths of barcode fields so the
+    // reader can parse records without hardcoding barcode widths.
     let unmapped_bc_path = out_dir.join("unmapped_bc_count.bin");
-    let unmapped_bc_file = std::fs::File::create(&unmapped_bc_path)
+    let mut unmapped_bc_file = std::fs::File::create(&unmapped_bc_path)
         .with_context(|| format!("failed to create {}", unmapped_bc_path.display()))?;
+
+    // Write the unmapped BC format header
+    {
+        use std::io::Write;
+        let descs = protocol.barcode_descs();
+        // version
+        unmapped_bc_file.write_all(&[1u8])?;
+        // num_fields
+        unmapped_bc_file.write_all(&[descs.len() as u8])?;
+        // field types: use the RAD tag type IDs based on barcode length in bases.
+        // 2 bits per base: <=4bp fits u8, <=8bp fits u16, <=16bp fits u32, <=32bp fits u64
+        for desc in &descs {
+            let type_id: u8 = if desc.len <= 4 {
+                1
+            }
+            // U8  (≤8 bits)
+            else if desc.len <= 8 {
+                2
+            }
+            // U16 (≤16 bits)
+            else if desc.len <= 16 {
+                3
+            }
+            // U32 (≤32 bits)
+            else {
+                4
+            }; // U64 (≤64 bits)
+            unmapped_bc_file.write_all(&[type_id])?;
+        }
+    }
 
     // Setup shared state
     let stats = MappingStats::new();
@@ -173,7 +234,11 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
         max_hit_occ: args.max_hit_occ,
         max_hit_occ_recover: args.max_hit_occ_recover,
         max_read_occ: args.max_read_occ,
-        max_ec_card: if args.ignore_ambig_hits { 0 } else { args.max_ec_card },
+        max_ec_card: if args.ignore_ambig_hits {
+            0
+        } else {
+            args.max_ec_card
+        },
     };
     let struct_constraints = args.struct_constraints;
 
@@ -216,7 +281,10 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
             if mode_count as f64 / total as f64 >= 0.9 {
                 rad_file.seek(SeekFrom::Start(rlen_offset))?;
                 rad_file.write_all(&mode.to_le_bytes())?;
-                info!("Read length mode: {} ({}/{} samples)", mode, mode_count, total);
+                info!(
+                    "Read length mode: {} ({}/{} samples)",
+                    mode, mode_count, total
+                );
             } else {
                 info!(
                     "Warning: read lengths are heterogeneous (mode {} = {}/{})",
@@ -285,8 +353,18 @@ where
     Kmer<K>: KmerBits,
 {
     let mut processor = ScrnaProcessor::<K, S>::new(
-        index, None, output, stats, strat, opts, protocol, bc_len, umi_len, with_position,
-        read_length_samples, progress,
+        index,
+        None,
+        output,
+        stats,
+        strat,
+        opts,
+        protocol,
+        bc_len,
+        umi_len,
+        with_position,
+        read_length_samples,
+        progress,
     );
 
     let mut readers = Vec::with_capacity(read1_paths.len() * 2);

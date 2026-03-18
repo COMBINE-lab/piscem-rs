@@ -1,11 +1,13 @@
+use piscem_rs::index::reference_index::ReferenceIndex;
 /// Dump basic index statistics for debugging.
 use std::path::Path;
-use piscem_rs::index::reference_index::ReferenceIndex;
 
 fn main() {
-    let prefix = std::env::args().nth(1).expect("usage: index_stats <index_prefix>");
-    let index = ReferenceIndex::load(Path::new(&prefix), false, false)
-        .expect("failed to load index");
+    let prefix = std::env::args()
+        .nth(1)
+        .expect("usage: index_stats <index_prefix>");
+    let index =
+        ReferenceIndex::load(Path::new(&prefix), false, false).expect("failed to load index");
 
     println!("k = {}", index.k());
     println!("num_refs = {}", index.num_refs());
@@ -16,13 +18,23 @@ fn main() {
     let n = index.num_refs();
     println!("\nFirst 10 references:");
     for i in 0..10.min(n) {
-        println!("  ref[{}] = {} (len={})", i, index.ref_name(i), index.ref_len(i));
+        println!(
+            "  ref[{}] = {} (len={})",
+            i,
+            index.ref_name(i),
+            index.ref_len(i)
+        );
     }
     if n > 15 {
         println!("  ...");
         println!("Last 5 references:");
-        for i in (n-5)..n {
-            println!("  ref[{}] = {} (len={})", i, index.ref_name(i), index.ref_len(i));
+        for i in (n - 5)..n {
+            println!(
+                "  ref[{}] = {} (len={})",
+                i,
+                index.ref_name(i),
+                index.ref_len(i)
+            );
         }
     }
 
@@ -53,5 +65,8 @@ fn main() {
     }
     println!("  total_entries (verified) = {}", total_entries_check);
     println!("  max_entries_per_contig = {}", max_entries_per_contig);
-    println!("  contigs_with_zero_entries = {}", contigs_with_zero_entries);
+    println!(
+        "  contigs_with_zero_entries = {}",
+        contigs_with_zero_entries
+    );
 }

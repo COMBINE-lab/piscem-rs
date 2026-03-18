@@ -30,7 +30,10 @@ pub struct IndexComparisonSummary {
 /// - Number of references
 /// - Reference names (ordered)
 /// - Reference lengths
-pub fn compare_ref_metadata(index_a: &ReferenceIndex, index_b: &ReferenceIndex) -> IndexComparisonSummary {
+pub fn compare_ref_metadata(
+    index_a: &ReferenceIndex,
+    index_b: &ReferenceIndex,
+) -> IndexComparisonSummary {
     let num_refs_match = index_a.num_refs() == index_b.num_refs();
     let n = index_a.num_refs().min(index_b.num_refs());
 

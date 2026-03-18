@@ -128,7 +128,8 @@ where
         let result = self.engine.lookup(kmer_bytes);
 
         // If the lookup succeeded and we were at a unitig boundary, cache it
-        if was_cache_end && result.is_found()
+        if was_cache_end
+            && result.is_found()
             && let Some(cache) = self.cache
         {
             let kmer = Kmer::<K>::from_ascii_unchecked(kmer_bytes);

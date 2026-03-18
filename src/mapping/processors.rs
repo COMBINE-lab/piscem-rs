@@ -8,19 +8,20 @@
 //! lazily on first batch. The custom `Clone` impl sets `state: None` so each
 //! cloned processor (one per worker thread) gets fresh state.
 
-use std::sync::atomic::Ordering;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
 use ahash::AHashMap;
 use indicatif::ProgressBar;
-use paraseq::parallel::{MultiParallelProcessor, PairedParallelProcessor, ParallelProcessor};
 use paraseq::Record;
+use paraseq::parallel::{MultiParallelProcessor, PairedParallelProcessor, ParallelProcessor};
 use smallvec::SmallVec;
 use sshash_lib::{Kmer, KmerBits};
 
 use crate::index::reference_index::ReferenceIndex;
 use crate::io::rad::{
     RadWriter, pack_bases_2bit, write_atac_record, write_bulk_record, write_sc_record,
+    write_sc_record_multi_bc,
 };
 use crate::io::threads::{MappingStats, OutputInfo};
 use crate::mapping::binning::BinPos;
@@ -28,14 +29,14 @@ use crate::mapping::cache::MappingCache;
 use crate::mapping::filters::PoisonState;
 use crate::mapping::hit_searcher::{HitSearcher, SkippingStrategy};
 use crate::mapping::hits::MappingType;
+use crate::mapping::hits::SketchHitInfo;
 use crate::mapping::map_fragment::{
     map_pe_fragment, map_pe_fragment_atac, map_se_fragment, map_se_fragment_atac,
 };
 use crate::mapping::merge_pairs::{remove_duplicate_hits_pub, simple_hit_cmp_bins};
-use crate::mapping::overlap::{find_overlap, OverlapType};
+use crate::mapping::overlap::{OverlapType, find_overlap};
 use crate::mapping::protocols::scrna::{barcode_has_n, count_ns, is_all_acgt, recover_barcode};
-use crate::mapping::protocols::Protocol;
-use crate::mapping::hits::SketchHitInfo;
+use crate::mapping::protocols::{AlignableReads, Protocol};
 use crate::mapping::sketch_hit_simple::SketchHitInfoSimple;
 use crate::mapping::streaming_query::PiscemStreamingQuery;
 use crate::mapping::unitig_end_cache::UnitigEndCache;
@@ -102,8 +103,11 @@ impl MappingOpts {
 /// Generic over `S: SketchHitInfo` to support both the default
 /// `SketchHitInfoSimple` (no structural constraints) and
 /// `SketchHitInfoChained` (structural constraints enabled via `-c`).
-struct CommonThreadState<'a, const K: usize, S: SketchHitInfo + Send + 'static = SketchHitInfoSimple>
-where
+struct CommonThreadState<
+    'a,
+    const K: usize,
+    S: SketchHitInfo + Send + 'static = SketchHitInfoSimple,
+> where
     Kmer<K>: KmerBits,
 {
     hs: HitSearcher<'a>,
@@ -173,7 +177,8 @@ where
         }
         let total_bytes = self.rad_writer.len() as u32;
         self.rad_writer.write_u32_at_offset(0, total_bytes);
-        self.rad_writer.write_u32_at_offset(4, self.num_reads_in_chunk);
+        self.rad_writer
+            .write_u32_at_offset(4, self.num_reads_in_chunk);
         if self.num_reads_in_chunk > 0 {
             let mut file = output.rad_file.lock().unwrap();
             self.rad_writer.flush_to(&mut *file).ok();
@@ -213,8 +218,11 @@ where
 /// Generic over `S: SketchHitInfo` so that structural constraints can be enabled
 /// at compile time by instantiating with `SketchHitInfoChained` rather than the
 /// default `SketchHitInfoSimple`.
-pub struct BulkProcessor<'a, const K: usize, S: SketchHitInfo + Send + 'static = SketchHitInfoSimple>
-where
+pub struct BulkProcessor<
+    'a,
+    const K: usize,
+    S: SketchHitInfo + Send + 'static = SketchHitInfoSimple,
+> where
     Kmer<K>: KmerBits,
 {
     index: &'a ReferenceIndex,
@@ -272,10 +280,10 @@ where
 }
 
 // Safety: all shared fields are `Copy` references; `state` is always `None` at clone time.
-unsafe impl<const K: usize, S: SketchHitInfo + Send + 'static> Send for BulkProcessor<'_, K, S>
-where
-    Kmer<K>: KmerBits,
-{}
+unsafe impl<const K: usize, S: SketchHitInfo + Send + 'static> Send for BulkProcessor<'_, K, S> where
+    Kmer<K>: KmerBits
+{
+}
 
 // --- Bulk PE ---
 
@@ -286,7 +294,9 @@ where
 {
     fn process_record_pair_batch(
         &mut self,
-        record_pairs: impl Iterator<Item = (paraseq::fastx::RefRecord<'r>, paraseq::fastx::RefRecord<'r>)>,
+        record_pairs: impl Iterator<
+            Item = (paraseq::fastx::RefRecord<'r>, paraseq::fastx::RefRecord<'r>),
+        >,
     ) -> paraseq::Result<()> {
         let index = self.index;
         let end_cache = self.end_cache;
@@ -433,6 +443,109 @@ where
 // ScrnaProcessor
 // ===========================================================================
 
+/// Unmapped barcode counts — two variants for zero overhead in the common case.
+///
+/// For single-barcode protocols: `Single(AHashMap<u64, u32>)` — same as the
+/// pre-multi-barcode code, no SmallVec allocation per lookup.
+///
+/// For multi-barcode protocols: `Multi(AHashMap<SmallVec<[u64; 2]>, u32>)` —
+/// stores per-field barcode values for structured output.
+enum UnmappedBcCounts {
+    /// Single barcode field — zero overhead compared to pre-multi-barcode code.
+    Single {
+        counts: AHashMap<u64, u32>,
+        bc_len: u16,
+    },
+    /// Multiple barcode fields — stores per-field values.
+    Multi {
+        counts: AHashMap<SmallVec<[u64; 2]>, u32>,
+        bc_lens: SmallVec<[u16; 2]>,
+    },
+}
+
+impl UnmappedBcCounts {
+    fn new_single(bc_len: u16) -> Self {
+        UnmappedBcCounts::Single {
+            counts: AHashMap::new(),
+            bc_len,
+        }
+    }
+
+    fn new_multi(bc_lens: SmallVec<[u16; 2]>) -> Self {
+        UnmappedBcCounts::Multi {
+            counts: AHashMap::default(),
+            bc_lens,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            UnmappedBcCounts::Single { counts, .. } => counts.is_empty(),
+            UnmappedBcCounts::Multi { counts, .. } => counts.is_empty(),
+        }
+    }
+
+    /// Increment count for a single-barcode key.
+    #[inline]
+    fn inc_single(&mut self, bc: u64) {
+        if let UnmappedBcCounts::Single { counts, .. } = self {
+            *counts.entry(bc).or_insert(0) += 1;
+        }
+    }
+
+    /// Increment count for a multi-barcode key.
+    #[inline]
+    fn inc_multi(&mut self, bcs: &SmallVec<[u64; 2]>) {
+        if let UnmappedBcCounts::Multi { counts, .. } = self {
+            *counts.entry(bcs.clone()).or_insert(0) += 1;
+        }
+    }
+
+    /// Write a single barcode value at its declared width (bases → bytes).
+    #[inline]
+    fn write_bc_at_width(buf: &mut Vec<u8>, val: u64, bc_len_bases: u16) {
+        if bc_len_bases <= 4 {
+            buf.extend_from_slice(&(val as u8).to_le_bytes());
+        } else if bc_len_bases <= 8 {
+            buf.extend_from_slice(&(val as u16).to_le_bytes());
+        } else if bc_len_bases <= 16 {
+            buf.extend_from_slice(&(val as u32).to_le_bytes());
+        } else {
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+    }
+
+    /// Write all accumulated counts to the given writer.
+    /// The format header must have already been written to the file.
+    fn flush_to(&self, writer: &mut impl std::io::Write) {
+        match self {
+            UnmappedBcCounts::Single { counts, bc_len } => {
+                let mut buf = Vec::with_capacity(counts.len() * 8);
+                for (&bc, &count) in counts {
+                    Self::write_bc_at_width(&mut buf, bc, *bc_len);
+                    buf.extend_from_slice(&count.to_le_bytes());
+                }
+                writer.write_all(&buf).ok();
+            }
+            UnmappedBcCounts::Multi { counts, bc_lens } => {
+                let mut buf = Vec::with_capacity(counts.len() * 16);
+                for (bc_fields, &count) in counts {
+                    for (i, &bc_len) in bc_lens.iter().enumerate() {
+                        let val = if i < bc_fields.len() {
+                            bc_fields[i]
+                        } else {
+                            0u64
+                        };
+                        Self::write_bc_at_width(&mut buf, val, bc_len);
+                    }
+                    buf.extend_from_slice(&count.to_le_bytes());
+                }
+                writer.write_all(&buf).ok();
+            }
+        }
+    }
+}
+
 /// Per-thread state for scRNA mapping (extends common state).
 struct ScrnaThreadState<'a, const K: usize, S: SketchHitInfo + Send + 'static = SketchHitInfoSimple>
 where
@@ -440,15 +553,18 @@ where
 {
     common: CommonThreadState<'a, K, S>,
     local_rlen_samples: Vec<u32>,
-    unmapped_bc_counts: AHashMap<u64, u32>,
+    unmapped_bc_counts: UnmappedBcCounts,
 }
 
 /// Parallel processor for scRNA-seq mapping.
 ///
 /// Generic over `S: SketchHitInfo` so that structural constraints can be enabled
 /// by instantiating with `SketchHitInfoChained`.
-pub struct ScrnaProcessor<'a, const K: usize, S: SketchHitInfo + Send + 'static = SketchHitInfoSimple>
-where
+pub struct ScrnaProcessor<
+    'a,
+    const K: usize,
+    S: SketchHitInfo + Send + 'static = SketchHitInfoSimple,
+> where
     Kmer<K>: KmerBits,
 {
     index: &'a ReferenceIndex,
@@ -527,9 +643,8 @@ where
 }
 
 // Safety: all shared fields are `Copy` references; `state` is always `None` at clone time.
-unsafe impl<const K: usize, S: SketchHitInfo + Send + 'static> Send for ScrnaProcessor<'_, K, S>
-where
-    Kmer<K>: KmerBits,
+unsafe impl<const K: usize, S: SketchHitInfo + Send + 'static> Send for ScrnaProcessor<'_, K, S> where
+    Kmer<K>: KmerBits
 {
 }
 
@@ -540,7 +655,9 @@ where
 {
     fn process_record_pair_batch(
         &mut self,
-        record_pairs: impl Iterator<Item = (paraseq::fastx::RefRecord<'r>, paraseq::fastx::RefRecord<'r>)>,
+        record_pairs: impl Iterator<
+            Item = (paraseq::fastx::RefRecord<'r>, paraseq::fastx::RefRecord<'r>),
+        >,
     ) -> paraseq::Result<()> {
         let index = self.index;
         let end_cache = self.end_cache;
@@ -549,16 +666,32 @@ where
         let bc_len = self.bc_len;
         let umi_len = self.umi_len;
         let with_position = self.with_position;
-        let is_bio_paired = protocol.is_bio_paired_end();
         let max_rlen_samples: usize = 10;
+
+        let is_multi_bc = protocol.is_multi_barcode();
+        let bc_descs = protocol.barcode_descs();
 
         let st = self.state.get_or_insert_with(|| ScrnaThreadState::<K, S> {
             common: CommonThreadState::new(index, end_cache, &self.opts),
             local_rlen_samples: Vec::new(),
-            unmapped_bc_counts: AHashMap::new(),
+            unmapped_bc_counts: if is_multi_bc {
+                let bc_lens = protocol.barcode_descs().iter().map(|d| d.len).collect();
+                UnmappedBcCounts::new_multi(bc_lens)
+            } else {
+                UnmappedBcCounts::new_single(bc_len)
+            },
         });
         let s = &mut st.common;
         s.ensure_chunk_started();
+
+        // Pre-compute multi-barcode lens (invariant across reads) and
+        // allocate the packed barcode buffer once, cleared each iteration.
+        let multi_bc_lens: SmallVec<[u16; 2]> = if is_multi_bc {
+            bc_descs.iter().map(|d| d.len).collect()
+        } else {
+            SmallVec::new()
+        };
+        let mut multi_bc_packed: SmallVec<[u64; 2]> = SmallVec::new();
 
         let mut batch_reads: u64 = 0;
         for (rec1, rec2) in record_pairs {
@@ -571,93 +704,139 @@ where
             // Extract technical sequences
             // C++ returns nullptr if R1 too short for BC or UMI → skip read
             let tech = protocol.extract_tech_seqs(&r1, &r2);
-            let bc_raw = match tech.barcode {
-                Some(bc) if !bc.is_empty() => bc,
-                _ => continue,
-            };
+
+            // UMI validation (matching C++ umi_kmer.fromChars check)
             let umi_raw = match tech.umi {
                 Some(umi) if !umi.is_empty() => umi,
                 _ => continue,
             };
-
-            // Barcode validation + recovery (matching C++ recover_barcode + fromChars)
-            // C++ uses find_first_not_of("ACTGactg") which catches any non-ACGT char
-            let n_count = count_ns(bc_raw);
-            if n_count > 1 {
-                continue;
-            }
-            let recovered_bc = if n_count == 1 {
-                recover_barcode(bc_raw)
-            } else {
-                None
-            };
-            let bc_to_pack = match &recovered_bc {
-                Some(bc) => bc.as_slice(),
-                None => {
-                    // No recovery needed/attempted — validate original BC
-                    if !is_all_acgt(bc_raw) {
-                        continue;
-                    }
-                    bc_raw
-                }
-            };
-            // Validate recovered BC (C++ fromChars check)
-            if !is_all_acgt(bc_to_pack) {
-                continue;
-            }
-
-            // UMI validation (matching C++ umi_kmer.fromChars check)
             if !is_all_acgt(umi_raw) {
                 continue;
             }
-
-            let bc_packed = pack_bases_2bit(bc_to_pack);
             let umi_packed = pack_bases_2bit(umi_raw);
 
-            // Extract mappable reads
+            // Multi-barcode path: validate and pack each barcode independently
+            let bc_packed: u64;
+
+            if is_multi_bc {
+                multi_bc_packed.clear();
+                let mut all_valid = true;
+                for (i, _desc) in bc_descs.iter().enumerate() {
+                    let bc_raw = match tech.barcodes.get(i) {
+                        Some(Some(bc)) if !bc.is_empty() => *bc,
+                        _ => {
+                            all_valid = false;
+                            break;
+                        }
+                    };
+                    let n_count = count_ns(bc_raw);
+                    if n_count > 1 {
+                        all_valid = false;
+                        break;
+                    }
+                    let recovered = if n_count == 1 {
+                        recover_barcode(bc_raw)
+                    } else {
+                        None
+                    };
+                    let bc_to_pack = match &recovered {
+                        Some(r) => {
+                            if !is_all_acgt(r) {
+                                all_valid = false;
+                                break;
+                            }
+                            r.as_slice()
+                        }
+                        None => {
+                            if !is_all_acgt(bc_raw) {
+                                all_valid = false;
+                                break;
+                            }
+                            bc_raw
+                        }
+                    };
+                    multi_bc_packed.push(pack_bases_2bit(bc_to_pack));
+                }
+                if !all_valid {
+                    continue;
+                }
+                // For unmapped tracking, use the cell barcode (last level)
+                bc_packed = *multi_bc_packed.last().unwrap_or(&0);
+            } else {
+                // Single-barcode path (unchanged)
+                let bc_raw = match tech.barcode() {
+                    Some(bc) if !bc.is_empty() => bc,
+                    _ => continue,
+                };
+                let n_count = count_ns(bc_raw);
+                if n_count > 1 {
+                    continue;
+                }
+                let recovered_bc = if n_count == 1 {
+                    recover_barcode(bc_raw)
+                } else {
+                    None
+                };
+                let bc_to_pack = match &recovered_bc {
+                    Some(bc) => bc.as_slice(),
+                    None => {
+                        if !is_all_acgt(bc_raw) {
+                            continue;
+                        }
+                        bc_raw
+                    }
+                };
+                if !is_all_acgt(bc_to_pack) {
+                    continue;
+                }
+                bc_packed = pack_bases_2bit(bc_to_pack);
+            }
+
+            // Extract mappable reads — the protocol returns exactly what the
+            // mapper needs: Single for SE mapping, Paired for PE mapping.
             let alignable = protocol.extract_mappable_reads(&r1, &r2);
 
-            if is_bio_paired {
-                let seq1 = alignable.seq1.unwrap_or(&[]);
-                let seq2 = alignable.seq2.unwrap_or(&[]);
-                if seq1.is_empty() && seq2.is_empty() {
-                    continue;
-                }
-                s.poison_state.paired_for_mapping = true;
-                map_pe_fragment::<K, S>(
-                    seq1,
-                    seq2,
-                    &mut s.hs,
-                    &mut s.query,
-                    &mut s.cache_left,
-                    &mut s.cache_right,
-                    &mut s.cache_out,
-                    index,
-                    &mut s.poison_state,
-                    strat,
-                );
+            match alignable {
+                AlignableReads::Paired { read1, read2 } => {
+                    if read1.is_empty() && read2.is_empty() {
+                        continue;
+                    }
+                    s.poison_state.paired_for_mapping = true;
+                    map_pe_fragment::<K, S>(
+                        read1,
+                        read2,
+                        &mut s.hs,
+                        &mut s.query,
+                        &mut s.cache_left,
+                        &mut s.cache_right,
+                        &mut s.cache_out,
+                        index,
+                        &mut s.poison_state,
+                        strat,
+                    );
 
-                if with_position && st.local_rlen_samples.len() < max_rlen_samples {
-                    st.local_rlen_samples.push(seq2.len() as u32);
+                    if with_position && st.local_rlen_samples.len() < max_rlen_samples {
+                        st.local_rlen_samples.push(read2.len() as u32);
+                    }
                 }
-            } else {
-                let seq1 = alignable.seq1.unwrap_or(&[]);
-                if seq1.is_empty() {
-                    continue;
-                }
-                s.poison_state.paired_for_mapping = false;
-                map_se_fragment::<K, S>(
-                    seq1,
-                    &mut s.hs,
-                    &mut s.query,
-                    &mut s.cache_out,
-                    index,
-                    &mut s.poison_state,
-                    strat,
-                );
+                AlignableReads::Single(bio_seq) => {
+                    if bio_seq.is_empty() {
+                        continue;
+                    }
+                    s.poison_state.paired_for_mapping = false;
+                    map_se_fragment::<K, S>(
+                        bio_seq,
+                        &mut s.hs,
+                        &mut s.query,
+                        &mut s.cache_out,
+                        index,
+                        &mut s.poison_state,
+                        strat,
+                    );
 
-                if with_position && st.local_rlen_samples.len() < max_rlen_samples {
-                    st.local_rlen_samples.push(seq1.len() as u32);
+                    if with_position && st.local_rlen_samples.len() < max_rlen_samples {
+                        st.local_rlen_samples.push(bio_seq.len() as u32);
+                    }
                 }
             }
 
@@ -668,19 +847,34 @@ where
 
             if s.cache_out.map_type != MappingType::Unmapped {
                 s.local_mapped += 1;
-                write_sc_record(
-                    bc_packed,
-                    umi_packed,
-                    bc_len,
-                    umi_len,
-                    s.cache_out.map_type,
-                    &s.cache_out.accepted_hits,
-                    with_position,
-                    &mut s.rad_writer,
-                );
+                if is_multi_bc {
+                    write_sc_record_multi_bc(
+                        &multi_bc_packed,
+                        &multi_bc_lens,
+                        umi_packed,
+                        umi_len,
+                        s.cache_out.map_type,
+                        &s.cache_out.accepted_hits,
+                        with_position,
+                        &mut s.rad_writer,
+                    );
+                } else {
+                    write_sc_record(
+                        bc_packed,
+                        umi_packed,
+                        bc_len,
+                        umi_len,
+                        s.cache_out.map_type,
+                        &s.cache_out.accepted_hits,
+                        with_position,
+                        &mut s.rad_writer,
+                    );
+                }
                 s.num_reads_in_chunk += 1;
+            } else if is_multi_bc {
+                st.unmapped_bc_counts.inc_multi(&multi_bc_packed);
             } else {
-                *st.unmapped_bc_counts.entry(bc_packed).or_insert(0) += 1;
+                st.unmapped_bc_counts.inc_single(bc_packed);
             }
         }
         self.progress.inc(batch_reads);
@@ -707,18 +901,13 @@ where
                 let mut samples = read_length_samples.lock().unwrap();
                 samples.extend_from_slice(&st.local_rlen_samples);
             }
-            // Write unmapped barcode counts to shared file
+            // Write unmapped barcode counts to shared file using the
+            // self-describing format (header already written by map_scrna.rs).
             if let Some(ref unmapped_file) = output.unmapped_bc_file
                 && !st.unmapped_bc_counts.is_empty()
             {
-                let mut buf = Vec::with_capacity(st.unmapped_bc_counts.len() * 12);
-                for (&bc, &count) in &st.unmapped_bc_counts {
-                    buf.extend_from_slice(&bc.to_le_bytes());
-                    buf.extend_from_slice(&count.to_le_bytes());
-                }
                 let mut file = unmapped_file.lock().unwrap();
-                use std::io::Write;
-                file.write_all(&buf).ok();
+                st.unmapped_bc_counts.flush_to(&mut *file);
             }
         }
         Ok(())

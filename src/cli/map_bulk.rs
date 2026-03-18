@@ -38,12 +38,22 @@ pub struct MapBulkArgs {
           conflicts_with_all = ["read1", "read2"])]
     pub reads: Vec<PathBuf>,
     /// Read 1 FASTQ files (comma-separated); requires -2
-    #[arg(short = '1', long, value_delimiter = ',',
-          requires = "read2", conflicts_with = "reads")]
+    #[arg(
+        short = '1',
+        long,
+        value_delimiter = ',',
+        requires = "read2",
+        conflicts_with = "reads"
+    )]
     pub read1: Vec<PathBuf>,
     /// Read 2 FASTQ files (comma-separated); requires -1
-    #[arg(short = '2', long, value_delimiter = ',',
-          requires = "read1", conflicts_with = "reads")]
+    #[arg(
+        short = '2',
+        long,
+        value_delimiter = ',',
+        requires = "read1",
+        conflicts_with = "reads"
+    )]
     pub read2: Vec<PathBuf>,
     /// Output file stem (e.g. foo/bar/sample); creates foo/bar/sample.rad and foo/bar/sample.map_info.json
     #[arg(short = 'o', long)]
@@ -95,7 +105,11 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
     let is_paired = !args.read1.is_empty();
     info!(
         "Mapping {} reads ({})",
-        if is_paired { "paired-end" } else { "single-end" },
+        if is_paired {
+            "paired-end"
+        } else {
+            "single-end"
+        },
         args.skipping_strategy,
     );
 
@@ -118,9 +132,8 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
     if let Some(parent) = args.output.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create output directory: {}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create output directory: {}", parent.display()))?;
     }
     let mut rad_path = args.output.clone();
     rad_path.add_extension("rad");
@@ -161,7 +174,11 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
         max_hit_occ: args.max_hit_occ,
         max_hit_occ_recover: args.max_hit_occ_recover,
         max_read_occ: args.max_read_occ,
-        max_ec_card: if args.ignore_ambig_hits { 0 } else { args.max_ec_card },
+        max_ec_card: if args.ignore_ambig_hits {
+            0
+        } else {
+            args.max_ec_card
+        },
     };
     let struct_constraints = args.struct_constraints;
 
@@ -256,7 +273,8 @@ fn run_bulk_pipeline<const K: usize, S: SketchHitInfo + Send + 'static>(
 where
     Kmer<K>: KmerBits,
 {
-    let mut processor = BulkProcessor::<K, S>::new(index, None, output, stats, strat, opts, progress);
+    let mut processor =
+        BulkProcessor::<K, S>::new(index, None, output, stats, strat, opts, progress);
 
     if is_paired {
         let mut readers = Vec::with_capacity(read1_paths.len() * 2);

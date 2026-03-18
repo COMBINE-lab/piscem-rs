@@ -117,10 +117,7 @@ impl PoisonTable {
         // Remove duplicates
         occs.dedup();
 
-        info!(
-            "Total number of distinct poison k-mer occs: {}",
-            occs.len()
-        );
+        info!("Total number of distinct poison k-mer occs: {}", occs.len());
 
         if occs.is_empty() {
             return Ok(Self {
@@ -170,11 +167,7 @@ impl PoisonTable {
             })
             .collect();
 
-        let max_range = offsets
-            .windows(2)
-            .map(|w| w[1] - w[0])
-            .max()
-            .unwrap_or(0);
+        let max_range = offsets.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
         info!(
             "[poison_table]: The most frequently occurring poison k-mer appeared in {} distinct unitig positions.",
             max_range

@@ -62,15 +62,13 @@ where
     cache_out.clear();
 
     poison_state.set_fragment_end(FragmentEnd::Left);
-    let early_left =
-        map_read::<K, S>(seq1, cache_left, hs, query, index, poison_state, strat);
+    let early_left = map_read::<K, S>(seq1, cache_left, hs, query, index, poison_state, strat);
     if poison_state.is_poisoned() {
         return false;
     }
 
     poison_state.set_fragment_end(FragmentEnd::Right);
-    let early_right =
-        map_read::<K, S>(seq2, cache_right, hs, query, index, poison_state, strat);
+    let early_right = map_read::<K, S>(seq2, cache_right, hs, query, index, poison_state, strat);
     if poison_state.is_poisoned() {
         return false;
     }
@@ -131,15 +129,29 @@ where
     cache_out.clear();
 
     poison_state.set_fragment_end(FragmentEnd::Left);
-    let early_left =
-        map_read_atac::<K, SketchHitInfoSimple>(seq1, cache_left, hs, query, index, poison_state, binning);
+    let early_left = map_read_atac::<K, SketchHitInfoSimple>(
+        seq1,
+        cache_left,
+        hs,
+        query,
+        index,
+        poison_state,
+        binning,
+    );
     if poison_state.is_poisoned() {
         return false;
     }
 
     poison_state.set_fragment_end(FragmentEnd::Right);
-    let early_right =
-        map_read_atac::<K, SketchHitInfoSimple>(seq2, cache_right, hs, query, index, poison_state, binning);
+    let early_right = map_read_atac::<K, SketchHitInfoSimple>(
+        seq2,
+        cache_right,
+        hs,
+        query,
+        index,
+        poison_state,
+        binning,
+    );
     if poison_state.is_poisoned() {
         return false;
     }

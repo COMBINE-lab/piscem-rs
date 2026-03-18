@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use piscem_rs::verify::rad_compare::{read_atac_rad_records, CanonicalAtacRecord};
+use piscem_rs::verify::rad_compare::{CanonicalAtacRecord, read_atac_rad_records};
 
 fn main() {
     let cpp_rad = Path::new("/tmp/cpp_atac_out/map.rad");
@@ -42,7 +42,11 @@ fn main() {
         })
         .collect();
 
-    println!("Records: C++={}, Rust={}", records_a.len(), records_b_translated.len());
+    println!(
+        "Records: C++={}, Rust={}",
+        records_a.len(),
+        records_b_translated.len()
+    );
 
     // Build frequency maps
     let mut freq_a: HashMap<CanonicalAtacRecord, u64> = HashMap::with_capacity(records_a.len());
@@ -90,11 +94,8 @@ fn main() {
     }
 
     // Count unique barcodes that appear in mismatches
-    let all_bc: std::collections::HashSet<u64> = a_by_bc
-        .keys()
-        .chain(b_by_bc.keys())
-        .copied()
-        .collect();
+    let all_bc: std::collections::HashSet<u64> =
+        a_by_bc.keys().chain(b_by_bc.keys()).copied().collect();
     println!("Unique barcodes with mismatches: {}", all_bc.len());
 
     // Find paired mismatches (same BC appears in both only_a and only_b)
@@ -175,13 +176,11 @@ fn main() {
                                 {
                                     if a_aln.2 != b_aln.2 {
                                         pos_differs = true;
-                                        pos_diffs
-                                            .push(a_aln.2 as i64 - b_aln.2 as i64);
+                                        pos_diffs.push(a_aln.2 as i64 - b_aln.2 as i64);
                                     }
                                     if a_aln.3 != b_aln.3 {
                                         flen_differs = true;
-                                        flen_diffs
-                                            .push(a_aln.3 as i64 - b_aln.3 as i64);
+                                        flen_diffs.push(a_aln.3 as i64 - b_aln.3 as i64);
                                     }
                                     if a_aln.1 != b_aln.1 {
                                         type_differs = true;
@@ -276,13 +275,19 @@ fn main() {
 
     println!("\n=== Mismatch Categories ===");
     println!("Paired (same BC in both):     {}", paired_bc);
-    println!("  Same targets, same #alns:   {}", cat_same_targets_same_nalns);
+    println!(
+        "  Same targets, same #alns:   {}",
+        cat_same_targets_same_nalns
+    );
     println!("    pos diff only:            {}", detail_pos_diff_only);
     println!("    flen diff only:           {}", detail_flen_diff_only);
     println!("    type diff only:           {}", detail_type_diff_only);
     println!("    pos+flen diff:            {}", detail_pos_and_flen);
     println!("    other:                    {}", detail_other);
-    println!("  Same targets, diff #alns:   {}", cat_same_targets_diff_nalns);
+    println!(
+        "  Same targets, diff #alns:   {}",
+        cat_same_targets_diff_nalns
+    );
     println!("  Subset targets:             {}", cat_subset_targets);
     println!("  Different targets:          {}", cat_diff_targets);
     println!("Unpaired (C++ only):          {}", unpaired_a_only);
@@ -293,7 +298,10 @@ fn main() {
         let min = pos_diffs[0];
         let max = pos_diffs[pos_diffs.len() - 1];
         let median = pos_diffs[pos_diffs.len() / 2];
-        println!("\nPosition diffs (C++ - Rust): min={min}, max={max}, median={median}, n={}", pos_diffs.len());
+        println!(
+            "\nPosition diffs (C++ - Rust): min={min}, max={max}, median={median}, n={}",
+            pos_diffs.len()
+        );
     }
 
     if !flen_diffs.is_empty() {
@@ -301,7 +309,10 @@ fn main() {
         let min = flen_diffs[0];
         let max = flen_diffs[flen_diffs.len() - 1];
         let median = flen_diffs[flen_diffs.len() / 2];
-        println!("Frag len diffs (C++ - Rust): min={min}, max={max}, median={median}, n={}", flen_diffs.len());
+        println!(
+            "Frag len diffs (C++ - Rust): min={min}, max={max}, median={median}, n={}",
+            flen_diffs.len()
+        );
     }
 
     println!("\n#alignments histogram (C++ mismatches):");

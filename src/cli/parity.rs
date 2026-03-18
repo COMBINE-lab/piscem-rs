@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Args;
 
-use crate::verify::parity::{run_parity, ParityConfig};
+use crate::verify::parity::{ParityConfig, run_parity};
 
 #[derive(Args, Debug)]
 pub struct ParityArgs {

@@ -8,7 +8,7 @@
 
 use smallvec::SmallVec;
 
-use crate::mapping::hits::{HitDirection, SimpleHit, SketchHitInfo, MAX_DISTORTION};
+use crate::mapping::hits::{HitDirection, MAX_DISTORTION, SimpleHit, SketchHitInfo};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -483,9 +483,11 @@ mod tests {
     fn test_chained_matches_simple_when_disabled() {
         // When structural constraints are disabled (via overflow),
         // behavior should match SketchHitInfoSimple.
-        let mut info = SketchHitInfoChained::default();
-        info.ignore_struct_constraints_fw = true;
-        info.ignore_struct_constraints_rc = true;
+        let mut info = SketchHitInfoChained {
+            ignore_struct_constraints_fw: true,
+            ignore_struct_constraints_rc: true,
+            ..SketchHitInfoChained::default()
+        };
 
         assert!(info.add_fw(100, 0, 100, 31, 100, 1.0));
         assert!(info.add_fw(105, 5, 100, 31, 100, 1.0));
@@ -499,9 +501,11 @@ mod tests {
 
     #[test]
     fn test_chained_best_direction() {
-        let mut info = SketchHitInfoChained::default();
-        info.ignore_struct_constraints_fw = true;
-        info.ignore_struct_constraints_rc = true;
+        let mut info = SketchHitInfoChained {
+            ignore_struct_constraints_fw: true,
+            ignore_struct_constraints_rc: true,
+            ..SketchHitInfoChained::default()
+        };
 
         info.add_fw(100, 0, 100, 31, 100, 1.0);
         info.add_fw(105, 5, 100, 31, 100, 1.0);
@@ -512,9 +516,11 @@ mod tests {
 
     #[test]
     fn test_chained_get_hits() {
-        let mut info = SketchHitInfoChained::default();
-        info.ignore_struct_constraints_fw = true;
-        info.ignore_struct_constraints_rc = true;
+        let mut info = SketchHitInfoChained {
+            ignore_struct_constraints_fw: true,
+            ignore_struct_constraints_rc: true,
+            ..SketchHitInfoChained::default()
+        };
 
         info.add_fw(100, 0, 100, 31, 100, 1.0);
         info.add_rc(200, 0, 100, 31, 100, 2.0);

@@ -568,6 +568,146 @@ pub fn write_atac_record(
     }
 }
 
+use crate::mapping::protocols::BarcodeDesc;
+
+/// Write a RAD header for multi-barcode single-cell mode (e.g., 10x Flex).
+///
+/// Returns `(chunk_count_offset, Option<read_length_offset>)` for backpatching.
+///
+/// File-level tags: num_barcodes, b0len, b1len, ..., ulen, known_rad_type [, rlen]
+/// Read-level tags: b0, b1, ..., u
+/// Alignment-level tags: compressed_ori_refid [, pos]
+pub fn write_rad_header_sc_multi_bc<W: Write>(
+    writer: &mut W,
+    num_refs: u64,
+    ref_names: &[&str],
+    barcode_descs: &[BarcodeDesc],
+    umi_len: u16,
+    with_position: bool,
+) -> Result<(u64, Option<u64>)> {
+    let mut buf = RadWriter::new();
+
+    // is_paired flag (always 0 for SC)
+    buf.write_u8(0);
+
+    // Reference count and names
+    buf.write_u64(num_refs);
+    for name in ref_names {
+        buf.write_string(name);
+    }
+
+    // num_chunks placeholder
+    let chunk_count_offset = buf.len() as u64;
+    buf.write_u64(0);
+
+    // --- Tag descriptions ---
+
+    // File-level tags: num_barcodes + per-BC lengths + ulen + known_rad_type [+ rlen]
+    let num_file_tags: u16 =
+        1 + barcode_descs.len() as u16 + 1 + 1 + if with_position { 1 } else { 0 };
+    buf.write_u16(num_file_tags);
+    buf.write_tag_desc("num_barcodes", TAG_U16);
+    for desc in barcode_descs {
+        let len_tag = format!("{}len", desc.tag_name);
+        buf.write_tag_desc(&len_tag, TAG_U16);
+    }
+    buf.write_tag_desc("ulen", TAG_U16);
+    buf.write_tag_desc("known_rad_type", TAG_STRING);
+    if with_position {
+        buf.write_tag_desc("rlen", TAG_U32);
+    }
+
+    // Read-level tags: one per barcode + UMI
+    buf.write_u16(barcode_descs.len() as u16 + 1);
+    for desc in barcode_descs {
+        let tag_type = if desc.len <= 16 { TAG_U32 } else { TAG_U64 };
+        buf.write_tag_desc(&desc.tag_name, tag_type);
+    }
+    let umi_tag_type = if umi_len <= 16 { TAG_U32 } else { TAG_U64 };
+    buf.write_tag_desc("u", umi_tag_type);
+
+    // Alignment-level tags
+    let num_aln_tags: u16 = if with_position { 2 } else { 1 };
+    buf.write_u16(num_aln_tags);
+    buf.write_tag_desc("compressed_ori_refid", TAG_U32);
+    if with_position {
+        buf.write_tag_desc("pos", TAG_U32);
+    }
+
+    // --- File-level tag values ---
+    buf.write_u16(barcode_descs.len() as u16);
+    for desc in barcode_descs {
+        buf.write_u16(desc.len);
+    }
+    buf.write_u16(umi_len);
+    buf.write_string("sc_rna_multi_bc");
+
+    // read_length placeholder (only with_position)
+    let read_length_offset = if with_position {
+        let off = buf.len() as u64;
+        buf.write_u32(0);
+        Some(off)
+    } else {
+        None
+    };
+
+    buf.flush_to(writer)?;
+    Ok((chunk_count_offset, read_length_offset))
+}
+
+/// Write a multi-barcode single-cell RAD record.
+///
+/// `bc_packed` contains one packed barcode per level, in order matching barcode_descs.
+/// `bc_lens` contains the length in bases for each barcode (for u32/u64 dispatch).
+#[allow(clippy::too_many_arguments)]
+pub fn write_sc_record_multi_bc(
+    bc_packed: &[u64],
+    bc_lens: &[u16],
+    umi_packed: u64,
+    umi_len: u16,
+    map_type: MappingType,
+    accepted_hits: &[SimpleHit],
+    with_position: bool,
+    writer: &mut RadWriter,
+) {
+    // Number of mappings
+    writer.write_u32(accepted_hits.len() as u32);
+
+    // Write each barcode component
+    for (packed, len) in bc_packed.iter().zip(bc_lens.iter()) {
+        if *len <= 16 {
+            writer.write_u32(*packed as u32);
+        } else {
+            writer.write_u64(*packed);
+        }
+    }
+
+    // UMI
+    if umi_len <= 16 {
+        writer.write_u32(umi_packed as u32);
+    } else {
+        writer.write_u64(umi_packed);
+    }
+
+    // Per-alignment data (same as single-barcode)
+    let invert_ori = map_type == MappingType::MappedSecondOrphan;
+    for hit in accepted_hits {
+        let fw_mask: u32 = if invert_ori {
+            if hit.is_fw { 0 } else { 0x80000000 }
+        } else if hit.is_fw {
+            0x80000000
+        } else {
+            0
+        };
+        let compressed = hit.tid | fw_mask;
+        writer.write_u32(compressed);
+
+        if with_position {
+            writer.write_u32(hit.pos as u32);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -589,29 +729,20 @@ mod tests {
         let b = w.as_bytes();
         assert_eq!(b[0], 0x42);
         assert_eq!(u16::from_le_bytes([b[1], b[2]]), 0x1234);
-        assert_eq!(
-            u32::from_le_bytes([b[3], b[4], b[5], b[6]]),
-            0xDEADBEEF
-        );
+        assert_eq!(u32::from_le_bytes([b[3], b[4], b[5], b[6]]), 0xDEADBEEF);
     }
 
     #[test]
     fn test_write_at_offset() {
         let mut w = RadWriter::new();
-        w.write_u32(0); // placeholder at offset 0
+        w.write_u32(0);
         w.write_u32(0xAAAAAAAA);
 
         w.write_u32_at_offset(0, 0xBBBBBBBB);
 
         let b = w.as_bytes();
-        assert_eq!(
-            u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-            0xBBBBBBBB
-        );
-        assert_eq!(
-            u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
-            0xAAAAAAAA
-        );
+        assert_eq!(u32::from_le_bytes([b[0], b[1], b[2], b[3]]), 0xBBBBBBBB);
+        assert_eq!(u32::from_le_bytes([b[4], b[5], b[6], b[7]]), 0xAAAAAAAA);
     }
 
     #[test]
@@ -625,31 +756,20 @@ mod tests {
 
     #[test]
     fn test_pack_bases_2bit_encoding() {
-        // A=0, C=1, G=2, T=3, MSB-first
         assert_eq!(pack_bases_2bit(b"A"), 0b00);
         assert_eq!(pack_bases_2bit(b"C"), 0b01);
         assert_eq!(pack_bases_2bit(b"G"), 0b10);
         assert_eq!(pack_bases_2bit(b"T"), 0b11);
-
-        // "ACGT" → 00_01_10_11 = 0x1B
         assert_eq!(pack_bases_2bit(b"ACGT"), 0b00011011);
-
-        // "TTTT" → 11_11_11_11 = 0xFF
         assert_eq!(pack_bases_2bit(b"TTTT"), 0xFF);
-
-        // "AAAA" → 0
         assert_eq!(pack_bases_2bit(b"AAAA"), 0);
-
-        // Case insensitive
         assert_eq!(pack_bases_2bit(b"acgt"), pack_bases_2bit(b"ACGT"));
     }
 
     #[test]
     fn test_pack_bases_2bit_16mer() {
-        // 16-base barcode fits in u32 (32 bits)
         let bc = b"ACGTACGTACGTACGT";
         let packed = pack_bases_2bit(bc);
-        // Should be non-zero and fit in 32 bits
         assert!(packed > 0);
         assert!(packed <= u32::MAX as u64);
     }
@@ -661,13 +781,9 @@ mod tests {
         let (chunk_off, rlen_off) =
             write_rad_header_sc(&mut buf, 2, &names, 16, 12, false).unwrap();
 
-        // First byte should be is_paired=0, not 'R'
         assert_eq!(buf[0], 0);
-        // No magic bytes
         assert_ne!(&buf[0..4], b"RAD\x01");
-        // chunk_count_offset should point to a valid u64
         assert!(chunk_off > 0);
-        // No read_length_offset when with_position=false
         assert!(rlen_off.is_none());
     }
 
@@ -675,48 +791,43 @@ mod tests {
     fn test_sc_header_with_position() {
         let mut buf = Vec::new();
         let names = vec!["ref1"];
-        let (_, rlen_off) =
-            write_rad_header_sc(&mut buf, 1, &names, 16, 12, true).unwrap();
-
-        // Should have read_length_offset when with_position=true
+        let (_, rlen_off) = write_rad_header_sc(&mut buf, 1, &names, 16, 12, true).unwrap();
         assert!(rlen_off.is_some());
     }
 
     #[test]
     fn test_sc_record_packed_bc_umi() {
         let mut w = RadWriter::new();
-        let hits = vec![
-            SimpleHit {
-                is_fw: true,
-                tid: 42,
-                pos: 100,
-                ..SimpleHit::default()
-            },
-        ];
-        let bc_packed = pack_bases_2bit(b"ACGTACGTACGTACGT"); // 16-base BC
-        let umi_packed = pack_bases_2bit(b"ACGTACGTACGT"); // 12-base UMI
+        let hits = vec![SimpleHit {
+            is_fw: true,
+            tid: 42,
+            pos: 100,
+            ..SimpleHit::default()
+        }];
+        let bc_packed = pack_bases_2bit(b"ACGTACGTACGTACGT");
+        let umi_packed = pack_bases_2bit(b"ACGTACGTACGT");
 
         write_sc_record(
-            bc_packed, umi_packed, 16, 12,
-            MappingType::SingleMapped, &hits, false, &mut w,
+            bc_packed,
+            umi_packed,
+            16,
+            12,
+            MappingType::SingleMapped,
+            &hits,
+            false,
+            &mut w,
         );
 
         let b = w.as_bytes();
-        // num_mappings (4) + bc_packed u32 (4) + umi_packed u32 (4) + compressed (4) = 16
         assert_eq!(b.len(), 16);
-
-        // num_mappings = 1
         assert_eq!(u32::from_le_bytes([b[0], b[1], b[2], b[3]]), 1);
 
-        // bc_packed as u32 (bc_len=16 ≤ 16)
         let bc = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
         assert_eq!(bc, bc_packed as u32);
 
-        // umi_packed as u32 (umi_len=12 ≤ 16)
         let umi = u32::from_le_bytes([b[8], b[9], b[10], b[11]]);
         assert_eq!(umi, umi_packed as u32);
 
-        // compressed: tid=42, is_fw=true → 42 | 0x80000000
         let comp = u32::from_le_bytes([b[12], b[13], b[14], b[15]]);
         assert_eq!(comp, 42 | 0x80000000);
     }
@@ -724,39 +835,44 @@ mod tests {
     #[test]
     fn test_sc_second_orphan_inversion() {
         let mut w = RadWriter::new();
-        let hits = vec![
-            SimpleHit {
-                is_fw: true,
-                tid: 10,
-                pos: 50,
-                ..SimpleHit::default()
-            },
-        ];
+        let hits = vec![SimpleHit {
+            is_fw: true,
+            tid: 10,
+            pos: 50,
+            ..SimpleHit::default()
+        }];
 
         write_sc_record(
-            0, 0, 16, 12,
-            MappingType::MappedSecondOrphan, &hits, false, &mut w,
+            0,
+            0,
+            16,
+            12,
+            MappingType::MappedSecondOrphan,
+            &hits,
+            false,
+            &mut w,
         );
 
         let b = w.as_bytes();
-        // For MappedSecondOrphan, orientation is inverted:
-        // is_fw=true → fw_mask=0 (not 0x80000000)
         let comp = u32::from_le_bytes([b[12], b[13], b[14], b[15]]);
-        assert_eq!(comp, 10); // tid=10, no fw_mask
+        assert_eq!(comp, 10);
 
-        // Now test with is_fw=false → should get 0x80000000
         let mut w2 = RadWriter::new();
-        let hits2 = vec![
-            SimpleHit {
-                is_fw: false,
-                tid: 10,
-                pos: 50,
-                ..SimpleHit::default()
-            },
-        ];
+        let hits2 = vec![SimpleHit {
+            is_fw: false,
+            tid: 10,
+            pos: 50,
+            ..SimpleHit::default()
+        }];
         write_sc_record(
-            0, 0, 16, 12,
-            MappingType::MappedSecondOrphan, &hits2, false, &mut w2,
+            0,
+            0,
+            16,
+            12,
+            MappingType::MappedSecondOrphan,
+            &hits2,
+            false,
+            &mut w2,
         );
         let b2 = w2.as_bytes();
         let comp2 = u32::from_le_bytes([b2[12], b2[13], b2[14], b2[15]]);
@@ -766,7 +882,6 @@ mod tests {
     #[test]
     fn test_bulk_record_leftmost_pos() {
         let mut w = RadWriter::new();
-        // Single-mapped with negative pos → clamped to 0
         let hits = vec![SimpleHit {
             is_fw: true,
             tid: 5,
@@ -776,14 +891,11 @@ mod tests {
         write_bulk_record(MappingType::SingleMapped, &hits, &mut w);
 
         let b = w.as_bytes();
-        // num_mappings (4) + frag_map_type (1) + compressed (4) + pos (4) + frag_len (2) = 15
         assert_eq!(b.len(), 15);
 
-        // pos should be clamped to 0
         let pos = u32::from_le_bytes([b[9], b[10], b[11], b[12]]);
         assert_eq!(pos, 0);
 
-        // frag_len should be u16::MAX for non-pair
         let frag = u16::from_le_bytes([b[13], b[14]]);
         assert_eq!(frag, u16::MAX);
     }
@@ -803,17 +915,12 @@ mod tests {
         write_bulk_record(MappingType::MappedPair, &hits, &mut w);
 
         let b = w.as_bytes();
-        // num_mappings (4) + frag_map_type (1) + compressed (4) + pos (4) + frag_len (2) = 15
         assert_eq!(b.len(), 15);
-
-        // frag_map_type should be MappedPair = 4
         assert_eq!(b[4], MappingType::MappedPair as u8);
 
-        // leftmost_pos = min(100, 200) = 100
         let pos = u32::from_le_bytes([b[9], b[10], b[11], b[12]]);
         assert_eq!(pos, 100);
 
-        // frag_len = 250
         let frag = u16::from_le_bytes([b[13], b[14]]);
         assert_eq!(frag, 250);
     }
@@ -825,9 +932,7 @@ mod tests {
         let ref_lens = vec![1000u32, 2000u32];
         let chunk_off = write_rad_header_bulk(&mut buf, true, 2, &names, &ref_lens).unwrap();
 
-        // First byte should be is_paired=1
         assert_eq!(buf[0], 1);
-        // No RAD magic
         assert_ne!(&buf[0..4], b"RAD\x01");
         assert!(chunk_off > 0);
     }
@@ -837,10 +942,8 @@ mod tests {
         let mut buf = Vec::new();
         let names = vec!["chr1", "chr2"];
         let ref_lens = vec![248956422u32, 242193529u32];
-        let chunk_off =
-            write_rad_header_atac(&mut buf, 2, &names, &ref_lens, 16).unwrap();
+        let chunk_off = write_rad_header_atac(&mut buf, 2, &names, &ref_lens, 16).unwrap();
 
-        // First byte: is_paired=1
         assert_eq!(buf[0], 1);
         assert!(chunk_off > 0);
     }
@@ -857,13 +960,9 @@ mod tests {
         write_atac_record(0xABCD, 16, MappingType::SingleMapped, &hits, false, &mut w);
 
         let b = w.as_bytes();
-        // num_mappings (4) + bc u32 (4) + ref (4) + type (1) + pos (4) + frag_len (2) = 19
         assert_eq!(b.len(), 19);
-
-        // type = 1 (Single)
         assert_eq!(b[12], 1);
 
-        // pos = 1000
         let pos = u32::from_le_bytes([b[13], b[14], b[15], b[16]]);
         assert_eq!(pos, 1000);
     }
@@ -882,11 +981,9 @@ mod tests {
         write_atac_record(0, 16, MappingType::MappedPair, &hits, true, &mut w);
 
         let b = w.as_bytes();
-        // leftmost = min(100, 300) = 100, + Tn5 shift 4 = 104
         let pos = u32::from_le_bytes([b[13], b[14], b[15], b[16]]);
         assert_eq!(pos, 104);
 
-        // frag_len = 250 - 9 = 241
         let frag = u16::from_le_bytes([b[17], b[18]]);
         assert_eq!(frag, 241);
     }
@@ -894,25 +991,18 @@ mod tests {
     #[test]
     fn test_sc_record_with_position() {
         let mut w = RadWriter::new();
-        let hits = vec![
-            SimpleHit {
-                is_fw: true,
-                tid: 7,
-                pos: 42,
-                ..SimpleHit::default()
-            },
-        ];
+        let hits = vec![SimpleHit {
+            is_fw: true,
+            tid: 7,
+            pos: 42,
+            ..SimpleHit::default()
+        }];
 
-        write_sc_record(
-            0, 0, 16, 12,
-            MappingType::SingleMapped, &hits, true, &mut w,
-        );
+        write_sc_record(0, 0, 16, 12, MappingType::SingleMapped, &hits, true, &mut w);
 
         let b = w.as_bytes();
-        // num_mappings (4) + bc u32 (4) + umi u32 (4) + compressed (4) + pos (4) = 20
         assert_eq!(b.len(), 20);
 
-        // pos at the end
         let pos = u32::from_le_bytes([b[16], b[17], b[18], b[19]]);
         assert_eq!(pos, 42);
     }

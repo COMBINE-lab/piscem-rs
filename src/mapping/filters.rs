@@ -64,7 +64,11 @@ fn is_low_complexity(kmer: u64, k: u32) -> bool {
     // filled in at the bottom).  Consecutive identical bases produce zeros.
     // Mask to 2k bits to prevent the topmost nucleotide from overflowing
     // into higher bit positions and corrupting the prefix check.
-    let kmask = if k >= 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 };
+    let kmask = if k >= 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * k)) - 1
+    };
     let xor_val = (kmer ^ ((kmer << 2) | nuc)) & kmask;
 
     // Prefix check: first (k - k/2) reading-order chars all identical.
@@ -125,8 +129,7 @@ impl Iterator for CanonicalKmerIter<'_> {
 
             if let Some(bits) = base_to_bits(b) {
                 self.fw_kmer = ((self.fw_kmer << 2) | bits) & self.mask;
-                self.rc_kmer = (self.rc_kmer >> 2)
-                    | (complement_bits(bits) << (2 * (self.k - 1)));
+                self.rc_kmer = (self.rc_kmer >> 2) | (complement_bits(bits) << (2 * (self.k - 1)));
                 self.valid_bases += 1;
 
                 if self.valid_bases >= self.k {
@@ -291,7 +294,11 @@ impl<'a> PoisonState<'a> {
             };
             let ub = {
                 let max_cp = cp1.max(cp2);
-                if max_cp < contig_len - k { max_cp - 1 } else { contig_len - k }
+                if max_cp < contig_len - k {
+                    max_cp - 1
+                } else {
+                    contig_len - k
+                }
             };
 
             // Scan k-mers in the interval [current_pos, p2)

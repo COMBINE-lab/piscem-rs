@@ -9,7 +9,7 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::verify::index_compare::IndexComparisonSummary;
-use crate::verify::rad_compare::{compare_rad_files, RadComparisonSummary};
+use crate::verify::rad_compare::{RadComparisonSummary, compare_rad_files};
 
 /// Configuration for a parity check run.
 #[derive(Debug)]
@@ -57,7 +57,10 @@ pub fn run_parity(cfg: ParityConfig) -> Result<()> {
     // Try RAD comparison
     let rad_summary = {
         let rad_a = Path::new(&cfg.dataset).join("map.rad");
-        let rad_b_dir = cfg.cpp_bin_dir.as_ref().map(|d| Path::new(d).join("map.rad"));
+        let rad_b_dir = cfg
+            .cpp_bin_dir
+            .as_ref()
+            .map(|d| Path::new(d).join("map.rad"));
 
         if rad_a.exists() {
             if let Some(ref rad_b) = rad_b_dir {
@@ -108,9 +111,6 @@ pub fn run_parity(cfg: ParityConfig) -> Result<()> {
         tracing::info!(report_path, "Parity check passed");
         Ok(())
     } else {
-        anyhow::bail!(
-            "Parity check failed. See report: {}",
-            report_path
-        )
+        anyhow::bail!("Parity check failed. See report: {}", report_path)
     }
 }

@@ -21,12 +21,12 @@ use anyhow::{Context, Result, bail};
 use epserde::deser::Deserialize;
 use epserde::ser::Serialize;
 use mem_dbg::{MemSize, SizeFlags};
-use sux::bits::bit_field_vec::BitFieldVec;
-use sux::dict::elias_fano::{EliasFanoBuilder, EfSeq};
-use sux::traits::IndexedSeq;
-use value_traits::slices::{SliceByValue, SliceByValueMut};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use sux::bits::bit_field_vec::BitFieldVec;
+use sux::dict::elias_fano::{EfSeq, EliasFanoBuilder};
+use sux::traits::IndexedSeq;
+use value_traits::slices::{SliceByValue, SliceByValueMut};
 
 use super::contig_table::ceil_log2;
 
@@ -209,10 +209,8 @@ impl EqClassMap {
     /// Get the label entries for a given equivalence class.
     #[inline]
     pub fn entries_for_ec(&self, ec_id: u64) -> EcSpan<'_> {
-        let start =
-            unsafe { self.label_list_offsets.get_unchecked(ec_id as usize) };
-        let end =
-            unsafe { self.label_list_offsets.get_unchecked(ec_id as usize + 1) };
+        let start = unsafe { self.label_list_offsets.get_unchecked(ec_id as usize) };
+        let end = unsafe { self.label_list_offsets.get_unchecked(ec_id as usize + 1) };
         EcSpan {
             entries: &self.label_entries,
             start,
@@ -419,7 +417,11 @@ impl EqClassMapBuilder {
         }
 
         let ef_n = offsets.len();
-        let ef_u = if ef_n > 0 { offsets[ef_n - 1] as usize + 1 } else { 1 };
+        let ef_u = if ef_n > 0 {
+            offsets[ef_n - 1] as usize + 1
+        } else {
+            1
+        };
         let mut ef_builder = EliasFanoBuilder::new(ef_n, ef_u);
         for &v in &offsets {
             ef_builder.push(v as usize);
@@ -444,7 +446,11 @@ mod tests {
 
     #[test]
     fn test_orientation_roundtrip() {
-        for ori in [Orientation::Forward, Orientation::ReverseComplement, Orientation::Both] {
+        for ori in [
+            Orientation::Forward,
+            Orientation::ReverseComplement,
+            Orientation::Both,
+        ] {
             assert_eq!(Orientation::from_bits(ori.to_bits()), ori);
         }
     }
@@ -462,7 +468,7 @@ mod tests {
         assert_eq!(ec_entry_orientation(packed), Orientation::ReverseComplement);
 
         // transcript_id=0, orientation=BOTH → packed = (0 << 2) | 2 = 2
-        let packed = (0u64 << 2) | Orientation::Both.to_bits();
+        let packed = Orientation::Both.to_bits();
         assert_eq!(ec_entry_transcript_id(packed), 0);
         assert_eq!(ec_entry_orientation(packed), Orientation::Both);
     }
@@ -473,8 +479,20 @@ mod tests {
         let mut builder = EqClassMapBuilder::new(5);
 
         // Tiles 0, 2 share the same label: {(0, FW), (1, RC)}
-        builder.add_tile(0, vec![(0, Orientation::Forward), (1, Orientation::ReverseComplement)]);
-        builder.add_tile(2, vec![(1, Orientation::ReverseComplement), (0, Orientation::Forward)]); // same after sort
+        builder.add_tile(
+            0,
+            vec![
+                (0, Orientation::Forward),
+                (1, Orientation::ReverseComplement),
+            ],
+        );
+        builder.add_tile(
+            2,
+            vec![
+                (1, Orientation::ReverseComplement),
+                (0, Orientation::Forward),
+            ],
+        ); // same after sort
 
         // Tile 1: {(2, Both)}
         builder.add_tile(1, vec![(2, Orientation::Both)]);
@@ -508,7 +526,10 @@ mod tests {
         assert_eq!(ec_entry_transcript_id(entries[0]), 0);
         assert_eq!(ec_entry_orientation(entries[0]), Orientation::Forward);
         assert_eq!(ec_entry_transcript_id(entries[1]), 1);
-        assert_eq!(ec_entry_orientation(entries[1]), Orientation::ReverseComplement);
+        assert_eq!(
+            ec_entry_orientation(entries[1]),
+            Orientation::ReverseComplement
+        );
 
         // Check entries for tile 1's EC
         let span1 = ec_map.entries_for_tile(1);
@@ -564,9 +585,21 @@ mod tests {
     #[test]
     fn test_serialization_roundtrip() {
         let mut builder = EqClassMapBuilder::new(5);
-        builder.add_tile(0, vec![(0, Orientation::Forward), (1, Orientation::ReverseComplement)]);
+        builder.add_tile(
+            0,
+            vec![
+                (0, Orientation::Forward),
+                (1, Orientation::ReverseComplement),
+            ],
+        );
         builder.add_tile(1, vec![(2, Orientation::Both)]);
-        builder.add_tile(2, vec![(0, Orientation::Forward), (1, Orientation::ReverseComplement)]);
+        builder.add_tile(
+            2,
+            vec![
+                (0, Orientation::Forward),
+                (1, Orientation::ReverseComplement),
+            ],
+        );
         builder.add_tile(3, vec![(0, Orientation::Forward)]);
         builder.add_tile(4, vec![(0, Orientation::Forward)]);
         let ec_map = builder.build();
@@ -613,7 +646,13 @@ mod tests {
     #[test]
     fn test_large_transcript_ids() {
         let mut builder = EqClassMapBuilder::new(2);
-        builder.add_tile(0, vec![(200_000, Orientation::Forward), (199_999, Orientation::ReverseComplement)]);
+        builder.add_tile(
+            0,
+            vec![
+                (200_000, Orientation::Forward),
+                (199_999, Orientation::ReverseComplement),
+            ],
+        );
         builder.add_tile(1, vec![(0, Orientation::Both)]);
         let ec_map = builder.build();
 
@@ -622,7 +661,10 @@ mod tests {
         // After sorting by (tid, ori): (199_999, RC), (200_000, FW)
         let entries: Vec<u64> = span.iter().collect();
         assert_eq!(ec_entry_transcript_id(entries[0]), 199_999);
-        assert_eq!(ec_entry_orientation(entries[0]), Orientation::ReverseComplement);
+        assert_eq!(
+            ec_entry_orientation(entries[0]),
+            Orientation::ReverseComplement
+        );
         assert_eq!(ec_entry_transcript_id(entries[1]), 200_000);
         assert_eq!(ec_entry_orientation(entries[1]), Orientation::Forward);
     }

@@ -22,13 +22,10 @@ use piscem_rs::verify::rad_compare::compare_bulk_rad_full;
 // Paths
 // ---------------------------------------------------------------------------
 
-const CFISH_PREFIX: &str =
-    "test_data/gencode_pc_v44_dbg/gencode_pc_v44_index_cfish";
-const CPP_INDEX_PREFIX: &str =
-    "test_data/gencode_pc_v44_index_cpp_from_dbg/gencode_pc_v44_index";
+const CFISH_PREFIX: &str = "test_data/gencode_pc_v44_dbg/gencode_pc_v44_index_cfish";
+const CPP_INDEX_PREFIX: &str = "test_data/gencode_pc_v44_index_cpp_from_dbg/gencode_pc_v44_index";
 const RUST_INDEX_DIR: &str = "test_data/gencode_pc_v44_index_rust";
-const RUST_INDEX_PREFIX: &str =
-    "test_data/gencode_pc_v44_index_rust/gencode_pc_v44_index";
+const RUST_INDEX_PREFIX: &str = "test_data/gencode_pc_v44_index_rust/gencode_pc_v44_index";
 const READ1: &str = "test_data/sim_1M_1.fq.gz";
 const READ2: &str = "test_data/sim_1M_2.fq.gz";
 const CPP_BULK_BIN: &str = "piscem-cpp/build/pesc-bulk";
@@ -53,17 +50,21 @@ fn ensure_cpp_index() -> Result<()> {
     }
 
     eprintln!("Building C++ index from cuttlefish output...");
-    std::fs::create_dir_all(CPP_INDEX_DIR)
-        .context("creating C++ index directory")?;
+    std::fs::create_dir_all(CPP_INDEX_DIR).context("creating C++ index directory")?;
 
     let status = Command::new(CPP_BUILD_BIN)
-        .arg("-i").arg(CFISH_PREFIX)
-        .arg("-k").arg("31")
-        .arg("-m").arg("19")
-        .arg("-o").arg(CPP_INDEX_PREFIX)
+        .arg("-i")
+        .arg(CFISH_PREFIX)
+        .arg("-k")
+        .arg("31")
+        .arg("-m")
+        .arg("19")
+        .arg("-o")
+        .arg(CPP_INDEX_PREFIX)
         .arg("--canonical")
         .arg("--build-ec-table")
-        .arg("-t").arg("4")
+        .arg("-t")
+        .arg("4")
         .arg("--quiet")
         .status()
         .context("failed to run C++ index builder")?;
@@ -83,8 +84,7 @@ fn ensure_rust_index() -> Result<()> {
     }
 
     eprintln!("Building Rust index from cuttlefish output...");
-    std::fs::create_dir_all(RUST_INDEX_DIR)
-        .context("creating rust index directory")?;
+    std::fs::create_dir_all(RUST_INDEX_DIR).context("creating rust index directory")?;
 
     let config = BuildConfig {
         input_prefix: PathBuf::from(CFISH_PREFIX),
@@ -104,17 +104,18 @@ fn ensure_rust_index() -> Result<()> {
 }
 
 /// Run the C++ bulk mapper.
-fn run_cpp_bulk(
-    output_stem: &Path,
-    threads: usize,
-    no_poison: bool,
-) -> Result<()> {
+fn run_cpp_bulk(output_stem: &Path, threads: usize, no_poison: bool) -> Result<()> {
     let mut cmd = Command::new(CPP_BULK_BIN);
-    cmd.arg("-i").arg(CPP_INDEX_PREFIX)
-        .arg("-o").arg(output_stem)
-        .arg("-t").arg(threads.to_string())
-        .arg("-1").arg(READ1)
-        .arg("-2").arg(READ2)
+    cmd.arg("-i")
+        .arg(CPP_INDEX_PREFIX)
+        .arg("-o")
+        .arg(output_stem)
+        .arg("-t")
+        .arg(threads.to_string())
+        .arg("-1")
+        .arg(READ1)
+        .arg("-2")
+        .arg(READ2)
         .arg("--quiet");
     if no_poison {
         cmd.arg("--no-poison");
@@ -144,11 +145,16 @@ fn run_rust_bulk(
 
     let mut cmd = Command::new(&bin);
     cmd.arg("map-bulk")
-        .arg("-i").arg(index_prefix)
-        .arg("-o").arg(output_dir)
-        .arg("-t").arg(threads.to_string())
-        .arg("-1").arg(READ1)
-        .arg("-2").arg(READ2);
+        .arg("-i")
+        .arg(index_prefix)
+        .arg("-o")
+        .arg(output_dir)
+        .arg("-t")
+        .arg(threads.to_string())
+        .arg("-1")
+        .arg(READ1)
+        .arg("-2")
+        .arg(READ2);
     if no_poison {
         cmd.arg("--no-poison");
     }
@@ -195,19 +201,25 @@ fn bulk_pe_rad_parity() {
 
     // 3. Run both mappers with 1 thread for determinism
     run_cpp_bulk(&cpp_out_stem, 1, true).expect("C++ mapper failed");
-    run_rust_bulk(&rust_out_stem, RUST_INDEX_PREFIX, 1, true)
-        .expect("Rust mapper failed");
+    run_rust_bulk(&rust_out_stem, RUST_INDEX_PREFIX, 1, true).expect("Rust mapper failed");
 
     // 4. Compare RAD files
     let cpp_rad = cpp_out_stem.with_extension("rad");
     let rust_rad = rust_out_stem.with_extension("rad");
 
-    assert!(cpp_rad.exists(), "C++ RAD file not found: {}", cpp_rad.display());
-    assert!(rust_rad.exists(), "Rust RAD file not found: {}", rust_rad.display());
+    assert!(
+        cpp_rad.exists(),
+        "C++ RAD file not found: {}",
+        cpp_rad.display()
+    );
+    assert!(
+        rust_rad.exists(),
+        "Rust RAD file not found: {}",
+        rust_rad.display()
+    );
 
     eprintln!("Comparing RAD files...");
-    let result = compare_bulk_rad_full(&cpp_rad, &rust_rad)
-        .expect("failed to compare RAD files");
+    let result = compare_bulk_rad_full(&cpp_rad, &rust_rad).expect("failed to compare RAD files");
 
     eprintln!("Comparison result:");
     eprintln!("  Header match: {}", result.header_match);
@@ -217,7 +229,10 @@ fn bulk_pe_rad_parity() {
     eprintln!("  Missing in A: {}", result.missing_in_a);
     eprintln!("  Missing in B: {}", result.missing_in_b);
     eprintln!("  Mismatch categories (A-only records):");
-    eprintln!("    Same targets, diff detail: {}", result.same_targets_diff_detail);
+    eprintln!(
+        "    Same targets, diff detail: {}",
+        result.same_targets_diff_detail
+    );
     eprintln!("    Different targets: {}", result.different_targets);
     eprintln!("    Diff position only: {}", result.diff_pos_only);
     eprintln!("    Diff frag_len only: {}", result.diff_frag_len_only);
@@ -263,8 +278,10 @@ fn bulk_pe_rad_parity() {
     } else {
         0.0
     };
-    eprintln!("  Record match rate: {:.2}% ({}/{})",
-        match_rate, result.matching_records, result.total_records_a);
+    eprintln!(
+        "  Record match rate: {:.2}% ({}/{})",
+        match_rate, result.matching_records, result.total_records_a
+    );
 
     // Assert reasonable record-level parity.
     // Not 100% due to SSHash dictionary implementation differences
@@ -302,18 +319,22 @@ fn bulk_pe_rad_parity_multithreaded() {
 
     // Run with 4 threads — record order will differ but multisets should match
     run_cpp_bulk(&cpp_out_stem, 4, true).expect("C++ mapper failed");
-    run_rust_bulk(&rust_out_stem, RUST_INDEX_PREFIX, 4, true)
-        .expect("Rust mapper failed");
+    run_rust_bulk(&rust_out_stem, RUST_INDEX_PREFIX, 4, true).expect("Rust mapper failed");
 
     let cpp_rad = cpp_out_stem.with_extension("rad");
     let rust_rad = rust_out_stem.with_extension("rad");
 
-    let result = compare_bulk_rad_full(&cpp_rad, &rust_rad)
-        .expect("failed to compare RAD files");
+    let result = compare_bulk_rad_full(&cpp_rad, &rust_rad).expect("failed to compare RAD files");
 
     eprintln!("Multithreaded comparison:");
-    eprintln!("  Records A: {}, Records B: {}", result.total_records_a, result.total_records_b);
-    eprintln!("  Matching: {}, Notes: {}", result.matching_records, result.notes);
+    eprintln!(
+        "  Records A: {}, Records B: {}",
+        result.total_records_a, result.total_records_b
+    );
+    eprintln!(
+        "  Matching: {}, Notes: {}",
+        result.matching_records, result.notes
+    );
 
     assert!(result.header_match, "Header mismatch: {}", result.notes);
 
@@ -356,14 +377,20 @@ fn bulk_pe_rad_parity_strict() {
 
     // Run C++ mapper with strict
     let status = Command::new(CPP_BULK_BIN)
-        .arg("-i").arg(CPP_INDEX_PREFIX)
-        .arg("-o").arg(&cpp_out_stem)
-        .arg("-t").arg("1")
-        .arg("-1").arg(READ1)
-        .arg("-2").arg(READ2)
+        .arg("-i")
+        .arg(CPP_INDEX_PREFIX)
+        .arg("-o")
+        .arg(&cpp_out_stem)
+        .arg("-t")
+        .arg("1")
+        .arg("-1")
+        .arg(READ1)
+        .arg("-2")
+        .arg(READ2)
         .arg("--quiet")
         .arg("--no-poison")
-        .arg("--skipping-strategy").arg("strict")
+        .arg("--skipping-strategy")
+        .arg("strict")
         .status()
         .expect("failed to run C++ bulk mapper");
     assert!(status.success(), "C++ strict mapper failed");
@@ -376,13 +403,19 @@ fn bulk_pe_rad_parity_strict() {
     };
     let status = Command::new(&bin)
         .arg("map-bulk")
-        .arg("-i").arg(RUST_INDEX_PREFIX)
-        .arg("-o").arg(&rust_out_stem)
-        .arg("-t").arg("1")
-        .arg("-1").arg(READ1)
-        .arg("-2").arg(READ2)
+        .arg("-i")
+        .arg(RUST_INDEX_PREFIX)
+        .arg("-o")
+        .arg(&rust_out_stem)
+        .arg("-t")
+        .arg("1")
+        .arg("-1")
+        .arg(READ1)
+        .arg("-2")
+        .arg(READ2)
         .arg("--no-poison")
-        .arg("--skipping-strategy").arg("strict")
+        .arg("--skipping-strategy")
+        .arg("strict")
         .status()
         .expect("failed to run Rust bulk mapper");
     assert!(status.success(), "Rust strict mapper failed");
@@ -391,8 +424,7 @@ fn bulk_pe_rad_parity_strict() {
     let rust_rad = rust_out_stem.with_extension("rad");
 
     eprintln!("Comparing STRICT mode RAD files...");
-    let result = compare_bulk_rad_full(&cpp_rad, &rust_rad)
-        .expect("failed to compare RAD files");
+    let result = compare_bulk_rad_full(&cpp_rad, &rust_rad).expect("failed to compare RAD files");
 
     eprintln!("STRICT mode comparison:");
     eprintln!("  Records A (C++): {}", result.total_records_a);
@@ -401,7 +433,10 @@ fn bulk_pe_rad_parity_strict() {
     eprintln!("  Missing in A: {}", result.missing_in_a);
     eprintln!("  Missing in B: {}", result.missing_in_b);
     eprintln!("  Mismatch categories (A-only records):");
-    eprintln!("    Same targets, diff detail: {}", result.same_targets_diff_detail);
+    eprintln!(
+        "    Same targets, diff detail: {}",
+        result.same_targets_diff_detail
+    );
     eprintln!("    Different targets: {}", result.different_targets);
     eprintln!("    Diff position only: {}", result.diff_pos_only);
     eprintln!("    Diff frag_len only: {}", result.diff_frag_len_only);
@@ -432,8 +467,7 @@ fn se_rad_parity() {
     }
 
     eprintln!("Comparing SE RAD files...");
-    let result = compare_bulk_rad_full(&cpp_rad, &rust_rad)
-        .expect("failed to compare RAD files");
+    let result = compare_bulk_rad_full(&cpp_rad, &rust_rad).expect("failed to compare RAD files");
 
     eprintln!("SE Comparison result:");
     eprintln!("  Header match: {}", result.header_match);
@@ -443,7 +477,10 @@ fn se_rad_parity() {
     eprintln!("  Missing in A: {}", result.missing_in_a);
     eprintln!("  Missing in B: {}", result.missing_in_b);
     eprintln!("  Mismatch categories (A-only records):");
-    eprintln!("    Same targets, diff detail: {}", result.same_targets_diff_detail);
+    eprintln!(
+        "    Same targets, diff detail: {}",
+        result.same_targets_diff_detail
+    );
     eprintln!("    Different targets: {}", result.different_targets);
     eprintln!("    Diff position only: {}", result.diff_pos_only);
     eprintln!("    Diff frag_len only: {}", result.diff_frag_len_only);
@@ -473,8 +510,8 @@ fn se_rad_parity() {
 #[test]
 #[ignore]
 fn kmer_dump_rust() {
-    use sshash_lib::dispatch_on_k;
     use piscem_rs::index::reference_index::ReferenceIndex;
+    use sshash_lib::dispatch_on_k;
 
     let max_reads: usize = std::env::var("KMER_DUMP_READS")
         .ok()
@@ -485,9 +522,8 @@ fn kmer_dump_rust() {
         ensure_rust_index().expect("failed to build Rust index");
     }
 
-    let index = ReferenceIndex::load(
-        Path::new(RUST_INDEX_PREFIX), false, false
-    ).expect("failed to load Rust index");
+    let index = ReferenceIndex::load(Path::new(RUST_INDEX_PREFIX), false, false)
+        .expect("failed to load Rust index");
     let k = index.k();
     eprintln!("Rust index loaded: k={}, refs={}", k, index.num_refs());
 
@@ -495,7 +531,10 @@ fn kmer_dump_rust() {
     // Generate with: gzcat test_data/sim_1M_1.fq.gz | head -20 > /tmp/first_reads.fq
     let fq_path = "/tmp/first_reads.fq";
     if !Path::new(fq_path).exists() {
-        eprintln!("SKIP: {} not found. Generate with: gzcat test_data/sim_1M_1.fq.gz | head -20 > /tmp/first_reads.fq", fq_path);
+        eprintln!(
+            "SKIP: {} not found. Generate with: gzcat test_data/sim_1M_1.fq.gz | head -20 > /tmp/first_reads.fq",
+            fq_path
+        );
         return;
     }
     let file = std::fs::File::open(fq_path).expect("failed to open FASTQ");
@@ -526,7 +565,11 @@ fn kmer_dump_rust() {
         eprintln!("ERROR: no sequences read");
         return;
     }
-    eprintln!("First seq ({}bp): {}...", sequences[0].len(), &sequences[0][..40.min(sequences[0].len())]);
+    eprintln!(
+        "First seq ({}bp): {}...",
+        sequences[0].len(),
+        &sequences[0][..40.min(sequences[0].len())]
+    );
 
     dispatch_on_k!(k, K => {
         kmer_dump_inner::<K>(&index, &sequences);
@@ -555,9 +598,9 @@ fn kmer_dump_inner<const K: usize>(
             let kmer_bytes = &seq_bytes[i..i + k];
 
             // Skip if contains non-ACGT
-            let has_invalid = kmer_bytes.iter().any(|&b| {
-                !matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't')
-            });
+            let has_invalid = kmer_bytes
+                .iter()
+                .any(|&b| !matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't'));
             if has_invalid {
                 eprintln!("  pos={} NOT_FOUND (invalid)", i);
                 query.reset();
@@ -618,7 +661,11 @@ fn kmer_dump_inner<const K: usize>(
                         " *** DIRECT_HIT cid={} cpos={} ori={}",
                         direct_result.string_id,
                         direct_result.kmer_id_in_string,
-                        if direct_result.kmer_orientation > 0 { "fw" } else { "rc" }
+                        if direct_result.kmer_orientation > 0 {
+                            "fw"
+                        } else {
+                            "rc"
+                        }
                     );
                 } else {
                     eprint!(" *** DIRECT_MISS");
@@ -639,8 +686,8 @@ fn kmer_dump_inner<const K: usize>(
 #[test]
 #[ignore]
 fn hit_dump_rust() {
-    use sshash_lib::dispatch_on_k;
     use piscem_rs::index::reference_index::ReferenceIndex;
+    use sshash_lib::dispatch_on_k;
 
     let max_reads: usize = std::env::var("HIT_DUMP_READS")
         .ok()
@@ -653,9 +700,8 @@ fn hit_dump_rust() {
         ensure_rust_index().expect("failed to build Rust index");
     }
 
-    let index = ReferenceIndex::load(
-        Path::new(RUST_INDEX_PREFIX), true, false
-    ).expect("failed to load Rust index");
+    let index = ReferenceIndex::load(Path::new(RUST_INDEX_PREFIX), true, false)
+        .expect("failed to load Rust index");
     let k = index.k();
     eprintln!("Rust index loaded: k={}, refs={}", k, index.num_refs());
     eprintln!("Strategy: {}", strat_str);
@@ -767,19 +813,27 @@ fn dump_rad_records() {
     let rust_rad = std::path::PathBuf::from("/tmp/debug_rust/map.rad");
 
     if !cpp_rad.exists() || !rust_rad.exists() {
-        eprintln!("SKIP: debug RAD files not found. Run both mappers on /tmp/single_pair_*.fq first.");
+        eprintln!(
+            "SKIP: debug RAD files not found. Run both mappers on /tmp/single_pair_*.fq first."
+        );
         return;
     }
 
-    let (prelude_a, records_a) = read_bulk_rad_records(&cpp_rad)
-        .expect("failed to read C++ RAD");
-    let (prelude_b, records_b) = read_bulk_rad_records(&rust_rad)
-        .expect("failed to read Rust RAD");
+    let (prelude_a, records_a) = read_bulk_rad_records(&cpp_rad).expect("failed to read C++ RAD");
+    let (prelude_b, records_b) = read_bulk_rad_records(&rust_rad).expect("failed to read Rust RAD");
 
-    eprintln!("C++ RAD: {} records, {} refs, paired={}",
-        records_a.len(), prelude_a.hdr.ref_count, prelude_a.hdr.is_paired);
-    eprintln!("Rust RAD: {} records, {} refs, paired={}",
-        records_b.len(), prelude_b.hdr.ref_count, prelude_b.hdr.is_paired);
+    eprintln!(
+        "C++ RAD: {} records, {} refs, paired={}",
+        records_a.len(),
+        prelude_a.hdr.ref_count,
+        prelude_a.hdr.is_paired
+    );
+    eprintln!(
+        "Rust RAD: {} records, {} refs, paired={}",
+        records_b.len(),
+        prelude_b.hdr.ref_count,
+        prelude_b.hdr.is_paired
+    );
 
     // Build ref name lookup for A
     let ref_names_a = &prelude_a.hdr.ref_names;
@@ -787,7 +841,8 @@ fn dump_rad_records() {
 
     // Build B→A ref ID translation
     let name_to_id_a: std::collections::HashMap<&str, u32> = ref_names_a
-        .iter().enumerate()
+        .iter()
+        .enumerate()
         .map(|(i, n)| (n.as_str(), i as u32))
         .collect();
 
@@ -798,10 +853,18 @@ fn dump_rad_records() {
             let name = if (ref_id as usize) < ref_names_a.len() {
                 // Truncate long names
                 let full = &ref_names_a[ref_id as usize];
-                if full.len() > 40 { &full[..40] } else { full.as_str() }
-            } else { "?" };
-            eprintln!("  aln[{}]: ref={} ({}) ori={} pos={} flen={}",
-                j, ref_id, name, ori, pos, flen);
+                if full.len() > 40 {
+                    &full[..40]
+                } else {
+                    full.as_str()
+                }
+            } else {
+                "?"
+            };
+            eprintln!(
+                "  aln[{}]: ref={} ({}) ori={} pos={} flen={}",
+                j, ref_id, name, ori, pos, flen
+            );
         }
     }
 
@@ -811,16 +874,27 @@ fn dump_rad_records() {
         for (j, &(ref_id, ori, pos, flen)) in rec.alignments.iter().enumerate() {
             let name = if (ref_id as usize) < ref_names_b.len() {
                 let full = &ref_names_b[ref_id as usize];
-                if full.len() > 40 { &full[..40] } else { full.as_str() }
-            } else { "?" };
+                if full.len() > 40 {
+                    &full[..40]
+                } else {
+                    full.as_str()
+                }
+            } else {
+                "?"
+            };
             // Translate to A's ref ID for comparison
-            let a_id = name_to_id_a.get(
-                if (ref_id as usize) < ref_names_b.len() {
+            let a_id = name_to_id_a
+                .get(if (ref_id as usize) < ref_names_b.len() {
                     ref_names_b[ref_id as usize].as_str()
-                } else { "" }
-            ).copied().unwrap_or(u32::MAX);
-            eprintln!("  aln[{}]: ref={} (a_id={}) ({}) ori={} pos={} flen={}",
-                j, ref_id, a_id, name, ori, pos, flen);
+                } else {
+                    ""
+                })
+                .copied()
+                .unwrap_or(u32::MAX);
+            eprintln!(
+                "  aln[{}]: ref={} (a_id={}) ({}) ori={} pos={} flen={}",
+                j, ref_id, a_id, name, ori, pos, flen
+            );
         }
     }
 
@@ -887,9 +961,12 @@ fn ensure_rust_poison_table() -> Result<()> {
 
     let status = Command::new(&bin)
         .arg("build-poison")
-        .arg("-i").arg(RUST_INDEX_PREFIX)
-        .arg("-d").arg(DECOY_FASTA)
-        .arg("-t").arg("4")
+        .arg("-i")
+        .arg(RUST_INDEX_PREFIX)
+        .arg("-d")
+        .arg(DECOY_FASTA)
+        .arg("-t")
+        .arg("4")
         .status()
         .context("failed to run Rust poison table builder")?;
     if !status.success() {
@@ -920,7 +997,10 @@ fn bulk_pe_rad_parity_with_poison() {
         return;
     }
     if !Path::new(&format!("{CPP_INDEX_WITH_POISON_PREFIX}.sshash")).exists() {
-        eprintln!("SKIP: C++ index with poison not found at {}", CPP_INDEX_WITH_POISON_PREFIX);
+        eprintln!(
+            "SKIP: C++ index with poison not found at {}",
+            CPP_INDEX_WITH_POISON_PREFIX
+        );
         return;
     }
     if !Path::new(&format!("{CFISH_PREFIX}.cf_seg")).exists() {
@@ -937,12 +1017,10 @@ fn bulk_pe_rad_parity_with_poison() {
     let rust_stats_path = format!("{RUST_INDEX_PREFIX}.poison.json");
 
     if Path::new(&cpp_stats_path).exists() && Path::new(&rust_stats_path).exists() {
-        let cpp_json: serde_json::Value = serde_json::from_reader(
-            std::fs::File::open(&cpp_stats_path).unwrap()
-        ).unwrap();
-        let rust_json: serde_json::Value = serde_json::from_reader(
-            std::fs::File::open(&rust_stats_path).unwrap()
-        ).unwrap();
+        let cpp_json: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(&cpp_stats_path).unwrap()).unwrap();
+        let rust_json: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(&rust_stats_path).unwrap()).unwrap();
 
         let cpp_nk = cpp_json["num_poison_kmers"].as_u64().unwrap_or(0);
         let cpp_no = cpp_json["num_poison_occs"].as_u64().unwrap_or(0);
@@ -963,7 +1041,8 @@ fn bulk_pe_rad_parity_with_poison() {
         assert!(
             kmer_ratio > 0.90 && kmer_ratio < 1.10,
             "Poison k-mer count differs by more than 10%: C++={}, Rust={}",
-            cpp_nk, rust_nk,
+            cpp_nk,
+            rust_nk,
         );
     }
 
@@ -973,8 +1052,7 @@ fn bulk_pe_rad_parity_with_poison() {
     let rust_out_stem = tmpdir.path().join("rust_out");
 
     // 4. Run both mappers WITH poison (not passing --no-poison)
-    run_cpp_bulk_with_poison_index(&cpp_out_stem, 1)
-        .expect("C++ mapper with poison failed");
+    run_cpp_bulk_with_poison_index(&cpp_out_stem, 1).expect("C++ mapper with poison failed");
     run_rust_bulk(&rust_out_stem, RUST_INDEX_PREFIX, 1, false)
         .expect("Rust mapper with poison failed");
 
@@ -982,12 +1060,19 @@ fn bulk_pe_rad_parity_with_poison() {
     let cpp_rad = cpp_out_stem.with_extension("rad");
     let rust_rad = rust_out_stem.with_extension("rad");
 
-    assert!(cpp_rad.exists(), "C++ RAD file not found: {}", cpp_rad.display());
-    assert!(rust_rad.exists(), "Rust RAD file not found: {}", rust_rad.display());
+    assert!(
+        cpp_rad.exists(),
+        "C++ RAD file not found: {}",
+        cpp_rad.display()
+    );
+    assert!(
+        rust_rad.exists(),
+        "Rust RAD file not found: {}",
+        rust_rad.display()
+    );
 
     eprintln!("Comparing RAD files (with poison filtering)...");
-    let result = compare_bulk_rad_full(&cpp_rad, &rust_rad)
-        .expect("failed to compare RAD files");
+    let result = compare_bulk_rad_full(&cpp_rad, &rust_rad).expect("failed to compare RAD files");
 
     eprintln!("Poison comparison result:");
     eprintln!("  Header match: {}", result.header_match);
@@ -997,7 +1082,10 @@ fn bulk_pe_rad_parity_with_poison() {
     eprintln!("  Missing in A: {}", result.missing_in_a);
     eprintln!("  Missing in B: {}", result.missing_in_b);
     eprintln!("  Mismatch categories:");
-    eprintln!("    Same targets, diff detail: {}", result.same_targets_diff_detail);
+    eprintln!(
+        "    Same targets, diff detail: {}",
+        result.same_targets_diff_detail
+    );
     eprintln!("    Different targets: {}", result.different_targets);
     eprintln!("    Diff position only: {}", result.diff_pos_only);
     eprintln!("    Diff frag_len only: {}", result.diff_frag_len_only);
@@ -1021,8 +1109,10 @@ fn bulk_pe_rad_parity_with_poison() {
     } else {
         0.0
     };
-    eprintln!("  Record match rate: {:.2}% ({}/{})",
-        match_rate, result.matching_records, result.total_records_a);
+    eprintln!(
+        "  Record match rate: {:.2}% ({}/{})",
+        match_rate, result.matching_records, result.total_records_a
+    );
 
     // Poison filtering may cause more divergence since the poison tables
     // themselves may differ slightly. Accept a somewhat lower threshold.
@@ -1035,16 +1125,18 @@ fn bulk_pe_rad_parity_with_poison() {
 }
 
 /// Run the C++ bulk mapper using the pre-built C++ index with poison.
-fn run_cpp_bulk_with_poison_index(
-    output_stem: &Path,
-    threads: usize,
-) -> Result<()> {
+fn run_cpp_bulk_with_poison_index(output_stem: &Path, threads: usize) -> Result<()> {
     let mut cmd = Command::new(CPP_BULK_BIN);
-    cmd.arg("-i").arg(CPP_INDEX_WITH_POISON_PREFIX)
-        .arg("-o").arg(output_stem)
-        .arg("-t").arg(threads.to_string())
-        .arg("-1").arg(READ1)
-        .arg("-2").arg(READ2)
+    cmd.arg("-i")
+        .arg(CPP_INDEX_WITH_POISON_PREFIX)
+        .arg("-o")
+        .arg(output_stem)
+        .arg("-t")
+        .arg(threads.to_string())
+        .arg("-1")
+        .arg(READ1)
+        .arg("-2")
+        .arg(READ2)
         .arg("--quiet");
     // Note: NOT passing --no-poison
     eprintln!("Running C++ mapper with poison: {:?}", cmd);
@@ -1070,11 +1162,16 @@ const RUST_INDEX_OPT_PREFIX: &str =
 /// Run the C++ bulk mapper with `--struct-constraints`.
 fn run_cpp_bulk_struct_constraints(output_stem: &Path, threads: usize) -> Result<()> {
     let mut cmd = Command::new(CPP_BULK_BIN);
-    cmd.arg("-i").arg(CPP_INDEX_NOPOISON_PREFIX)
-        .arg("-o").arg(output_stem)
-        .arg("-t").arg(threads.to_string())
-        .arg("-1").arg(READ1)
-        .arg("-2").arg(READ2)
+    cmd.arg("-i")
+        .arg(CPP_INDEX_NOPOISON_PREFIX)
+        .arg("-o")
+        .arg(output_stem)
+        .arg("-t")
+        .arg(threads.to_string())
+        .arg("-1")
+        .arg(READ1)
+        .arg("-2")
+        .arg(READ2)
         .arg("--no-poison")
         .arg("--struct-constraints")
         .arg("--quiet");
@@ -1099,11 +1196,16 @@ fn run_rust_bulk_struct_constraints(output_stem: &Path, threads: usize) -> Resul
 
     let mut cmd = Command::new(&bin);
     cmd.arg("map-bulk")
-        .arg("-i").arg(RUST_INDEX_OPT_PREFIX)
-        .arg("-o").arg(output_stem)
-        .arg("-t").arg(threads.to_string())
-        .arg("-1").arg(READ1)
-        .arg("-2").arg(READ2)
+        .arg("-i")
+        .arg(RUST_INDEX_OPT_PREFIX)
+        .arg("-o")
+        .arg(output_stem)
+        .arg("-t")
+        .arg(threads.to_string())
+        .arg("-1")
+        .arg(READ1)
+        .arg("-2")
+        .arg(READ2)
         .arg("--no-poison")
         .arg("--struct-constraints");
     eprintln!("Running Rust mapper (struct-constraints): {:?}", cmd);
@@ -1155,12 +1257,19 @@ fn bulk_pe_rad_parity_struct_constraints() {
     let cpp_rad = cpp_out_stem.with_extension("rad");
     let rust_rad = rust_out_stem.with_extension("rad");
 
-    assert!(cpp_rad.exists(), "C++ RAD file not found: {}", cpp_rad.display());
-    assert!(rust_rad.exists(), "Rust RAD file not found: {}", rust_rad.display());
+    assert!(
+        cpp_rad.exists(),
+        "C++ RAD file not found: {}",
+        cpp_rad.display()
+    );
+    assert!(
+        rust_rad.exists(),
+        "Rust RAD file not found: {}",
+        rust_rad.display()
+    );
 
     eprintln!("Comparing RAD files (struct-constraints)...");
-    let result = compare_bulk_rad_full(&cpp_rad, &rust_rad)
-        .expect("failed to compare RAD files");
+    let result = compare_bulk_rad_full(&cpp_rad, &rust_rad).expect("failed to compare RAD files");
 
     eprintln!("Struct-constraints comparison result:");
     eprintln!("  Header match: {}", result.header_match);
@@ -1170,7 +1279,10 @@ fn bulk_pe_rad_parity_struct_constraints() {
     eprintln!("  Missing in A: {}", result.missing_in_a);
     eprintln!("  Missing in B: {}", result.missing_in_b);
     eprintln!("  Mismatch categories:");
-    eprintln!("    Same targets, diff detail: {}", result.same_targets_diff_detail);
+    eprintln!(
+        "    Same targets, diff detail: {}",
+        result.same_targets_diff_detail
+    );
     eprintln!("    Different targets: {}", result.different_targets);
     eprintln!("    Diff position only: {}", result.diff_pos_only);
     eprintln!("    Diff frag_len only: {}", result.diff_frag_len_only);
@@ -1209,8 +1321,8 @@ fn bulk_pe_rad_parity_struct_constraints() {
 
 #[test]
 fn resolve_refs() {
-    use std::io::BufReader;
     use libradicl::header::RadPrelude;
+    use std::io::BufReader;
     let f = std::fs::File::open("/tmp/cpp_poison_new.rad").unwrap();
     let mut r = BufReader::new(f);
     let prelude = RadPrelude::from_bytes(&mut r).unwrap();

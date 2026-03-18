@@ -1,77 +1,148 @@
 #!/usr/bin/env bash
-# publish.sh — publish piscem-rs to crates.io and create a git tag.
-#
-# Usage:
-#   ./publish.sh              # dry-run (no publish, no tag)
-#   ./publish.sh --publish    # publish to crates.io, commit tag, push
-#
-# The version is read from Cargo.toml — bump it before running this script.
-
 set -euo pipefail
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+die() {
+    echo "error: $*" >&2
+    exit 1
+}
 
-die() { echo "error: $*" >&2; exit 1; }
+usage() {
+    cat <<'EOF'
+Usage:
+  ./publish.sh <version> [--publish] [--dry-run]
+  ./publish.sh [--publish] [--dry-run] <version>
 
-# ── args ─────────────────────────────────────────────────────────────────────
+Options:
+  --publish  Publish piscem-rs after bumping and committing
+  --dry-run  Show what would be done without modifying files, creating commits, tags, or publishing
+  -h, --help Show this help message
+EOF
+}
 
+print_cmd() {
+    printf '+'
+    printf ' %q' "$@"
+    printf '\n'
+}
+
+run() {
+    print_cmd "$@"
+    if [[ "$DRY_RUN" == true ]]; then
+        return 0
+    fi
+    "$@"
+}
+
+VERSION=""
 PUBLISH=false
-[[ "${1-}" == "--publish" ]] && PUBLISH=true
+DRY_RUN=false
 
-# ── setup ────────────────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --publish)
+            PUBLISH=true
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -*)
+            die "unknown option: $1"
+            ;;
+        *)
+            if [[ -n "$VERSION" ]]; then
+                die "version specified more than once"
+            fi
+            VERSION="$1"
+            ;;
+    esac
+    shift
+done
 
-cd "$(dirname "$0")"   # run from repo root regardless of cwd
+[[ -n "$VERSION" ]] || {
+    usage
+    exit 1
+}
 
-[[ -f "Cargo.toml" ]] || die "not found: Cargo.toml"
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)*$ ]]; then
+    die "version must look like X.Y.Z, optionally with prerelease/build suffixes"
+fi
 
-VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+ROOT_CARGO="Cargo.toml"
+LOCKFILE="Cargo.lock"
 TAG="piscem-rs-v${VERSION}"
 
-echo "piscem-rs version: $VERSION"
-echo "tag:               $TAG"
-echo ""
+[[ -f "$ROOT_CARGO" ]] || die "not found: $ROOT_CARGO"
+[[ -f "$LOCKFILE" ]] || die "not found: $LOCKFILE"
 
-# ── pre-flight checks ───────────────────────────────────────────────────────
+CURRENT_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT_CARGO" | head -1)"
+[[ -n "$CURRENT_VERSION" ]] || die "could not determine current crate version from $ROOT_CARGO"
 
-if git rev-parse "$TAG" &>/dev/null; then
-    die "tag $TAG already exists — bump the version in Cargo.toml first"
+if [[ "$CURRENT_VERSION" == "$VERSION" ]]; then
+    die "crate version is already $VERSION"
 fi
 
-if ! git diff --quiet -- ':!Cargo.lock'; then
-    die "working tree has unstaged changes — commit or stash them first"
+if git rev-parse "$TAG" >/dev/null 2>&1; then
+    die "tag $TAG already exists"
 fi
 
-if ! git diff --cached --quiet; then
-    die "index has staged changes — commit or stash them first"
+if [[ -n "$(git status --porcelain)" ]]; then
+    die "working tree is not clean; commit or stash existing changes first"
 fi
 
-# ── dry run ──────────────────────────────────────────────────────────────────
+echo "Current crate version : $CURRENT_VERSION"
+echo "New crate version     : $VERSION"
+echo "Tag                   : $TAG"
+if [[ "$PUBLISH" == true ]]; then
+    echo "Publish crate         : yes"
+else
+    echo "Publish crate         : no"
+fi
+if [[ "$DRY_RUN" == true ]]; then
+    echo "Dry-run               : yes"
+else
+    echo "Dry-run               : no"
+fi
+echo
 
-# --allow-dirty: untracked dirs (test_data/, piscem-cpp/) and Cargo.lock
-# changes from local .cargo/config.toml patches are expected.
-echo "Running cargo publish --dry-run ..."
-echo ""
-cargo publish --dry-run --allow-dirty
-echo ""
-echo "Dry run passed."
+echo "Updating $ROOT_CARGO"
+echo "  version: $CURRENT_VERSION -> $VERSION"
 
-if ! $PUBLISH; then
-    echo ""
-    echo "This was a dry run. To publish for real:"
-    echo "  ./publish.sh --publish"
-    exit 0
+if [[ "$DRY_RUN" == false ]]; then
+    sed -i.bak "1,/^version = /s/^version = \".*\"/version = \"${VERSION}\"/" "$ROOT_CARGO"
+    rm -f "${ROOT_CARGO}.bak"
 fi
 
-# ── publish ──────────────────────────────────────────────────────────────────
+UPDATED_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT_CARGO" | head -1)"
 
-echo ""
-echo "Publishing piscem-rs $VERSION to crates.io ..."
-cargo publish --allow-dirty
+if [[ "$DRY_RUN" == false ]]; then
+    [[ "$UPDATED_VERSION" == "$VERSION" ]] || die "crate version update failed"
+else
+    echo "Dry-run: would rewrite $ROOT_CARGO and refresh $LOCKFILE"
+fi
 
-# ── tag and push ─────────────────────────────────────────────────────────────
+run cargo check -q
+run git add "$ROOT_CARGO" "$LOCKFILE"
+run git commit -m "chore(release): bump piscem-rs to v${VERSION}"
 
-git tag -a "$TAG" -m "piscem-rs v${VERSION}"
-echo "Created tag $TAG"
+if [[ "$PUBLISH" == true ]]; then
+    run cargo publish --allow-dirty
+fi
 
-git push origin "$TAG"
-echo "Pushed tag to origin."
+run git tag -a "$TAG" -m "piscem-rs v${VERSION}"
+run git push origin HEAD
+run git push origin "$TAG"
+
+if [[ "$DRY_RUN" == true ]]; then
+    echo
+    echo "Dry-run complete"
+else
+    echo
+    echo "Release bump complete for v${VERSION}"
+fi

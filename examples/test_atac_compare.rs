@@ -16,7 +16,9 @@ fn main() {
 
     let match_rate = if result.total_records_a > 0 {
         result.matching_records as f64 / result.total_records_a as f64 * 100.0
-    } else { 0.0 };
+    } else {
+        0.0
+    };
     println!("Match rate: {:.2}%", match_rate);
 
     if !result.first_mismatches.is_empty() {
@@ -25,7 +27,10 @@ fn main() {
             println!("  - {}", m);
         }
     }
-    println!("Same targets, diff detail: {}", result.same_targets_diff_detail);
+    println!(
+        "Same targets, diff detail: {}",
+        result.same_targets_diff_detail
+    );
     println!("Different targets: {}", result.different_targets);
     println!("Diff position only: {}", result.diff_pos_only);
     println!("Diff frag_len only: {}", result.diff_frag_len_only);

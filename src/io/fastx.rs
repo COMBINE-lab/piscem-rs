@@ -8,19 +8,21 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 // Re-export paraseq types used by the mapping pipeline.
+pub use paraseq::Record;
 pub use paraseq::fastq;
 pub use paraseq::fastx::{Collection, CollectionType};
 pub use paraseq::parallel::{
     MultiParallelProcessor, PairedParallelProcessor, ParallelProcessor, ParallelReader,
 };
-pub use paraseq::Record;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 /// Open a single file with automatic decompression (gzip, zstd, etc.).
-pub(crate) fn open_with_decompression(path: impl AsRef<Path>) -> Result<Box<dyn std::io::Read + Send>> {
+pub(crate) fn open_with_decompression(
+    path: impl AsRef<Path>,
+) -> Result<Box<dyn std::io::Read + Send>> {
     let path = path.as_ref();
     let (reader, _format) = niffler::send::from_path(path)
         .with_context(|| format!("failed to open {}", path.display()))?;
@@ -31,9 +33,7 @@ pub(crate) fn open_with_decompression(path: impl AsRef<Path>) -> Result<Box<dyn 
 ///
 /// Automatically detects and decompresses gzip, zstd, and other formats
 /// via niffler.
-pub fn open_concatenated_readers(
-    paths: &[String],
-) -> Result<Box<dyn std::io::Read + Send>> {
+pub fn open_concatenated_readers(paths: &[String]) -> Result<Box<dyn std::io::Read + Send>> {
     use std::io::Read;
 
     if paths.is_empty() {
@@ -47,7 +47,10 @@ pub fn open_concatenated_readers(
     for path in paths {
         readers.push(open_with_decompression(path)?);
     }
-    Ok(Box::new(MultiReader { readers, current: 0 }))
+    Ok(Box::new(MultiReader {
+        readers,
+        current: 0,
+    }))
 }
 
 /// Concatenating reader over multiple boxed readers.

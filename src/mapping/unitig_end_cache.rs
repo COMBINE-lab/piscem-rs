@@ -44,7 +44,11 @@ impl UnitigEndCache {
     ///
     /// If the stored orientation doesn't match the current query's
     /// `fw_is_canonical`, the result's orientation is flipped.
-    pub fn get(&self, canonical_hash: CanonicalKmer, fw_is_canonical: bool) -> Option<LookupResult> {
+    pub fn get(
+        &self,
+        canonical_hash: CanonicalKmer,
+        fw_is_canonical: bool,
+    ) -> Option<LookupResult> {
         self.map.get(&canonical_hash).map(|entry| {
             let cached = entry.value();
             let mut result = cached.result.clone();
@@ -59,7 +63,12 @@ impl UnitigEndCache {
     /// Insert a lookup result into the cache.
     ///
     /// Does nothing if the cache is at capacity.
-    pub fn insert(&self, canonical_hash: CanonicalKmer, result: &LookupResult, fw_is_canonical: bool) {
+    pub fn insert(
+        &self,
+        canonical_hash: CanonicalKmer,
+        result: &LookupResult,
+        fw_is_canonical: bool,
+    ) {
         if self.map.len() >= self.capacity {
             return;
         }
