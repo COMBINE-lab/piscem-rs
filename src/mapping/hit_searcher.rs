@@ -100,7 +100,6 @@ where
     Some(Kmer::<K>::from_ascii_unchecked(bytes))
 }
 
-
 // ---------------------------------------------------------------------------
 // ReadKmerIter
 // ---------------------------------------------------------------------------
@@ -369,14 +368,7 @@ impl<'idx> HitSearcher<'idx> {
             SkippingStrategy::Strict => {
                 let read_end_pos = read.len() as i32 - k as i32;
                 let mut iter = ReadKmerIter::new(read, k);
-                Self::walk_safely_until::<K>(
-                    index,
-                    &mut iter,
-                    query,
-                    read,
-                    read_end_pos,
-                    raw_hits,
-                );
+                Self::walk_safely_until::<K>(index, &mut iter, query, read, read_end_pos, raw_hits);
             }
             SkippingStrategy::Permissive => {
                 Self::collect_permissive::<K>(index, k, read, query, raw_hits);
@@ -451,8 +443,7 @@ impl<'idx> HitSearcher<'idx> {
                 }
 
                 let dist_to_read_end = (read_len - k) as i64 - read_pos as i64;
-                let skip_dist =
-                    std::cmp::min(dist_to_read_end, dist_to_contig_end) as i32;
+                let skip_dist = std::cmp::min(dist_to_read_end, dist_to_contig_end) as i32;
 
                 if skip_dist > 1 {
                     // Save backup iterator and contig position.
@@ -530,16 +521,13 @@ impl<'idx> HitSearcher<'idx> {
                     let alt_kmer_bytes = iter.kmer_bytes();
                     let alt_result = query.lookup_at(alt_kmer_bytes, iter.pos());
                     let alt_phit = index.resolve_lookup(&alt_result);
-                    let alt_found = alt_phit
-                        .as_ref()
-                        .is_some_and(|p| !p.is_empty());
+                    let alt_found = alt_phit.as_ref().is_some_and(|p| !p.is_empty());
 
                     if let Some(ref check_phit) = alt_phit
                         && !check_phit.is_empty()
                     {
                         let accept = check_phit.contig_id() == phit.contig_id()
-                            && check_phit.hit_fw_on_contig()
-                                == phit.hit_fw_on_contig()
+                            && check_phit.hit_fw_on_contig() == phit.hit_fw_on_contig()
                             && if direction > 0 {
                                 check_phit.contig_pos() > phit.contig_pos()
                             } else {
@@ -565,8 +553,7 @@ impl<'idx> HitSearcher<'idx> {
                         if !mid_iter.is_exhausted() {
                             let mid_bytes = mid_iter.kmer_bytes();
                             let mid_result = query.lookup_at(mid_bytes, mid_iter.pos());
-                            if let Some(mid_phit) =
-                                index.resolve_lookup(&mid_result)
+                            if let Some(mid_phit) = index.resolve_lookup(&mid_result)
                                 && !mid_phit.is_empty()
                             {
                                 if mid_phit.contig_id() == phit.contig_id() {
@@ -575,9 +562,7 @@ impl<'idx> HitSearcher<'idx> {
                                     let mut mp = mid_phit;
                                     mp.set_resulted_from_open_search(false);
                                     raw_hits.push((mid_iter.pos(), mp));
-                                    if alt_found
-                                        && let Some(ref ap) = alt_phit
-                                    {
+                                    if alt_found && let Some(ref ap) = alt_phit {
                                         let mut ap_clone = ap.clone();
                                         ap_clone.set_resulted_from_open_search(true);
                                         raw_hits.push((alt_iter.pos(), ap_clone));
@@ -672,8 +657,7 @@ impl<'idx> HitSearcher<'idx> {
                 let read_pos = iter.pos();
                 let initial_search_pos = read_pos;
 
-                let c_start_pos =
-                    phit_info.global_pos() as i64 - phit_info.contig_pos() as i64;
+                let c_start_pos = phit_info.global_pos() as i64 - phit_info.contig_pos() as i64;
                 let c_end_pos = c_start_pos + phit_info.contig_len() as i64;
                 let mut c_curr_pos = phit_info.global_pos() as i64;
 
@@ -713,27 +697,21 @@ impl<'idx> HitSearcher<'idx> {
                         if iter.is_exhausted() {
                             break;
                         }
-                        let ref_kmer: Kmer<K> =
-                            index.dict().kmer_at_pos(c_curr_pos as usize);
+                        let ref_kmer: Kmer<K> = index.dict().kmer_at_pos(c_curr_pos as usize);
                         let read_kmer_bytes = iter.kmer_bytes();
-                        if let Some(read_kmer) = parse_read_kmer_unchecked::<K>(read_kmer_bytes)
-                        {
+                        if let Some(read_kmer) = parse_read_kmer_unchecked::<K>(read_kmer_bytes) {
                             let match_type = kmer_match(&read_kmer, &ref_kmer);
                             matches = match_type != KmerMatchType::NoMatch;
 
                             if matches {
-                                let hit_fw =
-                                    match_type == KmerMatchType::IdentityMatch;
+                                let hit_fw = match_type == KmerMatchType::IdentityMatch;
                                 let phit = &mut last_valid_hit.1;
                                 phit.set_resulted_from_open_search(false);
                                 phit.set_contig_orientation(hit_fw);
                                 phit.set_global_pos(
-                                    (phit.global_pos() as i64 + inc_offset as i64)
-                                        as u64,
+                                    (phit.global_pos() as i64 + inc_offset as i64) as u64,
                                 );
-                                phit.set_contig_pos(
-                                    (phit.contig_pos() as i32 + inc_offset) as u32,
-                                );
+                                phit.set_contig_pos((phit.contig_pos() as i32 + inc_offset) as u32);
                                 last_valid_hit.0 = iter.pos();
                                 ended_on_match = dist_to_contig_end == 0;
                             } else {
@@ -808,12 +786,9 @@ impl<'idx> HitSearcher<'idx> {
         let mut direct_phit = prev_phit.clone();
         if add_hit {
             direct_phit.set_resulted_from_open_search(false);
-            direct_phit.set_global_pos(
-                (direct_phit.global_pos() as i64 + inc_offset) as u64,
-            );
-            direct_phit.set_contig_pos(
-                (direct_phit.contig_pos() as i32 + inc_offset as i32) as u32,
-            );
+            direct_phit.set_global_pos((direct_phit.global_pos() as i64 + inc_offset) as u64);
+            direct_phit
+                .set_contig_pos((direct_phit.contig_pos() as i32 + inc_offset as i32) as u32);
         }
 
         // Compare read k-mer to ref k-mer.

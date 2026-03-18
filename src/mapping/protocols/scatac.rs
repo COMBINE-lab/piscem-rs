@@ -51,7 +51,10 @@ impl Protocol for ScatacProtocol {
 
     fn extract_mappable_reads<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> AlignableReads<'a> {
         // Both R1 and R2 are biological reads (always paired for ATAC)
-        AlignableReads::Paired { read1: r1, read2: r2 }
+        AlignableReads::Paired {
+            read1: r1,
+            read2: r2,
+        }
     }
 
     fn barcode_len(&self) -> usize {

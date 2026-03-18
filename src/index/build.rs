@@ -71,23 +71,25 @@ enum Tile {
 ///
 /// Formats: `<id>+` (forward), `<id>-` (reverse), `N<count>` (gap).
 fn parse_tile(tok: &str) -> Result<Tile> {
-    let last = tok.as_bytes().last()
-        .context("empty tile token")?;
+    let last = tok.as_bytes().last().context("empty tile token")?;
 
     match *last {
         b'+' => {
-            let id: u64 = tok[..tok.len() - 1].parse()
+            let id: u64 = tok[..tok.len() - 1]
+                .parse()
                 .with_context(|| format!("invalid segment id in '{tok}'"))?;
             Ok(Tile::Segment { id, is_fw: true })
         }
         b'-' => {
-            let id: u64 = tok[..tok.len() - 1].parse()
+            let id: u64 = tok[..tok.len() - 1]
+                .parse()
                 .with_context(|| format!("invalid segment id in '{tok}'"))?;
             Ok(Tile::Segment { id, is_fw: false })
         }
         _ => {
             if let Some(rest) = tok.strip_prefix('N') {
-                let count: u64 = rest.parse()
+                let count: u64 = rest
+                    .parse()
                     .with_context(|| format!("invalid N-tile count in '{tok}'"))?;
                 Ok(Tile::Gap { count })
             } else {
@@ -119,8 +121,8 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
 
     // Step 1: Parse .cf_seg — collect segment IDs, sequences, and lengths
     info!("Parsing segment file: {}", cf_seg_path);
-    let mut cf_data = parse_cf_seg(&cf_seg_path)
-        .with_context(|| format!("failed to parse {cf_seg_path}"))?;
+    let mut cf_data =
+        parse_cf_seg(&cf_seg_path).with_context(|| format!("failed to parse {cf_seg_path}"))?;
 
     let num_segments = cf_data.len();
     info!("  {num_segments} segments");
@@ -132,7 +134,10 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
     let segment_ids = std::mem::take(&mut cf_data.segment_ids);
 
     // Step 2: Build SSHash dictionary from unitig sequences
-    info!("Building SSHash dictionary (k={}, m={})", config.k, config.m);
+    info!(
+        "Building SSHash dictionary (k={}, m={})",
+        config.k, config.m
+    );
     let mut build_cfg = BuildConfiguration::new(config.k, config.m)
         .map_err(|e| anyhow::anyhow!("invalid build configuration: {e}"))?;
     build_cfg.canonical = config.canonical;
@@ -179,8 +184,7 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
         for info in id_to_info.values() {
             counts[info.rank as usize] = info.count;
         }
-        let mut ctab_builder =
-            ContigTableDirectBuilder::new(&counts, max_ref_len, num_refs as u64);
+        let mut ctab_builder = ContigTableDirectBuilder::new(&counts, max_ref_len, num_refs as u64);
         second_pass_cf_seq(&cf_seq_path, k, &id_to_info, &mut ctab_builder)?;
         ctab_builder.build()
     };
@@ -254,7 +258,10 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
     }
 
     index.save(&config.output_prefix)?;
-    info!("Index built and saved to {}", config.output_prefix.display());
+    info!(
+        "Index built and saved to {}",
+        config.output_prefix.display()
+    );
     Ok(())
 }
 
@@ -436,9 +443,7 @@ fn parse_short_refs(
             if arr.len() != 2 {
                 bail!("short seqs entry has {} elements, expected 2", arr.len());
             }
-            let name = arr[0]
-                .as_str()
-                .context("short seqs name is not a string")?;
+            let name = arr[0].as_str().context("short seqs name is not a string")?;
             let len = arr[1]
                 .as_u64()
                 .context("short seqs length is not a number")?;
@@ -585,8 +590,13 @@ mod tests {
         let mut lens = vec![1000u64];
         let mut max_len = 1000u64;
 
-        parse_short_refs(json_path.to_str().unwrap(), &mut names, &mut lens, &mut max_len)
-            .unwrap();
+        parse_short_refs(
+            json_path.to_str().unwrap(),
+            &mut names,
+            &mut lens,
+            &mut max_len,
+        )
+        .unwrap();
 
         assert_eq!(names.len(), 3);
         assert_eq!(names[1], "short_ref_1");
@@ -607,7 +617,13 @@ mod tests {
         let mut max_len = 0u64;
 
         // Should not error if file doesn't exist
-        parse_short_refs("/nonexistent/path.json", &mut names, &mut lens, &mut max_len).unwrap();
+        parse_short_refs(
+            "/nonexistent/path.json",
+            &mut names,
+            &mut lens,
+            &mut max_len,
+        )
+        .unwrap();
 
         assert!(names.is_empty());
         assert!(lens.is_empty());
@@ -626,8 +642,13 @@ mod tests {
         let mut lens = Vec::new();
         let mut max_len = 0u64;
 
-        parse_short_refs(json_path.to_str().unwrap(), &mut names, &mut lens, &mut max_len)
-            .unwrap();
+        parse_short_refs(
+            json_path.to_str().unwrap(),
+            &mut names,
+            &mut lens,
+            &mut max_len,
+        )
+        .unwrap();
 
         assert!(names.is_empty());
 
@@ -639,9 +660,7 @@ mod tests {
     fn test_build_from_test_data() {
         let output_dir = std::env::temp_dir().join("piscem_rs_build_integration_test");
         let config = BuildConfig {
-            input_prefix: PathBuf::from(
-                "test_data/gencode_pc_v44_dbg/gencode_pc_v44_index_cfish",
-            ),
+            input_prefix: PathBuf::from("test_data/gencode_pc_v44_dbg/gencode_pc_v44_index_cfish"),
             output_prefix: output_dir.join("gencode_pc_v44_index"),
             k: 31,
             m: 19,

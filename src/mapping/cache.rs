@@ -115,9 +115,7 @@ mod tests {
         cache.has_matching_kmers = true;
         cache.accepted_hits.push(SimpleHit::default());
         cache.ambiguous_hit_indices.push(42);
-        cache
-            .hit_map
-            .insert(0, SketchHitInfoSimple::default());
+        cache.hit_map.insert(0, SketchHitInfoSimple::default());
 
         cache.clear();
 

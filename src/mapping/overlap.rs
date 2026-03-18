@@ -63,12 +63,26 @@ pub fn find_overlap(
     let mut mate_ov = MateOverlap::default();
 
     // Try dovetail first
-    get_overlap(seq1, seq2, &mut mate_ov, true, min_overlap_length, error_threshold);
+    get_overlap(
+        seq1,
+        seq2,
+        &mut mate_ov,
+        true,
+        min_overlap_length,
+        error_threshold,
+    );
     if !mate_ov.frag.is_empty() {
         mate_ov.ov_type = OverlapType::Dovetail;
     } else {
         // Try regular overlap
-        get_overlap(seq1, seq2, &mut mate_ov, false, min_overlap_length, error_threshold);
+        get_overlap(
+            seq1,
+            seq2,
+            &mut mate_ov,
+            false,
+            min_overlap_length,
+            error_threshold,
+        );
         mate_ov.ov_type = if !mate_ov.frag.is_empty() {
             OverlapType::Overlap
         } else {
@@ -160,8 +174,7 @@ fn get_overlap(
             // Validate: enough room before seed
             let before_ok = seed_start >= seed_offset;
             // Validate: enough overlap length
-            let remaining_overlap =
-                (suff_length - seed_start + seed_offset) as i32;
+            let remaining_overlap = (suff_length - seed_start + seed_offset) as i32;
             let overlap_ok = remaining_overlap >= min_overlap_length;
 
             if before_ok && overlap_ok {
@@ -182,12 +195,9 @@ fn get_overlap(
 
                 // Phase 2: match after seed
                 if can_merge {
-                    let max_after =
-                        (suff_length - seed_start).min(pref_length - seed_offset);
+                    let max_after = (suff_length - seed_start).min(pref_length - seed_offset);
                     for i in seed_length..max_after {
-                        if suffix_read[seed_start + i]
-                            != prefix_read[seed_offset + i]
-                        {
+                        if suffix_read[seed_start + i] != prefix_read[seed_offset + i] {
                             num_errors += 1;
                         }
                         if num_errors > error_threshold {
@@ -199,8 +209,7 @@ fn get_overlap(
 
                 if can_merge {
                     is_merged = true;
-                    overlap_length = (suff_length - seed_start + seed_offset)
-                        .min(pref_length);
+                    overlap_length = (suff_length - seed_start + seed_offset).min(pref_length);
                     break;
                 }
             }
@@ -258,7 +267,9 @@ mod tests {
         // This should detect dovetail if the reads overlap
         let result = find_overlap(read1, &read2, 6, 0);
         // Whether it detects depends on exact overlap geometry
-        assert!(result.ov_type == OverlapType::Dovetail || result.ov_type == OverlapType::NoOverlap);
+        assert!(
+            result.ov_type == OverlapType::Dovetail || result.ov_type == OverlapType::NoOverlap
+        );
     }
 
     #[test]

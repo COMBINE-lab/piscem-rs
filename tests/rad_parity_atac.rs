@@ -39,12 +39,18 @@ fn run_cpp_atac(output_dir: &Path, threads: usize) -> Result<()> {
     // --no-poison defaults to 1 (true) in C++, so we don't pass it explicitly.
     // --quiet minimizes console output.
     let cmd = Command::new(CPP_ATAC_BIN)
-        .arg("-i").arg(CPP_INDEX_PREFIX)
-        .arg("-1").arg(READ1)
-        .arg("-2").arg(READ2)
-        .arg("-b").arg(BARCODE)
-        .arg("-o").arg(output_dir)
-        .arg("-t").arg(threads.to_string())
+        .arg("-i")
+        .arg(CPP_INDEX_PREFIX)
+        .arg("-1")
+        .arg(READ1)
+        .arg("-2")
+        .arg(READ2)
+        .arg("-b")
+        .arg(BARCODE)
+        .arg("-o")
+        .arg(output_dir)
+        .arg("-t")
+        .arg(threads.to_string())
         .arg("--quiet")
         .status()
         .context("failed to run C++ ATAC mapper")?;
@@ -65,12 +71,18 @@ fn run_rust_atac(output_dir: &Path, threads: usize) -> Result<()> {
 
     let cmd = Command::new(&bin)
         .arg("map-scatac")
-        .arg("-i").arg(RUST_INDEX_PREFIX)
-        .arg("-1").arg(READ1)
-        .arg("-2").arg(READ2)
-        .arg("-b").arg(BARCODE)
-        .arg("-o").arg(output_dir)
-        .arg("-t").arg(threads.to_string())
+        .arg("-i")
+        .arg(RUST_INDEX_PREFIX)
+        .arg("-1")
+        .arg(READ1)
+        .arg("-2")
+        .arg(READ2)
+        .arg("-b")
+        .arg(BARCODE)
+        .arg("-o")
+        .arg(output_dir)
+        .arg("-t")
+        .arg(threads.to_string())
         .status()
         .context("failed to run Rust ATAC mapper")?;
     if !cmd.success() {
@@ -125,12 +137,20 @@ fn atac_rad_parity() {
     let cpp_rad = cpp_out_dir.join("map.rad");
     let rust_rad = rust_out_dir.join("map.rad");
 
-    assert!(cpp_rad.exists(), "C++ RAD file not found: {}", cpp_rad.display());
-    assert!(rust_rad.exists(), "Rust RAD file not found: {}", rust_rad.display());
+    assert!(
+        cpp_rad.exists(),
+        "C++ RAD file not found: {}",
+        cpp_rad.display()
+    );
+    assert!(
+        rust_rad.exists(),
+        "Rust RAD file not found: {}",
+        rust_rad.display()
+    );
 
     eprintln!("Comparing ATAC RAD files...");
-    let result = compare_atac_rad_full(&cpp_rad, &rust_rad)
-        .expect("failed to compare ATAC RAD files");
+    let result =
+        compare_atac_rad_full(&cpp_rad, &rust_rad).expect("failed to compare ATAC RAD files");
 
     eprintln!("Comparison result:");
     eprintln!("  Header match: {}", result.header_match);
@@ -140,7 +160,10 @@ fn atac_rad_parity() {
     eprintln!("  Missing in A: {}", result.missing_in_a);
     eprintln!("  Missing in B: {}", result.missing_in_b);
     eprintln!("  Mismatch categories:");
-    eprintln!("    Same targets, diff detail: {}", result.same_targets_diff_detail);
+    eprintln!(
+        "    Same targets, diff detail: {}",
+        result.same_targets_diff_detail
+    );
     eprintln!("    Different targets: {}", result.different_targets);
     eprintln!("    Diff position only: {}", result.diff_pos_only);
     eprintln!("    Diff frag_len only: {}", result.diff_frag_len_only);
@@ -159,8 +182,10 @@ fn atac_rad_parity() {
     } else {
         0.0
     };
-    eprintln!("  Record match rate: {:.2}% ({}/{})",
-        match_rate, result.matching_records, result.total_records_a);
+    eprintln!(
+        "  Record match rate: {:.2}% ({}/{})",
+        match_rate, result.matching_records, result.total_records_a
+    );
 
     // Assert reasonable record-level parity
     assert!(

@@ -19,7 +19,7 @@
 //!
 //! Port of C++ `sc/util.hpp` PEG parser + `custom_protocol` class.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use smallvec::SmallVec;
 
 use smallvec::smallvec;
@@ -156,14 +156,10 @@ impl Protocol for CustomProtocol {
             }
         } else if !self.read_slices_r1.is_empty() {
             // Bio read is on R1 — the geometry specified r[N] or r: in the 1{...} block
-            AlignableReads::Single(
-                extract_read_region(&self.read_slices_r1, r1).unwrap_or(&[]),
-            )
+            AlignableReads::Single(extract_read_region(&self.read_slices_r1, r1).unwrap_or(&[]))
         } else {
             // Bio read is on R2 — the geometry specified r[N] or r: in the 2{...} block
-            AlignableReads::Single(
-                extract_read_region(&self.read_slices_r2, r2).unwrap_or(&[]),
-            )
+            AlignableReads::Single(extract_read_region(&self.read_slices_r2, r2).unwrap_or(&[]))
         }
     }
 
@@ -275,7 +271,9 @@ pub fn parse_custom_geometry(geom: &str) -> Result<CustomProtocol> {
 
     // When `s` is present alongside `b`, renumber: s -> b0 (sample), b -> b1 (cell)
     // When only numbered barcodes are used, take them as-is.
-    let has_sample_tag = parts_r1.iter().chain(parts_r2.iter())
+    let has_sample_tag = parts_r1
+        .iter()
+        .chain(parts_r2.iter())
         .any(|p| p.tag_type == GeoTagType::SampleBarcode);
     let has_plain_bc = !sr1.bc.is_empty() || !sr2.bc.is_empty();
 
@@ -304,12 +302,16 @@ pub fn parse_custom_geometry(geom: &str) -> Result<CustomProtocol> {
 
         for &level in &all_levels {
             // Get slices for this level from R1
-            let r1_slices: SmallVec<[StrSlice; 4]> = sr1.multi_bc.iter()
+            let r1_slices: SmallVec<[StrSlice; 4]> = sr1
+                .multi_bc
+                .iter()
                 .filter(|(l, _)| *l == level)
                 .flat_map(|(_, s)| s.iter().copied())
                 .collect();
             // Get slices for this level from R2
-            let r2_slices: SmallVec<[StrSlice; 4]> = sr2.multi_bc.iter()
+            let r2_slices: SmallVec<[StrSlice; 4]> = sr2
+                .multi_bc
+                .iter()
                 .filter(|(l, _)| *l == level)
                 .flat_map(|(_, s)| s.iter().copied())
                 .collect();
@@ -317,8 +319,10 @@ pub fn parse_custom_geometry(geom: &str) -> Result<CustomProtocol> {
             // If this is the plain-bc-as-next-level case
             if has_sample_tag && has_plain_bc && level == all_levels[num_levels - 1] {
                 // The plain `b` tag becomes this level
-                let combined_r1: SmallVec<[StrSlice; 4]> = r1_slices.iter().chain(sr1.bc.iter()).copied().collect();
-                let combined_r2: SmallVec<[StrSlice; 4]> = r2_slices.iter().chain(sr2.bc.iter()).copied().collect();
+                let combined_r1: SmallVec<[StrSlice; 4]> =
+                    r1_slices.iter().chain(sr1.bc.iter()).copied().collect();
+                let combined_r2: SmallVec<[StrSlice; 4]> =
+                    r2_slices.iter().chain(sr2.bc.iter()).copied().collect();
                 let len = sum_bounded_len(&combined_r1) + sum_bounded_len(&combined_r2);
                 slices_r1.push(combined_r1);
                 slices_r2.push(combined_r2);
@@ -439,7 +443,7 @@ fn parse_desc_list(body: &str) -> Result<Vec<GeoPart>> {
             b'b' => {
                 // Check for numbered barcode: b0[N], b1[N], etc.
                 if i + 2 < bytes.len() && bytes[i + 1].is_ascii_digit() {
-                    let level = (bytes[i + 1] - b'0') as u8;
+                    let level = bytes[i + 1] - b'0';
                     // delim is now the digit; the actual delimiter is the next char
                     (GeoTagType::NumberedBarcode(level), 1)
                 } else {
@@ -450,7 +454,11 @@ fn parse_desc_list(body: &str) -> Result<Vec<GeoPart>> {
             b'r' => (GeoTagType::Read, 0),
             b'f' => (GeoTagType::Fixed, 0),
             b'x' => (GeoTagType::Discard, 0),
-            _ => bail!("unknown geometry tag '{}' at position {}", tag_char as char, i),
+            _ => bail!(
+                "unknown geometry tag '{}' at position {}",
+                tag_char as char,
+                i
+            ),
         };
         // Advance past any extra consumed characters (e.g., the digit in b0)
         let i_delim = i + 1 + extra_consumed;
@@ -474,19 +482,26 @@ fn parse_desc_list(body: &str) -> Result<Vec<GeoPart>> {
                     if inner.is_empty() {
                         bail!("empty fixed sequence at position {}", i);
                     }
-                    if !inner.bytes().all(|b| matches!(b, b'A' | b'C' | b'G' | b'T')) {
+                    if !inner
+                        .bytes()
+                        .all(|b| matches!(b, b'A' | b'C' | b'G' | b'T'))
+                    {
                         bail!("fixed sequence must contain only ACGT: '{}'", inner);
                     }
                     inner.len() as i32
                 } else {
                     // Others: value is a length
-                    inner
-                        .parse::<i32>()
-                        .map_err(|_| anyhow::anyhow!("invalid length '{}' at position {}", inner, value_start))?
+                    inner.parse::<i32>().map_err(|_| {
+                        anyhow::anyhow!("invalid length '{}' at position {}", inner, value_start)
+                    })?
                 };
 
                 if len <= 0 && tag_type != GeoTagType::Fixed {
-                    bail!("length must be positive, got {} at position {}", len, value_start);
+                    bail!(
+                        "length must be positive, got {} at position {}",
+                        len,
+                        value_start
+                    );
                 }
 
                 parts.push(GeoPart { tag_type, len });
@@ -500,10 +515,7 @@ fn parse_desc_list(body: &str) -> Result<Vec<GeoPart>> {
                         tag_char as char,
                     );
                 }
-                parts.push(GeoPart {
-                    tag_type,
-                    len: -1,
-                });
+                parts.push(GeoPart { tag_type, len: -1 });
                 i = i_delim + 1;
             }
             _ => bail!(

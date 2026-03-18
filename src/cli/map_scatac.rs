@@ -22,7 +22,7 @@ use tracing::info;
 use sshash_lib::{Kmer, KmerBits, dispatch_on_k};
 
 use crate::index::reference_index::ReferenceIndex;
-use crate::io::fastx::{open_with_decompression, Collection, CollectionType};
+use crate::io::fastx::{Collection, CollectionType, open_with_decompression};
 use crate::io::map_info::{MapInfoParams, write_map_info};
 use crate::io::rad::write_rad_header_atac;
 use crate::io::threads::{MappingStats, OutputInfo};
@@ -47,12 +47,22 @@ pub struct MapScatacArgs {
           conflicts_with_all = ["read1", "read2"])]
     pub reads: Vec<PathBuf>,
     /// Read 1 FASTQ files (genomic left, comma-separated); requires -2
-    #[arg(short = '1', long, value_delimiter = ',',
-          requires = "read2", conflicts_with = "reads")]
+    #[arg(
+        short = '1',
+        long,
+        value_delimiter = ',',
+        requires = "read2",
+        conflicts_with = "reads"
+    )]
     pub read1: Vec<PathBuf>,
     /// Read 2 FASTQ files (genomic right, comma-separated); requires -1
-    #[arg(short = '2', long, value_delimiter = ',',
-          requires = "read1", conflicts_with = "reads")]
+    #[arg(
+        short = '2',
+        long,
+        value_delimiter = ',',
+        requires = "read1",
+        conflicts_with = "reads"
+    )]
     pub read2: Vec<PathBuf>,
     /// Barcode FASTQ files (comma-separated)
     #[arg(short = 'b', long, value_delimiter = ',')]
@@ -119,11 +129,7 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
 
     info!(
         "scATAC mapping (bc_len={}, tn5_shift={}, bin_size={}, overlap={}, thr={:.2})",
-        args.bc_len,
-        !args.no_tn5_shift,
-        args.bin_size,
-        args.bin_overlap,
-        args.thr,
+        args.bc_len, !args.no_tn5_shift, args.bin_size, args.bin_overlap, args.thr,
     );
 
     let is_paired = !args.read1.is_empty();
@@ -278,7 +284,16 @@ where
     Kmer<K>: KmerBits,
 {
     let mut processor = ScatacProcessor::<K>::new(
-        index, end_cache, output, stats, binning, bc_len, tn5_shift, min_overlap, is_paired, opts,
+        index,
+        end_cache,
+        output,
+        stats,
+        binning,
+        bc_len,
+        tn5_shift,
+        min_overlap,
+        is_paired,
+        opts,
         progress,
     );
 
@@ -289,13 +304,15 @@ where
                 .map_err(|e| anyhow::anyhow!("failed to open {}: {}", bio_paths[i].display(), e))?,
         );
         readers.push(
-            paraseq::fastx::Reader::new(open_with_decompression(&barcode_paths[i])?)
-                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", barcode_paths[i].display(), e))?,
+            paraseq::fastx::Reader::new(open_with_decompression(&barcode_paths[i])?).map_err(
+                |e| anyhow::anyhow!("failed to open {}: {}", barcode_paths[i].display(), e),
+            )?,
         );
         if is_paired {
             readers.push(
-                paraseq::fastx::Reader::new(open_with_decompression(&read2_paths[i])?)
-                    .map_err(|e| anyhow::anyhow!("failed to open {}: {}", read2_paths[i].display(), e))?,
+                paraseq::fastx::Reader::new(open_with_decompression(&read2_paths[i])?).map_err(
+                    |e| anyhow::anyhow!("failed to open {}: {}", read2_paths[i].display(), e),
+                )?,
             );
         }
     }

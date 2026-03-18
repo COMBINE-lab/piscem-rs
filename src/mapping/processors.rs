@@ -8,14 +8,14 @@
 //! lazily on first batch. The custom `Clone` impl sets `state: None` so each
 //! cloned processor (one per worker thread) gets fresh state.
 
-use std::sync::atomic::Ordering;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
 use ahash::AHashMap;
 use indicatif::ProgressBar;
-use paraseq::parallel::{MultiParallelProcessor, PairedParallelProcessor, ParallelProcessor};
 use paraseq::Record;
-use smallvec::{SmallVec, smallvec};
+use paraseq::parallel::{MultiParallelProcessor, PairedParallelProcessor, ParallelProcessor};
+use smallvec::SmallVec;
 use sshash_lib::{Kmer, KmerBits};
 
 use crate::index::reference_index::ReferenceIndex;
@@ -29,14 +29,14 @@ use crate::mapping::cache::MappingCache;
 use crate::mapping::filters::PoisonState;
 use crate::mapping::hit_searcher::{HitSearcher, SkippingStrategy};
 use crate::mapping::hits::MappingType;
+use crate::mapping::hits::SketchHitInfo;
 use crate::mapping::map_fragment::{
     map_pe_fragment, map_pe_fragment_atac, map_se_fragment, map_se_fragment_atac,
 };
 use crate::mapping::merge_pairs::{remove_duplicate_hits_pub, simple_hit_cmp_bins};
-use crate::mapping::overlap::{find_overlap, OverlapType};
+use crate::mapping::overlap::{OverlapType, find_overlap};
 use crate::mapping::protocols::scrna::{barcode_has_n, count_ns, is_all_acgt, recover_barcode};
 use crate::mapping::protocols::{AlignableReads, Protocol};
-use crate::mapping::hits::SketchHitInfo;
 use crate::mapping::sketch_hit_simple::SketchHitInfoSimple;
 use crate::mapping::streaming_query::PiscemStreamingQuery;
 use crate::mapping::unitig_end_cache::UnitigEndCache;
@@ -103,8 +103,11 @@ impl MappingOpts {
 /// Generic over `S: SketchHitInfo` to support both the default
 /// `SketchHitInfoSimple` (no structural constraints) and
 /// `SketchHitInfoChained` (structural constraints enabled via `-c`).
-struct CommonThreadState<'a, const K: usize, S: SketchHitInfo + Send + 'static = SketchHitInfoSimple>
-where
+struct CommonThreadState<
+    'a,
+    const K: usize,
+    S: SketchHitInfo + Send + 'static = SketchHitInfoSimple,
+> where
     Kmer<K>: KmerBits,
 {
     hs: HitSearcher<'a>,
@@ -174,7 +177,8 @@ where
         }
         let total_bytes = self.rad_writer.len() as u32;
         self.rad_writer.write_u32_at_offset(0, total_bytes);
-        self.rad_writer.write_u32_at_offset(4, self.num_reads_in_chunk);
+        self.rad_writer
+            .write_u32_at_offset(4, self.num_reads_in_chunk);
         if self.num_reads_in_chunk > 0 {
             let mut file = output.rad_file.lock().unwrap();
             self.rad_writer.flush_to(&mut *file).ok();
@@ -214,8 +218,11 @@ where
 /// Generic over `S: SketchHitInfo` so that structural constraints can be enabled
 /// at compile time by instantiating with `SketchHitInfoChained` rather than the
 /// default `SketchHitInfoSimple`.
-pub struct BulkProcessor<'a, const K: usize, S: SketchHitInfo + Send + 'static = SketchHitInfoSimple>
-where
+pub struct BulkProcessor<
+    'a,
+    const K: usize,
+    S: SketchHitInfo + Send + 'static = SketchHitInfoSimple,
+> where
     Kmer<K>: KmerBits,
 {
     index: &'a ReferenceIndex,
@@ -273,10 +280,10 @@ where
 }
 
 // Safety: all shared fields are `Copy` references; `state` is always `None` at clone time.
-unsafe impl<const K: usize, S: SketchHitInfo + Send + 'static> Send for BulkProcessor<'_, K, S>
-where
-    Kmer<K>: KmerBits,
-{}
+unsafe impl<const K: usize, S: SketchHitInfo + Send + 'static> Send for BulkProcessor<'_, K, S> where
+    Kmer<K>: KmerBits
+{
+}
 
 // --- Bulk PE ---
 
@@ -287,7 +294,9 @@ where
 {
     fn process_record_pair_batch(
         &mut self,
-        record_pairs: impl Iterator<Item = (paraseq::fastx::RefRecord<'r>, paraseq::fastx::RefRecord<'r>)>,
+        record_pairs: impl Iterator<
+            Item = (paraseq::fastx::RefRecord<'r>, paraseq::fastx::RefRecord<'r>),
+        >,
     ) -> paraseq::Result<()> {
         let index = self.index;
         let end_cache = self.end_cache;
@@ -522,7 +531,11 @@ impl UnmappedBcCounts {
                 let mut buf = Vec::with_capacity(counts.len() * 16);
                 for (bc_fields, &count) in counts {
                     for (i, &bc_len) in bc_lens.iter().enumerate() {
-                        let val = if i < bc_fields.len() { bc_fields[i] } else { 0u64 };
+                        let val = if i < bc_fields.len() {
+                            bc_fields[i]
+                        } else {
+                            0u64
+                        };
                         Self::write_bc_at_width(&mut buf, val, bc_len);
                     }
                     buf.extend_from_slice(&count.to_le_bytes());
@@ -547,8 +560,11 @@ where
 ///
 /// Generic over `S: SketchHitInfo` so that structural constraints can be enabled
 /// by instantiating with `SketchHitInfoChained`.
-pub struct ScrnaProcessor<'a, const K: usize, S: SketchHitInfo + Send + 'static = SketchHitInfoSimple>
-where
+pub struct ScrnaProcessor<
+    'a,
+    const K: usize,
+    S: SketchHitInfo + Send + 'static = SketchHitInfoSimple,
+> where
     Kmer<K>: KmerBits,
 {
     index: &'a ReferenceIndex,
@@ -627,9 +643,8 @@ where
 }
 
 // Safety: all shared fields are `Copy` references; `state` is always `None` at clone time.
-unsafe impl<const K: usize, S: SketchHitInfo + Send + 'static> Send for ScrnaProcessor<'_, K, S>
-where
-    Kmer<K>: KmerBits,
+unsafe impl<const K: usize, S: SketchHitInfo + Send + 'static> Send for ScrnaProcessor<'_, K, S> where
+    Kmer<K>: KmerBits
 {
 }
 
@@ -640,7 +655,9 @@ where
 {
     fn process_record_pair_batch(
         &mut self,
-        record_pairs: impl Iterator<Item = (paraseq::fastx::RefRecord<'r>, paraseq::fastx::RefRecord<'r>)>,
+        record_pairs: impl Iterator<
+            Item = (paraseq::fastx::RefRecord<'r>, paraseq::fastx::RefRecord<'r>),
+        >,
     ) -> paraseq::Result<()> {
         let index = self.index;
         let end_cache = self.end_cache;
@@ -704,27 +721,45 @@ where
             if is_multi_bc {
                 multi_bc_packed.clear();
                 let mut all_valid = true;
-                for (i, desc) in bc_descs.iter().enumerate() {
+                for (i, _desc) in bc_descs.iter().enumerate() {
                     let bc_raw = match tech.barcodes.get(i) {
                         Some(Some(bc)) if !bc.is_empty() => *bc,
-                        _ => { all_valid = false; break; }
+                        _ => {
+                            all_valid = false;
+                            break;
+                        }
                     };
                     let n_count = count_ns(bc_raw);
-                    if n_count > 1 { all_valid = false; break; }
-                    let recovered = if n_count == 1 { recover_barcode(bc_raw) } else { None };
+                    if n_count > 1 {
+                        all_valid = false;
+                        break;
+                    }
+                    let recovered = if n_count == 1 {
+                        recover_barcode(bc_raw)
+                    } else {
+                        None
+                    };
                     let bc_to_pack = match &recovered {
                         Some(r) => {
-                            if !is_all_acgt(r) { all_valid = false; break; }
+                            if !is_all_acgt(r) {
+                                all_valid = false;
+                                break;
+                            }
                             r.as_slice()
                         }
                         None => {
-                            if !is_all_acgt(bc_raw) { all_valid = false; break; }
+                            if !is_all_acgt(bc_raw) {
+                                all_valid = false;
+                                break;
+                            }
                             bc_raw
                         }
                     };
                     multi_bc_packed.push(pack_bases_2bit(bc_to_pack));
                 }
-                if !all_valid { continue; }
+                if !all_valid {
+                    continue;
+                }
                 // For unmapped tracking, use the cell barcode (last level)
                 bc_packed = *multi_bc_packed.last().unwrap_or(&0);
             } else {
@@ -734,16 +769,26 @@ where
                     _ => continue,
                 };
                 let n_count = count_ns(bc_raw);
-                if n_count > 1 { continue; }
-                let recovered_bc = if n_count == 1 { recover_barcode(bc_raw) } else { None };
+                if n_count > 1 {
+                    continue;
+                }
+                let recovered_bc = if n_count == 1 {
+                    recover_barcode(bc_raw)
+                } else {
+                    None
+                };
                 let bc_to_pack = match &recovered_bc {
                     Some(bc) => bc.as_slice(),
                     None => {
-                        if !is_all_acgt(bc_raw) { continue; }
+                        if !is_all_acgt(bc_raw) {
+                            continue;
+                        }
                         bc_raw
                     }
                 };
-                if !is_all_acgt(bc_to_pack) { continue; }
+                if !is_all_acgt(bc_to_pack) {
+                    continue;
+                }
                 bc_packed = pack_bases_2bit(bc_to_pack);
             }
 
@@ -826,12 +871,10 @@ where
                     );
                 }
                 s.num_reads_in_chunk += 1;
+            } else if is_multi_bc {
+                st.unmapped_bc_counts.inc_multi(&multi_bc_packed);
             } else {
-                if is_multi_bc {
-                    st.unmapped_bc_counts.inc_multi(&multi_bc_packed);
-                } else {
-                    st.unmapped_bc_counts.inc_single(bc_packed);
-                }
+                st.unmapped_bc_counts.inc_single(bc_packed);
             }
         }
         self.progress.inc(batch_reads);
@@ -864,7 +907,6 @@ where
                 && !st.unmapped_bc_counts.is_empty()
             {
                 let mut file = unmapped_file.lock().unwrap();
-                use std::io::Write;
                 st.unmapped_bc_counts.flush_to(&mut *file);
             }
         }

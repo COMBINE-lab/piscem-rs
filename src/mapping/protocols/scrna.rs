@@ -181,7 +181,8 @@ pub fn count_ns(bc: &[u8]) -> usize {
 /// is not in {A, C, G, T, a, c, g, t}.
 #[inline]
 pub fn is_all_acgt(seq: &[u8]) -> bool {
-    seq.iter().all(|&b| matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't'))
+    seq.iter()
+        .all(|&b| matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't'))
 }
 
 // ---------------------------------------------------------------------------

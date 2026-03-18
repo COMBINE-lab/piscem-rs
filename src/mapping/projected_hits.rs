@@ -235,9 +235,9 @@ mod tests {
     /// - Contig 2: ref 0, pos 500, FW
     fn make_test_table() -> (crate::index::contig_table::ContigTable, EntryEncoding) {
         let mut builder = ContigTableBuilder::new(3, 10_000, 5);
-        builder.add_occurrence(0, 0, 100, true);  // contig 0: ref0 pos100 FW
+        builder.add_occurrence(0, 0, 100, true); // contig 0: ref0 pos100 FW
         builder.add_occurrence(0, 1, 200, false); // contig 0: ref1 pos200 RC
-        builder.add_occurrence(2, 0, 500, true);  // contig 2: ref0 pos500 FW
+        builder.add_occurrence(2, 0, 500, true); // contig 2: ref0 pos500 FW
         let table = builder.build();
         let enc = table.encoding();
         (table, enc)
@@ -262,7 +262,7 @@ mod tests {
 
         let rp = hits.decode_hit(entry, &enc);
         assert_eq!(rp.pos, 100 + 10); // pos(entry) + contig_pos
-        assert!(rp.is_fw);            // contigFW == contigOri → true
+        assert!(rp.is_fw); // contigFW == contigOri → true
     }
 
     #[test]
@@ -284,7 +284,7 @@ mod tests {
 
         let rp = hits.decode_hit(entry, &enc);
         assert_eq!(rp.pos, 100 + 10); // pos(entry) + contig_pos
-        assert!(!rp.is_fw);           // contigFW != contigOri → false
+        assert!(!rp.is_fw); // contigFW != contigOri → false
     }
 
     #[test]

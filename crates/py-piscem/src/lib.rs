@@ -14,20 +14,20 @@ use std::sync::Arc;
 
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use sshash_lib::{dispatch_on_k, Kmer, KmerBits, LookupResult, StreamingQuery};
+use sshash_lib::{Kmer, KmerBits, LookupResult, StreamingQuery, dispatch_on_k};
 
 use piscem_rs::index::build_poison::{build_poison_table, verify_poison_table};
 use piscem_rs::index::reference_index::ReferenceIndex;
 use piscem_rs::mapping::binning::BinPos;
 use piscem_rs::mapping::cache::MappingCache;
+use piscem_rs::mapping::chain_state::SketchHitInfoChained;
 use piscem_rs::mapping::filters::PoisonState;
 use piscem_rs::mapping::hit_searcher::{HitSearcher, SkippingStrategy};
-use piscem_rs::mapping::hits::{MappingType, INVALID_FRAG_LEN, INVALID_MATE_POS};
+use piscem_rs::mapping::hits::SketchHitInfo;
+use piscem_rs::mapping::hits::{INVALID_FRAG_LEN, INVALID_MATE_POS, MappingType};
 use piscem_rs::mapping::map_fragment::{
     map_pe_fragment, map_pe_fragment_atac, map_se_fragment, map_se_fragment_atac,
 };
-use piscem_rs::mapping::chain_state::SketchHitInfoChained;
-use piscem_rs::mapping::hits::SketchHitInfo;
 use piscem_rs::mapping::sketch_hit_simple::SketchHitInfoSimple;
 use piscem_rs::mapping::streaming_query::PiscemStreamingQuery;
 
@@ -176,7 +176,9 @@ where
         self.inner.has_poison_table()
     }
     fn save(&self, prefix: &str) -> Result<(), String> {
-        self.inner.save(Path::new(prefix)).map_err(|e| e.to_string())
+        self.inner
+            .save(Path::new(prefix))
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -194,8 +196,10 @@ trait DynMappingEngine: Send {
     fn uses_virtual_colors(&self) -> bool;
 }
 
-struct ConcreteMappingEngine<const K: usize, S: SketchHitInfo + Send + 'static = SketchHitInfoSimple>
-where
+struct ConcreteMappingEngine<
+    const K: usize,
+    S: SketchHitInfo + Send + 'static = SketchHitInfoSimple,
+> where
     Kmer<K>: KmerBits,
 {
     index: Arc<ReferenceIndex>,
@@ -219,7 +223,10 @@ where
     cache_out: MappingCache<SketchHitInfoSimple>,
 }
 
-fn extract_result(index: &ReferenceIndex, cache: &MappingCache<impl SketchHitInfo>) -> MappingResultData {
+fn extract_result(
+    index: &ReferenceIndex,
+    cache: &MappingCache<impl SketchHitInfo>,
+) -> MappingResultData {
     let hits: Vec<MappingHitData> = cache
         .accepted_hits
         .iter()
@@ -272,7 +279,8 @@ fn apply_opts(cache: &mut MappingCache<impl SketchHitInfo>, opts: &MappingOpts) 
     cache.max_ec_card = opts.max_ec_card;
 }
 
-impl<const K: usize, S: SketchHitInfo + Send + 'static> DynMappingEngine for ConcreteMappingEngine<K, S>
+impl<const K: usize, S: SketchHitInfo + Send + 'static> DynMappingEngine
+    for ConcreteMappingEngine<K, S>
 where
     Kmer<K>: KmerBits,
 {
@@ -466,7 +474,9 @@ where
         let mut results = Vec::with_capacity(n);
         for i in 0..n {
             self.prev_query_pos = i as i32;
-            let result = self.query.lookup_with_dict(&seq[i..i + k], self.index.dict());
+            let result = self
+                .query
+                .lookup_with_dict(&seq[i..i + k], self.index.dict());
             results.push(self.resolve_lookup(&result));
         }
         results
@@ -829,9 +839,7 @@ impl PyReferenceIndex {
     fn load(py: Python<'_>, prefix: &str, load_ec: bool, load_poison: bool) -> PyResult<Self> {
         let prefix_owned = prefix.to_owned();
         let index = py
-            .detach(move || {
-                ReferenceIndex::load(Path::new(&prefix_owned), load_ec, load_poison)
-            })
+            .detach(move || ReferenceIndex::load(Path::new(&prefix_owned), load_ec, load_poison))
             .map_err(|e| PyIOError::new_err(format!("Failed to load index '{}': {}", prefix, e)))?;
         Ok(PyReferenceIndex {
             inner: make_dyn_index(index),
@@ -884,7 +892,8 @@ impl PyReferenceIndex {
             decoys.map(|v| v.into_iter().map(PathBuf::from).collect());
 
         py.detach(move || -> Result<(), String> {
-            piscem_rs::index::build::build_index(&config).map_err(|e| format!("Build failed: {e}"))?;
+            piscem_rs::index::build::build_index(&config)
+                .map_err(|e| format!("Build failed: {e}"))?;
 
             // If decoy paths were provided, build the poison table
             if let Some(ref paths) = decoy_paths {
@@ -912,14 +921,16 @@ impl PyReferenceIndex {
                 poison_path.add_extension("poison");
                 let mut f = std::fs::File::create(&poison_path)
                     .map_err(|e| format!("Failed to create {}: {e}", poison_path.display()))?;
-                table.save(&mut f)
+                table
+                    .save(&mut f)
                     .map_err(|e| format!("Failed to save poison table: {e}"))?;
 
                 let mut json_path = poison_path;
                 json_path.add_extension("json");
                 let mut f = std::fs::File::create(&json_path)
                     .map_err(|e| format!("Failed to create {}: {e}", json_path.display()))?;
-                table.save_stats_json(&mut f)
+                table
+                    .save_stats_json(&mut f)
                     .map_err(|e| format!("Failed to save poison stats: {e}"))?;
             }
 
@@ -929,9 +940,7 @@ impl PyReferenceIndex {
 
         // Load the final index (with poison if decoys were provided)
         let index = ReferenceIndex::load(Path::new(output_prefix), true, has_poison)
-            .map_err(|e| {
-                PyRuntimeError::new_err(format!("Failed to load built index: {}", e))
-            })?;
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to load built index: {}", e)))?;
         Ok(PyReferenceIndex {
             inner: make_dyn_index(index),
         })
@@ -1052,7 +1061,9 @@ impl PyReferenceIndex {
             ..MappingOpts::default()
         };
         Ok(PyMappingEngine {
-            engine: self.inner.make_mapping_engine(strat, opts, struct_constraints),
+            engine: self
+                .inner
+                .make_mapping_engine(strat, opts, struct_constraints),
         })
     }
 

@@ -34,7 +34,10 @@ impl Protocol for BulkProtocol {
 
     fn extract_mappable_reads<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> AlignableReads<'a> {
         if self.is_paired {
-            AlignableReads::Paired { read1: r1, read2: r2 }
+            AlignableReads::Paired {
+                read1: r1,
+                read2: r2,
+            }
         } else {
             AlignableReads::Single(r1)
         }

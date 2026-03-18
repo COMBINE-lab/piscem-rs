@@ -78,12 +78,7 @@ impl RefSigInfo {
                 return None;
             }
         };
-        let get = |key: &str| {
-            v.get(key)
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_owned()
-        };
+        let get = |key: &str| v.get(key).and_then(|s| s.as_str()).unwrap_or("").to_owned();
         info!("Loaded reference signatures from {}", path.display());
         Some(Self {
             sha256_names: get("sha256_names"),
@@ -206,7 +201,10 @@ impl ReferenceIndex {
         let ec_table = if load_ec {
             let ectab_path = with_ext(prefix, ECTAB_EXT);
             if ectab_path.exists() {
-                info!("Loading equivalence class table from {}", ectab_path.display());
+                info!(
+                    "Loading equivalence class table from {}",
+                    ectab_path.display()
+                );
                 let ectab_file = std::fs::File::open(&ectab_path)
                     .with_context(|| format!("failed to open {}", ectab_path.display()))?;
                 let mut ectab_reader = std::io::BufReader::new(ectab_file);
@@ -220,7 +218,10 @@ impl ReferenceIndex {
                 );
                 Some(ec)
             } else {
-                info!("No equivalence class table found at {}", ectab_path.display());
+                info!(
+                    "No equivalence class table found at {}",
+                    ectab_path.display()
+                );
                 None
             }
         } else {
@@ -450,13 +451,7 @@ impl ReferenceIndex {
         let global_pos = result.kmer_id + result.string_id * (k as u64 - 1);
         let ref_range = self.contig_table.contig_entries(result.string_id);
         Some(ProjectedHits::new(
-            contig_id,
-            contig_pos,
-            is_forward,
-            contig_len,
-            global_pos,
-            k,
-            ref_range,
+            contig_id, contig_pos, is_forward, contig_len, global_pos, k, ref_range,
         ))
     }
 

@@ -21,12 +21,12 @@ use anyhow::{Context, Result, bail};
 use epserde::deser::Deserialize;
 use epserde::ser::Serialize;
 use mem_dbg::{MemSize, SizeFlags};
+use std::io::{Read, Write};
 use sux::bits::bit_field_vec::BitFieldVec;
-use sux::dict::elias_fano::{EliasFanoBuilder, EfSeq};
+use sux::dict::elias_fano::{EfSeq, EliasFanoBuilder};
 use sux::traits::IndexedSeq;
 use value_traits::slices::SliceByValue;
 use value_traits::slices::SliceByValueMut;
-use std::io::{Read, Write};
 
 // ---------------------------------------------------------------------------
 // Entry encoding / decoding helpers
@@ -58,7 +58,11 @@ impl EntryEncoding {
             num_ref_bits,
             entry_width: ref_len_bits + num_ref_bits + 1,
             ref_shift: ref_len_bits + 1,
-            pos_mask: if ref_len_bits == 0 { 0 } else { (1u64 << ref_len_bits) - 1 },
+            pos_mask: if ref_len_bits == 0 {
+                0
+            } else {
+                (1u64 << ref_len_bits) - 1
+            },
         }
     }
 
@@ -300,11 +304,15 @@ impl ContigTable {
     /// Deserialize a contig table from a reader.
     pub fn load<R: Read>(reader: &mut R) -> Result<Self> {
         let mut magic = [0u8; 8];
-        reader.read_exact(&mut magic)
+        reader
+            .read_exact(&mut magic)
             .context("failed to read contig table magic")?;
         if magic != *CONTIG_TABLE_MAGIC {
-            bail!("invalid contig table magic: expected {:?}, got {:?}",
-                  CONTIG_TABLE_MAGIC, magic);
+            bail!(
+                "invalid contig table magic: expected {:?}, got {:?}",
+                CONTIG_TABLE_MAGIC,
+                magic
+            );
         }
 
         let ref_len_bits = read_u64_le(reader).context("failed to read ref_len_bits")?;
@@ -415,7 +423,11 @@ impl ContigTableBuilder {
 
         // Build Elias-Fano from offsets
         let n = offsets.len();
-        let u = if n > 0 { offsets[n - 1] as usize + 1 } else { 1 };
+        let u = if n > 0 {
+            offsets[n - 1] as usize + 1
+        } else {
+            1
+        };
         let mut ef_builder = EliasFanoBuilder::new(n, u);
         for &v in &offsets {
             ef_builder.push(v as usize);
@@ -488,7 +500,11 @@ impl ContigTableDirectBuilder {
 
         // Build Elias-Fano from offsets
         let n = offsets.len();
-        let u = if n > 0 { offsets[n - 1] as usize + 1 } else { 1 };
+        let u = if n > 0 {
+            offsets[n - 1] as usize + 1
+        } else {
+            1
+        };
         let mut ef_builder = EliasFanoBuilder::new(n, u);
         for &v in &offsets {
             ef_builder.push(v as usize);
@@ -558,7 +574,7 @@ mod tests {
         // Verify bit widths
         assert_eq!(enc.ref_len_bits, 20); // ceil_log2(1_000_001) = 20
         assert_eq!(enc.num_ref_bits, 17); // ceil_log2(100_001) = 17
-        assert_eq!(enc.entry_width, 38);  // 20 + 17 + 1
+        assert_eq!(enc.entry_width, 38); // 20 + 17 + 1
 
         // Roundtrip test
         let test_cases = [
@@ -571,12 +587,21 @@ mod tests {
 
         for (ref_id, position, is_fw) in test_cases {
             let encoded = enc.encode(ref_id, position, is_fw);
-            assert_eq!(enc.transcript_id(encoded), ref_id,
-                       "ref_id mismatch for ({ref_id}, {position}, {is_fw})");
-            assert_eq!(enc.pos(encoded), position,
-                       "position mismatch for ({ref_id}, {position}, {is_fw})");
-            assert_eq!(enc.orientation(encoded), is_fw,
-                       "orientation mismatch for ({ref_id}, {position}, {is_fw})");
+            assert_eq!(
+                enc.transcript_id(encoded),
+                ref_id,
+                "ref_id mismatch for ({ref_id}, {position}, {is_fw})"
+            );
+            assert_eq!(
+                enc.pos(encoded),
+                position,
+                "position mismatch for ({ref_id}, {position}, {is_fw})"
+            );
+            assert_eq!(
+                enc.orientation(encoded),
+                is_fw,
+                "orientation mismatch for ({ref_id}, {position}, {is_fw})"
+            );
         }
     }
 

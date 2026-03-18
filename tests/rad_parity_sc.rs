@@ -22,13 +22,10 @@ use piscem_rs::verify::rad_compare::compare_sc_rad_full;
 // Paths
 // ---------------------------------------------------------------------------
 
-const CFISH_PREFIX: &str =
-    "test_data/gencode_pc_v44_dbg/gencode_pc_v44_index_cfish";
-const CPP_INDEX_PREFIX: &str =
-    "test_data/gencode_pc_v44_index_cpp_from_dbg/gencode_pc_v44_index";
+const CFISH_PREFIX: &str = "test_data/gencode_pc_v44_dbg/gencode_pc_v44_index_cfish";
+const CPP_INDEX_PREFIX: &str = "test_data/gencode_pc_v44_index_cpp_from_dbg/gencode_pc_v44_index";
 const RUST_INDEX_DIR: &str = "test_data/gencode_pc_v44_index_rust";
-const RUST_INDEX_PREFIX: &str =
-    "test_data/gencode_pc_v44_index_rust/gencode_pc_v44_index";
+const RUST_INDEX_PREFIX: &str = "test_data/gencode_pc_v44_index_rust/gencode_pc_v44_index";
 const BULK_READ2: &str = "test_data/sim_1M_2.fq.gz";
 const CPP_SC_BIN: &str = "piscem-cpp/build/pesc-sc";
 const CPP_BUILD_BIN: &str = "piscem-cpp/build/build";
@@ -53,17 +50,21 @@ fn ensure_cpp_index() -> Result<()> {
     }
 
     eprintln!("Building C++ index from cuttlefish output...");
-    std::fs::create_dir_all(CPP_INDEX_DIR)
-        .context("creating C++ index directory")?;
+    std::fs::create_dir_all(CPP_INDEX_DIR).context("creating C++ index directory")?;
 
     let status = Command::new(CPP_BUILD_BIN)
-        .arg("-i").arg(CFISH_PREFIX)
-        .arg("-k").arg("31")
-        .arg("-m").arg("19")
-        .arg("-o").arg(CPP_INDEX_PREFIX)
+        .arg("-i")
+        .arg(CFISH_PREFIX)
+        .arg("-k")
+        .arg("31")
+        .arg("-m")
+        .arg("19")
+        .arg("-o")
+        .arg(CPP_INDEX_PREFIX)
         .arg("--canonical")
         .arg("--build-ec-table")
-        .arg("-t").arg("4")
+        .arg("-t")
+        .arg("4")
         .arg("--quiet")
         .status()
         .context("failed to run C++ index builder")?;
@@ -82,8 +83,7 @@ fn ensure_rust_index() -> Result<()> {
     }
 
     eprintln!("Building Rust index from cuttlefish output...");
-    std::fs::create_dir_all(RUST_INDEX_DIR)
-        .context("creating rust index directory")?;
+    std::fs::create_dir_all(RUST_INDEX_DIR).context("creating rust index directory")?;
 
     let config = BuildConfig {
         input_prefix: PathBuf::from(CFISH_PREFIX),
@@ -146,8 +146,8 @@ fn generate_sc_test_data(num_reads: usize) -> Result<(PathBuf, PathBuf)> {
     eprintln!("Generating synthetic V3 SC test data ({num_reads} reads)...");
 
     // Read R2 from bulk test data (use first `num_reads` reads)
-    let (r2_reader, _) = niffler::send::from_path(BULK_READ2)
-        .with_context(|| format!("open {}", BULK_READ2))?;
+    let (r2_reader, _) =
+        niffler::send::from_path(BULK_READ2).with_context(|| format!("open {}", BULK_READ2))?;
     let r2_bufreader = std::io::BufReader::new(r2_reader);
 
     // Parse R2 FASTQ records
@@ -174,7 +174,9 @@ fn generate_sc_test_data(num_reads: usize) -> Result<(PathBuf, PathBuf)> {
     if r2_records.len() < num_reads {
         anyhow::bail!(
             "Only {} reads in {}, need {}",
-            r2_records.len(), BULK_READ2, num_reads
+            r2_records.len(),
+            BULK_READ2,
+            num_reads
         );
     }
 
@@ -196,7 +198,7 @@ fn generate_sc_test_data(num_reads: usize) -> Result<(PathBuf, PathBuf)> {
         let umi = make_umi(i);
 
         // R1: @name\n[BC][UMI][suffix]\n+\n[qual]\n
-        r1_writer.write_all(&name)?;
+        r1_writer.write_all(name)?;
         r1_writer.write_all(b"\n")?;
         r1_writer.write_all(&bc)?;
         r1_writer.write_all(&umi)?;
@@ -206,7 +208,7 @@ fn generate_sc_test_data(num_reads: usize) -> Result<(PathBuf, PathBuf)> {
         r1_writer.write_all(b"\n")?;
 
         // R2: pass-through
-        r2_writer.write_all(&name)?;
+        r2_writer.write_all(name)?;
         r2_writer.write_all(b"\n")?;
         r2_writer.write_all(seq)?;
         r2_writer.write_all(b"\n+\n")?;
@@ -224,20 +226,21 @@ fn generate_sc_test_data(num_reads: usize) -> Result<(PathBuf, PathBuf)> {
 }
 
 /// Run the C++ SC mapper.
-fn run_cpp_sc(
-    r1: &Path,
-    r2: &Path,
-    output_dir: &Path,
-    threads: usize,
-) -> Result<()> {
+fn run_cpp_sc(r1: &Path, r2: &Path, output_dir: &Path, threads: usize) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
     let mut cmd = Command::new(CPP_SC_BIN);
-    cmd.arg("-i").arg(CPP_INDEX_PREFIX)
-        .arg("-o").arg(output_dir)
-        .arg("-g").arg("chromium_v3")
-        .arg("-t").arg(threads.to_string())
-        .arg("-1").arg(r1)
-        .arg("-2").arg(r2)
+    cmd.arg("-i")
+        .arg(CPP_INDEX_PREFIX)
+        .arg("-o")
+        .arg(output_dir)
+        .arg("-g")
+        .arg("chromium_v3")
+        .arg("-t")
+        .arg(threads.to_string())
+        .arg("-1")
+        .arg(r1)
+        .arg("-2")
+        .arg(r2)
         .arg("--no-poison")
         .arg("--quiet");
     eprintln!("Running C++ SC mapper: {:?}", cmd);
@@ -249,12 +252,7 @@ fn run_cpp_sc(
 }
 
 /// Run the Rust SC mapper as a subprocess.
-fn run_rust_sc(
-    r1: &Path,
-    r2: &Path,
-    output_dir: &Path,
-    threads: usize,
-) -> Result<()> {
+fn run_rust_sc(r1: &Path, r2: &Path, output_dir: &Path, threads: usize) -> Result<()> {
     let bin = PathBuf::from("target/release/piscem-rs");
     let bin = if bin.exists() {
         bin
@@ -264,12 +262,18 @@ fn run_rust_sc(
 
     let mut cmd = Command::new(&bin);
     cmd.arg("map-scrna")
-        .arg("-i").arg(RUST_INDEX_PREFIX)
-        .arg("-o").arg(output_dir)
-        .arg("-g").arg("chromium_v3")
-        .arg("-t").arg(threads.to_string())
-        .arg("-1").arg(r1)
-        .arg("-2").arg(r2)
+        .arg("-i")
+        .arg(RUST_INDEX_PREFIX)
+        .arg("-o")
+        .arg(output_dir)
+        .arg("-g")
+        .arg("chromium_v3")
+        .arg("-t")
+        .arg(threads.to_string())
+        .arg("-1")
+        .arg(r1)
+        .arg("-2")
+        .arg(r2)
         .arg("--no-poison");
     eprintln!("Running Rust SC mapper: {:?}", cmd);
     let status = cmd.status().context("failed to run Rust SC mapper")?;
@@ -308,8 +312,8 @@ fn sc_v3_rad_parity() {
     ensure_rust_index().expect("failed to build Rust index");
 
     // 2. Generate synthetic SC test data (10K reads)
-    let (r1_path, r2_path) = generate_sc_test_data(10_000)
-        .expect("failed to generate SC test data");
+    let (r1_path, r2_path) =
+        generate_sc_test_data(10_000).expect("failed to generate SC test data");
 
     // 3. Create temp directories
     let tmpdir = tempfile::tempdir().expect("failed to create tempdir");
@@ -317,21 +321,26 @@ fn sc_v3_rad_parity() {
     let rust_out_dir = tmpdir.path().join("rust_out");
 
     // 4. Run both mappers with 1 thread for determinism
-    run_cpp_sc(&r1_path, &r2_path, &cpp_out_dir, 1)
-        .expect("C++ SC mapper failed");
-    run_rust_sc(&r1_path, &r2_path, &rust_out_dir, 1)
-        .expect("Rust SC mapper failed");
+    run_cpp_sc(&r1_path, &r2_path, &cpp_out_dir, 1).expect("C++ SC mapper failed");
+    run_rust_sc(&r1_path, &r2_path, &rust_out_dir, 1).expect("Rust SC mapper failed");
 
     // 5. Compare RAD files
     let cpp_rad = cpp_out_dir.join("map.rad");
     let rust_rad = rust_out_dir.join("map.rad");
 
-    assert!(cpp_rad.exists(), "C++ RAD file not found: {}", cpp_rad.display());
-    assert!(rust_rad.exists(), "Rust RAD file not found: {}", rust_rad.display());
+    assert!(
+        cpp_rad.exists(),
+        "C++ RAD file not found: {}",
+        cpp_rad.display()
+    );
+    assert!(
+        rust_rad.exists(),
+        "Rust RAD file not found: {}",
+        rust_rad.display()
+    );
 
     eprintln!("Comparing SC RAD files...");
-    let result = compare_sc_rad_full(&cpp_rad, &rust_rad)
-        .expect("failed to compare SC RAD files");
+    let result = compare_sc_rad_full(&cpp_rad, &rust_rad).expect("failed to compare SC RAD files");
 
     eprintln!("SC Comparison result:");
     eprintln!("  Header match: {}", result.header_match);
@@ -355,11 +364,13 @@ fn sc_v3_rad_parity() {
     };
     eprintln!(
         "  C++ mapping rate: {:.2}% ({}/10K)",
-        result.total_records_a as f64 / 100.0, result.total_records_a
+        result.total_records_a as f64 / 100.0,
+        result.total_records_a
     );
     eprintln!(
         "  Rust mapping rate: {:.2}% ({}/10K)",
-        result.total_records_b as f64 / 100.0, result.total_records_b
+        result.total_records_b as f64 / 100.0,
+        result.total_records_b
     );
     eprintln!(
         "  Record match rate: {:.2}% ({}/{})",
@@ -400,12 +411,18 @@ const SC_READ2: &str = "test_data/pbmc_10k_r2.fq.gz";
 fn run_cpp_sc_struct_constraints(output_dir: &Path, threads: usize) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
     let mut cmd = Command::new(CPP_SC_BIN);
-    cmd.arg("-i").arg(CPP_INDEX_NOPOISON_PREFIX)
-        .arg("-o").arg(output_dir)
-        .arg("-g").arg("chromium_v3")
-        .arg("-t").arg(threads.to_string())
-        .arg("-1").arg(SC_READ1)
-        .arg("-2").arg(SC_READ2)
+    cmd.arg("-i")
+        .arg(CPP_INDEX_NOPOISON_PREFIX)
+        .arg("-o")
+        .arg(output_dir)
+        .arg("-g")
+        .arg("chromium_v3")
+        .arg("-t")
+        .arg(threads.to_string())
+        .arg("-1")
+        .arg(SC_READ1)
+        .arg("-2")
+        .arg(SC_READ2)
         .arg("--no-poison")
         .arg("--struct-constraints")
         .arg("--quiet");
@@ -428,12 +445,18 @@ fn run_rust_sc_struct_constraints(output_dir: &Path, threads: usize) -> Result<(
 
     let mut cmd = Command::new(&bin);
     cmd.arg("map-scrna")
-        .arg("-i").arg(RUST_INDEX_OPT_PREFIX)
-        .arg("-o").arg(output_dir)
-        .arg("-g").arg("chromium_v3")
-        .arg("-t").arg(threads.to_string())
-        .arg("-1").arg(SC_READ1)
-        .arg("-2").arg(SC_READ2)
+        .arg("-i")
+        .arg(RUST_INDEX_OPT_PREFIX)
+        .arg("-o")
+        .arg(output_dir)
+        .arg("-g")
+        .arg("chromium_v3")
+        .arg("-t")
+        .arg(threads.to_string())
+        .arg("-1")
+        .arg(SC_READ1)
+        .arg("-2")
+        .arg(SC_READ2)
         .arg("--no-poison")
         .arg("--struct-constraints");
     eprintln!("Running Rust SC mapper (struct-constraints): {:?}", cmd);
@@ -485,12 +508,19 @@ fn sc_v3_rad_parity_struct_constraints() {
     let cpp_rad = cpp_out_dir.join("map.rad");
     let rust_rad = rust_out_dir.join("map.rad");
 
-    assert!(cpp_rad.exists(), "C++ RAD file not found: {}", cpp_rad.display());
-    assert!(rust_rad.exists(), "Rust RAD file not found: {}", rust_rad.display());
+    assert!(
+        cpp_rad.exists(),
+        "C++ RAD file not found: {}",
+        cpp_rad.display()
+    );
+    assert!(
+        rust_rad.exists(),
+        "Rust RAD file not found: {}",
+        rust_rad.display()
+    );
 
     eprintln!("Comparing SC RAD files (struct-constraints)...");
-    let result = compare_sc_rad_full(&cpp_rad, &rust_rad)
-        .expect("failed to compare SC RAD files");
+    let result = compare_sc_rad_full(&cpp_rad, &rust_rad).expect("failed to compare SC RAD files");
 
     eprintln!("SC struct-constraints comparison result:");
     eprintln!("  Header match: {}", result.header_match);
@@ -551,23 +581,20 @@ fn sc_v3_rad_parity_1m() {
     ensure_cpp_index().expect("failed to build C++ index");
     ensure_rust_index().expect("failed to build Rust index");
 
-    let (r1_path, r2_path) = generate_sc_test_data(1_000_000)
-        .expect("failed to generate SC test data");
+    let (r1_path, r2_path) =
+        generate_sc_test_data(1_000_000).expect("failed to generate SC test data");
 
     let tmpdir = tempfile::tempdir().expect("failed to create tempdir");
     let cpp_out_dir = tmpdir.path().join("cpp_out");
     let rust_out_dir = tmpdir.path().join("rust_out");
 
-    run_cpp_sc(&r1_path, &r2_path, &cpp_out_dir, 1)
-        .expect("C++ SC mapper failed");
-    run_rust_sc(&r1_path, &r2_path, &rust_out_dir, 1)
-        .expect("Rust SC mapper failed");
+    run_cpp_sc(&r1_path, &r2_path, &cpp_out_dir, 1).expect("C++ SC mapper failed");
+    run_rust_sc(&r1_path, &r2_path, &rust_out_dir, 1).expect("Rust SC mapper failed");
 
     let cpp_rad = cpp_out_dir.join("map.rad");
     let rust_rad = rust_out_dir.join("map.rad");
 
-    let result = compare_sc_rad_full(&cpp_rad, &rust_rad)
-        .expect("failed to compare SC RAD files");
+    let result = compare_sc_rad_full(&cpp_rad, &rust_rad).expect("failed to compare SC RAD files");
 
     eprintln!("SC 1M Comparison result:");
     eprintln!("  Records A (C++): {}", result.total_records_a);

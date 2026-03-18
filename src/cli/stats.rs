@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Args;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
 use crate::index::reference_index::ReferenceIndex;
@@ -94,46 +94,61 @@ pub fn run(args: StatsArgs) -> Result<()> {
     root.insert("k".to_string(), json!(index.k()));
     root.insert("m".to_string(), json!(index.m()));
 
-    root.insert("references".to_string(), json!({
-        "num_refs": num_refs,
-        "total_length": total_ref_len,
-        "min_length": min_ref_len,
-        "max_length": max_ref_len,
-        "mean_length": (mean_ref_len * 100.0).round() / 100.0,
-    }));
+    root.insert(
+        "references".to_string(),
+        json!({
+            "num_refs": num_refs,
+            "total_length": total_ref_len,
+            "min_length": min_ref_len,
+            "max_length": max_ref_len,
+            "mean_length": (mean_ref_len * 100.0).round() / 100.0,
+        }),
+    );
 
-    root.insert("dictionary".to_string(), json!({
-        "num_unitigs": dict.num_strings(),
-        "num_minimizers": dict.num_minimizers(),
-        "num_bits": dict.num_bits(),
-        "canonical": dict.canonical(),
-    }));
+    root.insert(
+        "dictionary".to_string(),
+        json!({
+            "num_unitigs": dict.num_strings(),
+            "num_minimizers": dict.num_minimizers(),
+            "num_bits": dict.num_bits(),
+            "canonical": dict.canonical(),
+        }),
+    );
 
-    root.insert("contig_table".to_string(), json!({
-        "num_contigs": num_contigs,
-        "num_entries": num_entries,
-        "entry_width_bits": entry_width_bits,
-        "ref_id_bits": ctab.num_ref_bits(),
-        "position_bits": ctab.ref_len_bits(),
-        "ref_shift": encoding.ref_shift,
-        "pos_mask": format!("0x{:x}", encoding.pos_mask),
-        "max_entries_per_contig": max_entries_per_contig,
-        "contigs_with_zero_entries": contigs_with_zero_entries,
-    }));
+    root.insert(
+        "contig_table".to_string(),
+        json!({
+            "num_contigs": num_contigs,
+            "num_entries": num_entries,
+            "entry_width_bits": entry_width_bits,
+            "ref_id_bits": ctab.num_ref_bits(),
+            "position_bits": ctab.ref_len_bits(),
+            "ref_shift": encoding.ref_shift,
+            "pos_mask": format!("0x{:x}", encoding.pos_mask),
+            "max_entries_per_contig": max_entries_per_contig,
+            "contigs_with_zero_entries": contigs_with_zero_entries,
+        }),
+    );
 
     if let Some(ec) = index.ec_table() {
-        root.insert("eq_class_table".to_string(), json!({
-            "num_tiles": ec.num_tiles(),
-            "num_ecs": ec.num_ecs(),
-            "num_label_entries": ec.num_label_entries(),
-        }));
+        root.insert(
+            "eq_class_table".to_string(),
+            json!({
+                "num_tiles": ec.num_tiles(),
+                "num_ecs": ec.num_ecs(),
+                "num_label_entries": ec.num_label_entries(),
+            }),
+        );
     }
 
     if let Some(pt) = index.poison_table() {
-        root.insert("poison_table".to_string(), json!({
-            "num_poison_kmers": pt.num_poison_kmers(),
-            "num_poison_occurrences": pt.num_poison_occs(),
-        }));
+        root.insert(
+            "poison_table".to_string(),
+            json!({
+                "num_poison_kmers": pt.num_poison_kmers(),
+                "num_poison_occurrences": pt.num_poison_occs(),
+            }),
+        );
     }
 
     root.insert("size_on_disk_bytes".to_string(), Value::Object(file_sizes));

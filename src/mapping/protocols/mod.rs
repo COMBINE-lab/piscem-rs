@@ -60,10 +60,7 @@ pub enum AlignableReads<'a> {
     Single(&'a [u8]),
     /// Two biological reads for PE mapping.
     /// `read1` and `read2` are the two ends of the fragment.
-    Paired {
-        read1: &'a [u8],
-        read2: &'a [u8],
-    },
+    Paired { read1: &'a [u8], read2: &'a [u8] },
 }
 
 impl<'a> AlignableReads<'a> {

@@ -8,8 +8,8 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use crossbeam::channel;
@@ -252,10 +252,9 @@ where
             for path_str in decoy_paths_ref {
                 let path: &Path = path_str.as_path();
                 info!("Reading decoy sequences from {}", path.display());
-                let (reader, _format) = niffler::send::from_path(path)
-                    .unwrap_or_else(|e| {
-                        panic!("failed to open {} for decompression: {}", path.display(), e)
-                    });
+                let (reader, _format) = niffler::send::from_path(path).unwrap_or_else(|e| {
+                    panic!("failed to open {} for decompression: {}", path.display(), e)
+                });
                 let n = read_fasta_records(reader, &sender_for_producer)
                     .unwrap_or_else(|e| panic!("error reading {}: {}", path.display(), e));
                 total_seqs_ref.fetch_add(n, Ordering::Relaxed);
@@ -315,10 +314,7 @@ where
 /// Verify that no poison k-mers are present in the reference dictionary.
 ///
 /// Returns the number of poison k-mers found in the dictionary (should be 0).
-pub fn verify_poison_table<const K: usize>(
-    table: &PoisonTable,
-    index: &ReferenceIndex,
-) -> usize
+pub fn verify_poison_table<const K: usize>(table: &PoisonTable, index: &ReferenceIndex) -> usize
 where
     Kmer<K>: KmerBits,
 {
@@ -351,20 +347,26 @@ where
             if found_in_dict <= 10 {
                 info!(
                     "WARNING: poison k-mer {} (canonical={}) FOUND in dictionary!",
-                    std::str::from_utf8(&s).unwrap_or("???"), raw,
+                    std::str::from_utf8(&s).unwrap_or("???"),
+                    raw,
                 );
             }
         }
         checked += 1;
         if checked.is_multiple_of(500_000) {
-            info!("Verified {}/{} poison k-mers ({} in dict so far)",
-                checked, table.num_poison_kmers(), found_in_dict);
+            info!(
+                "Verified {}/{} poison k-mers ({} in dict so far)",
+                checked,
+                table.num_poison_kmers(),
+                found_in_dict
+            );
         }
     }
 
     info!(
         "Poison verification: {}/{} k-mers found in dictionary",
-        found_in_dict, table.num_poison_kmers()
+        found_in_dict,
+        table.num_poison_kmers()
     );
     found_in_dict
 }

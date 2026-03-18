@@ -4,9 +4,7 @@
 //! by our RAD writer and that we can read them back.
 
 use paraseq::Record;
-use piscem_rs::io::rad::{
-    write_rad_header_bulk, write_rad_header_sc, write_rad_header_atac,
-};
+use piscem_rs::io::rad::{write_rad_header_atac, write_rad_header_bulk, write_rad_header_sc};
 
 #[test]
 fn parity_smoke_bulk_header_roundtrip() {
@@ -24,8 +22,7 @@ fn parity_smoke_bulk_header_roundtrip() {
 fn parity_smoke_sc_header_roundtrip() {
     let mut buf = Vec::new();
     let names = vec!["gene1", "gene2"];
-    let (chunk_off, rlen_off) =
-        write_rad_header_sc(&mut buf, 2, &names, 16, 12, true).unwrap();
+    let (chunk_off, rlen_off) = write_rad_header_sc(&mut buf, 2, &names, 16, 12, true).unwrap();
 
     assert!(chunk_off > 0);
     assert!(rlen_off.is_some());
@@ -37,8 +34,7 @@ fn parity_smoke_atac_header_roundtrip() {
     let mut buf = Vec::new();
     let names = vec!["chr1"];
     let ref_lens = vec![248956422u32];
-    let chunk_off =
-        write_rad_header_atac(&mut buf, 1, &names, &ref_lens, 16).unwrap();
+    let chunk_off = write_rad_header_atac(&mut buf, 1, &names, &ref_lens, 16).unwrap();
 
     assert!(chunk_off > 0);
     assert_eq!(buf[0], 1); // is_paired=true for ATAC
@@ -54,19 +50,23 @@ fn integration_rust_index_lookup() {
 
     let index_prefix = Path::new("test_data/gencode_pc_v44_index_rust/gencode_pc_v44_index");
     if !index_prefix.with_extension("ssi").exists() {
-        eprintln!("Skipping: Rust index not found at {}", index_prefix.display());
+        eprintln!(
+            "Skipping: Rust index not found at {}",
+            index_prefix.display()
+        );
         return;
     }
 
-    let index = piscem_rs::index::reference_index::ReferenceIndex::load(
-        index_prefix, true, false,
-    )
-    .expect("failed to load Rust index");
+    let index = piscem_rs::index::reference_index::ReferenceIndex::load(index_prefix, true, false)
+        .expect("failed to load Rust index");
 
     let dict = index.dict();
     eprintln!(
         "Index loaded: k={}, {} refs, {} strings, canonical={}",
-        index.k(), index.num_refs(), dict.num_strings(), dict.canonical()
+        index.k(),
+        index.num_refs(),
+        dict.num_strings(),
+        dict.canonical()
     );
 
     // Read first read from test FASTQ
@@ -123,8 +123,13 @@ fn integration_rust_index_lookup() {
 
     eprintln!(
         "Total: {}/{} k-mers found ({:.1}%)",
-        found_kmers, total_kmers,
-        if total_kmers > 0 { found_kmers as f64 / total_kmers as f64 * 100.0 } else { 0.0 }
+        found_kmers,
+        total_kmers,
+        if total_kmers > 0 {
+            found_kmers as f64 / total_kmers as f64 * 100.0
+        } else {
+            0.0
+        }
     );
 
     assert!(

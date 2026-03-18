@@ -3,7 +3,7 @@ members = [".", "crates/py-piscem"]
 
 [package]
 name = "piscem-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.91"
 license = "BSD-3-Clause"
@@ -65,13 +65,13 @@ value-traits = "0.2"
 mem_dbg = "0.4.0"
 
 # RAD file parsing — optional, enabled by parity-test feature
-libradicl = { version = "0.11", optional = true }
+libradicl = { version = "0.12", optional = true }
 mimalloc = { version = "0.1.48", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
-libradicl = "0.11"
+libradicl = "0.12"
 
 # Examples that need optional features (excluded from publish but needed locally).
 [[example]]
@@ -80,6 +80,10 @@ required-features = ["parity-test"]
 
 [[example]]
 name = "test_atac_compare"
+required-features = ["parity-test"]
+
+[[example]]
+name = "compare_rad"
 required-features = ["parity-test"]
 
 [profile.release]

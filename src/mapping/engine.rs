@@ -51,8 +51,7 @@ where
     let apply_poison_filter = poison_state.is_valid();
     let perform_ambig_filtering = index.has_ec_table();
 
-    cache.has_matching_kmers =
-        hs.get_raw_hits_sketch::<K>(read_seq, query, strat, true);
+    cache.has_matching_kmers = hs.get_raw_hits_sketch::<K>(read_seq, query, strat, true);
     let mut early_stop = false;
 
     let max_ec_ambig = cache.max_ec_card as usize;
@@ -62,8 +61,7 @@ where
 
         // Poison filter
         if apply_poison_filter {
-            let was_poisoned =
-                poison_state.scan_raw_hits(read_seq, k as u32, raw_hits, strat);
+            let was_poisoned = poison_state.scan_raw_hits(read_seq, k as u32, raw_hits, strat);
             if was_poisoned {
                 poison_state.poison_read();
                 cache.map_type = MappingType::Unmapped;
@@ -130,36 +128,35 @@ where
             let mut min_cardinality_index: u32 = 0;
             let mut visited: usize = 0;
 
-            let visit_ec =
-                |hit_map: &mut AHashMap<u32, S>, ent: u64, fw_on_contig: bool| {
-                    let tid = ec_entry_transcript_id(ent);
-                    if let Some(target) = hit_map.get_mut(&tid) {
-                        let ori = ent & 0x3;
-                        match ori {
-                            0 => {
-                                // FW
-                                if fw_on_contig {
-                                    target.inc_fw_hits();
-                                } else {
-                                    target.inc_rc_hits();
-                                }
-                            }
-                            1 => {
-                                // RC
-                                if fw_on_contig {
-                                    target.inc_rc_hits();
-                                } else {
-                                    target.inc_fw_hits();
-                                }
-                            }
-                            _ => {
-                                // Both
+            let visit_ec = |hit_map: &mut AHashMap<u32, S>, ent: u64, fw_on_contig: bool| {
+                let tid = ec_entry_transcript_id(ent);
+                if let Some(target) = hit_map.get_mut(&tid) {
+                    let ori = ent & 0x3;
+                    match ori {
+                        0 => {
+                            // FW
+                            if fw_on_contig {
                                 target.inc_fw_hits();
+                            } else {
                                 target.inc_rc_hits();
                             }
                         }
+                        1 => {
+                            // RC
+                            if fw_on_contig {
+                                target.inc_rc_hits();
+                            } else {
+                                target.inc_fw_hits();
+                            }
+                        }
+                        _ => {
+                            // Both
+                            target.inc_fw_hits();
+                            target.inc_rc_hits();
+                        }
                     }
-                };
+                }
+            };
 
             for &hit_idx in &cache.ambiguous_hit_indices {
                 let proj_hit = &raw_hits[hit_idx as usize].1;
@@ -282,8 +279,7 @@ where
     let perform_ambig_filtering = index.has_ec_table();
 
     // Use every-kmer hit collection (matching C++ ATAC behavior)
-    cache.has_matching_kmers =
-        hs.get_raw_hits_sketch_everykmer::<K>(read_seq, query, true);
+    cache.has_matching_kmers = hs.get_raw_hits_sketch_everykmer::<K>(read_seq, query, true);
 
     let max_ec_ambig = cache.max_ec_card as usize;
 
@@ -372,9 +368,7 @@ where
             // C++ visit_ec: uses (ent >> 2) as key, which is tid, not bin_id.
             // In bin-keyed map this is mostly a no-op, but we match C++ exactly.
             let visit_ec =
-                |hit_map: &mut HashMap<u64, BinnedHitEntry<S>>,
-                 ent: u64,
-                 fw_on_contig: bool| {
+                |hit_map: &mut HashMap<u64, BinnedHitEntry<S>>, ent: u64, fw_on_contig: bool| {
                     let tid_as_key = ec_entry_transcript_id(ent) as u64;
                     if let Some(target) = hit_map.get_mut(&tid_as_key) {
                         let ori = ent & 0x3;
@@ -531,11 +525,21 @@ fn collect_mappings_from_hits_binned<S: SketchHitInfo>(
                     target.tid = tid;
                     if ori {
                         target.info.add_fw(
-                            pos as i32, signed_read_pos, signed_rl, k, max_stretch, score_inc,
+                            pos as i32,
+                            signed_read_pos,
+                            signed_rl,
+                            k,
+                            max_stretch,
+                            score_inc,
                         );
                     } else {
                         target.info.add_rc(
-                            pos as i32, signed_read_pos, signed_rl, k, max_stretch, score_inc,
+                            pos as i32,
+                            signed_read_pos,
+                            signed_rl,
+                            k,
+                            max_stretch,
+                            score_inc,
                         );
                     }
                 }
@@ -546,11 +550,21 @@ fn collect_mappings_from_hits_binned<S: SketchHitInfo>(
                     target2.tid = tid;
                     if ori {
                         target2.info.add_fw(
-                            pos as i32, signed_read_pos, signed_rl, k, max_stretch, score_inc,
+                            pos as i32,
+                            signed_read_pos,
+                            signed_rl,
+                            k,
+                            max_stretch,
+                            score_inc,
                         );
                     } else {
                         target2.info.add_rc(
-                            pos as i32, signed_read_pos, signed_rl, k, max_stretch, score_inc,
+                            pos as i32,
+                            signed_read_pos,
+                            signed_rl,
+                            k,
+                            max_stretch,
+                            score_inc,
                         );
                     }
                 }
@@ -606,17 +620,12 @@ fn collect_mappings_from_hits<S: SketchHitInfo>(
 
                 if target.max_hits_for_target() >= *num_valid_hits {
                     if ori {
-                        target.add_fw(
-                            pos, *read_pos, signed_rl, k, max_stretch, score_inc,
-                        );
+                        target.add_fw(pos, *read_pos, signed_rl, k, max_stretch, score_inc);
                     } else {
-                        target.add_rc(
-                            pos, *read_pos, signed_rl, k, max_stretch, score_inc,
-                        );
+                        target.add_rc(pos, *read_pos, signed_rl, k, max_stretch, score_inc);
                     }
 
-                    still_have_valid_target |=
-                        target.max_hits_for_target() > *num_valid_hits;
+                    still_have_valid_target |= target.max_hits_for_target() > *num_valid_hits;
                 }
             }
 
@@ -678,8 +687,10 @@ mod tests {
 
         // Simulate having too many accepted hits
         for i in 0..5 {
-            let mut hit = SimpleHit::default();
-            hit.tid = i;
+            let hit = SimpleHit {
+                tid: i,
+                ..SimpleHit::default()
+            };
             cache.accepted_hits.push(hit);
         }
 
@@ -699,8 +710,10 @@ mod tests {
     fn test_single_mapped_classification() {
         let mut cache = MappingCache::<SketchHitInfoSimple>::new(31);
 
-        let mut hit = SimpleHit::default();
-        hit.tid = 42;
+        let hit = SimpleHit {
+            tid: 42,
+            ..SimpleHit::default()
+        };
         cache.accepted_hits.push(hit);
 
         // Apply the classification logic from map_read

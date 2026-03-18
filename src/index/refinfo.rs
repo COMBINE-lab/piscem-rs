@@ -5,7 +5,7 @@
 //! stored in the `.refinfo` file.
 
 use anyhow::{Context, Result, bail};
-use std::io::{Read, Write, BufWriter, BufReader};
+use std::io::{BufReader, BufWriter, Read, Write};
 
 /// Magic bytes for the piscem-rs refinfo file format.
 const REFINFO_MAGIC: &[u8; 8] = b"PRFINF01";
