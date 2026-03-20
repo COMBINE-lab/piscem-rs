@@ -33,7 +33,9 @@
 
 pub mod types;
 pub mod parse;
+pub mod extract;
 
 // Re-export key types at crate root
 pub use types::*;
 pub use parse::{parse_geometry, validate_geometry, format_errors};
+pub use extract::{CompiledGeom, ExtractedSeqs};

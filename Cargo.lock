@@ -2159,6 +2159,7 @@ version = "1.0.0"
 dependencies = [
  "ariadne",
  "chumsky",
+ "criterion",
  "smallvec",
  "thiserror 2.0.18",
 ]
