@@ -9,13 +9,21 @@ die() {
 usage() {
     cat <<'EOF'
 Usage:
-  ./publish.sh <version> [--publish] [--dry-run]
-  ./publish.sh [--publish] [--dry-run] <version>
+  ./publish.sh <crate> <version> [--publish] [--dry-run]
+
+Arguments:
+  <crate>    Crate to release: seq_geom_parser or piscem-rs
+  <version>  New version (X.Y.Z format)
 
 Options:
-  --publish  Publish piscem-rs after bumping and committing
-  --dry-run  Show what would be done without modifying files, creating commits, tags, or publishing
+  --publish  Publish to crates.io after bumping and committing
+  --dry-run  Show what would be done without modifying anything
   -h, --help Show this help message
+
+Examples:
+  ./publish.sh seq_geom_parser 1.0.0 --publish
+  ./publish.sh piscem-rs 0.3.0 --publish
+  ./publish.sh piscem-rs 0.3.0 --dry-run
 EOF
 }
 
@@ -33,6 +41,7 @@ run() {
     "$@"
 }
 
+CRATE=""
 VERSION=""
 PUBLISH=false
 DRY_RUN=false
@@ -53,19 +62,20 @@ while [[ $# -gt 0 ]]; do
             die "unknown option: $1"
             ;;
         *)
-            if [[ -n "$VERSION" ]]; then
-                die "version specified more than once"
+            if [[ -z "$CRATE" ]]; then
+                CRATE="$1"
+            elif [[ -z "$VERSION" ]]; then
+                VERSION="$1"
+            else
+                die "too many positional arguments"
             fi
-            VERSION="$1"
             ;;
     esac
     shift
 done
 
-[[ -n "$VERSION" ]] || {
-    usage
-    exit 1
-}
+[[ -n "$CRATE" ]] || { usage; exit 1; }
+[[ -n "$VERSION" ]] || { usage; exit 1; }
 
 if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)*$ ]]; then
     die "version must look like X.Y.Z, optionally with prerelease/build suffixes"
@@ -74,15 +84,30 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-ROOT_CARGO="Cargo.toml"
-LOCKFILE="Cargo.lock"
-TAG="piscem-rs-v${VERSION}"
+# Determine the Cargo.toml path for the crate
+case "$CRATE" in
+    piscem-rs)
+        CARGO_TOML="Cargo.toml"
+        TAG="${CRATE}-v${VERSION}"
+        PUBLISH_ARGS=""
+        ;;
+    seq_geom_parser)
+        CARGO_TOML="crates/seq_geom_parser/Cargo.toml"
+        TAG="${CRATE}-v${VERSION}"
+        PUBLISH_ARGS="-p seq_geom_parser"
+        ;;
+    *)
+        die "unknown crate: $CRATE (expected: piscem-rs or seq_geom_parser)"
+        ;;
+esac
 
-[[ -f "$ROOT_CARGO" ]] || die "not found: $ROOT_CARGO"
+LOCKFILE="Cargo.lock"
+
+[[ -f "$CARGO_TOML" ]] || die "not found: $CARGO_TOML"
 [[ -f "$LOCKFILE" ]] || die "not found: $LOCKFILE"
 
-CURRENT_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT_CARGO" | head -1)"
-[[ -n "$CURRENT_VERSION" ]] || die "could not determine current crate version from $ROOT_CARGO"
+CURRENT_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$CARGO_TOML" | head -1)"
+[[ -n "$CURRENT_VERSION" ]] || die "could not determine current crate version from $CARGO_TOML"
 
 if [[ "$CURRENT_VERSION" == "$VERSION" ]]; then
     die "crate version is already $VERSION"
@@ -96,8 +121,10 @@ if [[ -n "$(git status --porcelain)" ]]; then
     die "working tree is not clean; commit or stash existing changes first"
 fi
 
-echo "Current crate version : $CURRENT_VERSION"
-echo "New crate version     : $VERSION"
+echo "Crate                 : $CRATE"
+echo "Cargo.toml            : $CARGO_TOML"
+echo "Current version       : $CURRENT_VERSION"
+echo "New version           : $VERSION"
 echo "Tag                   : $TAG"
 if [[ "$PUBLISH" == true ]]; then
     echo "Publish crate         : yes"
@@ -111,31 +138,31 @@ else
 fi
 echo
 
-echo "Updating $ROOT_CARGO"
+echo "Updating $CARGO_TOML"
 echo "  version: $CURRENT_VERSION -> $VERSION"
 
 if [[ "$DRY_RUN" == false ]]; then
-    sed -i.bak "1,/^version = /s/^version = \".*\"/version = \"${VERSION}\"/" "$ROOT_CARGO"
-    rm -f "${ROOT_CARGO}.bak"
+    sed -i.bak "1,/^version = /s/^version = \".*\"/version = \"${VERSION}\"/" "$CARGO_TOML"
+    rm -f "${CARGO_TOML}.bak"
 fi
 
-UPDATED_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT_CARGO" | head -1)"
+UPDATED_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$CARGO_TOML" | head -1)"
 
 if [[ "$DRY_RUN" == false ]]; then
     [[ "$UPDATED_VERSION" == "$VERSION" ]] || die "crate version update failed"
 else
-    echo "Dry-run: would rewrite $ROOT_CARGO and refresh $LOCKFILE"
+    echo "Dry-run: would rewrite $CARGO_TOML and refresh $LOCKFILE"
 fi
 
 run cargo check -q
-run git add "$ROOT_CARGO" "$LOCKFILE"
-run git commit -m "chore(release): bump piscem-rs to v${VERSION}"
+run git add "$CARGO_TOML" "$LOCKFILE"
+run git commit -m "chore(release): bump ${CRATE} to v${VERSION}"
 
 if [[ "$PUBLISH" == true ]]; then
-    run cargo publish --allow-dirty
+    run cargo publish $PUBLISH_ARGS --allow-dirty
 fi
 
-run git tag -a "$TAG" -m "piscem-rs v${VERSION}"
+run git tag -a "$TAG" -m "${CRATE} v${VERSION}"
 run git push origin HEAD
 run git push origin "$TAG"
 
@@ -144,5 +171,5 @@ if [[ "$DRY_RUN" == true ]]; then
     echo "Dry-run complete"
 else
     echo
-    echo "Release bump complete for v${VERSION}"
+    echo "Release bump complete for ${CRATE} v${VERSION}"
 fi
