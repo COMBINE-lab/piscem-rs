@@ -227,16 +227,14 @@ impl CompiledGeom {
         let (r2_plan, r2_bc_info, r2_umi_len, r2_has_read) =
             compile_read_plan_with_levels(&geom.read2, &bc_level_fn)?;
 
-        // Merge barcode info from both reads
+        // Merge barcode info from both reads: take the max length at each level,
+        // since a level may appear on R1, R2, or both (with the other defaulting to 0).
         let mut bc_lens = SmallVec::new();
         let num_bc_levels = r1_bc_info.len().max(r2_bc_info.len());
         for level in 0..num_bc_levels {
-            let len = r1_bc_info
-                .get(level)
-                .or_else(|| r2_bc_info.get(level))
-                .copied()
-                .unwrap_or(0);
-            bc_lens.push(len);
+            let r1_len = r1_bc_info.get(level).copied().unwrap_or(0);
+            let r2_len = r2_bc_info.get(level).copied().unwrap_or(0);
+            bc_lens.push(r1_len.max(r2_len));
         }
 
         let umi_len = r1_umi_len.max(r2_umi_len);

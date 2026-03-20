@@ -34,6 +34,7 @@
 pub mod types;
 pub mod parse;
 pub mod extract;
+pub mod normalize;
 
 // Re-export key types at crate root
 pub use types::*;

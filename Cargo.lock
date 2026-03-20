@@ -1760,6 +1760,7 @@ dependencies = [
  "mimalloc",
  "niffler",
  "paraseq",
+ "seq_geom_parser",
  "serde",
  "serde_json",
  "smallvec",
