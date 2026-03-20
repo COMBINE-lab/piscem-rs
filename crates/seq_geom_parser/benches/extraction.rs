@@ -8,7 +8,7 @@
 //! Results are saved to `target/criterion/` with HTML reports.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
-use seq_geom_parser::{parse_geometry, validate_geometry, CompiledGeom, SimpleExtractor};
+use seq_geom_parser::{parse_geometry, validate_geometry, CompiledGeom, SimpleExtractor, ExtractionBuf};
 
 /// Generate a synthetic read of the given length filled with random-ish bases.
 fn make_read(len: usize, seed: u8) -> Vec<u8> {
@@ -222,6 +222,12 @@ fn bench_hardcoded_vs_compiled(c: &mut Criterion) {
     };
     group.bench_function("compiled_v2_direct", |b| {
         b.iter(|| simple_v2.extract(black_box(&r1), black_box(&r2)));
+    });
+
+    // Compiled v3 via extract_into (reusable buffer)
+    let mut buf = ExtractionBuf::new(compiled_v3.meta());
+    group.bench_function("compiled_v3_into", |b| {
+        b.iter(|| simple_v3.extract_into(black_box(&r1), black_box(&r2), &mut buf));
     });
 
     group.finish();

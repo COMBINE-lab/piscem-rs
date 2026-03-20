@@ -82,6 +82,49 @@ pub struct ExtractedSeqs<'a> {
     pub reads: SmallVec<[&'a [u8]; 2]>,
 }
 
+/// A reusable extraction work buffer. Create once per thread, pass to
+/// `extract_into()` on every read to avoid per-call SmallVec construction.
+///
+/// The buffer pre-allocates SmallVec storage for the expected number of
+/// barcode levels and reads. On each call, the vecs are cleared and
+/// repopulated — reusing their inline/heap storage across reads.
+///
+/// The `'a` lifetime ties extracted slices to the current read data.
+/// The buffer must be repopulated (via `extract_into`) before accessing
+/// results from a new read pair.
+#[derive(Debug)]
+pub struct ExtractionBuf<'a> {
+    /// Barcodes by level.
+    pub barcodes: SmallVec<[Option<&'a [u8]>; MAX_INLINE_BARCODES]>,
+    /// UMI sequence.
+    pub umi: Option<&'a [u8]>,
+    /// Biological read(s).
+    pub reads: SmallVec<[&'a [u8]; 2]>,
+    num_bc_levels: usize,
+}
+
+impl<'a> ExtractionBuf<'a> {
+    /// Create a new buffer sized for the given geometry.
+    pub fn new(meta: &GeomMeta) -> Self {
+        Self {
+            barcodes: SmallVec::from_elem(None, meta.num_bc_levels),
+            umi: None,
+            reads: SmallVec::new(),
+            num_bc_levels: meta.num_bc_levels,
+        }
+    }
+
+    /// Reset for a new read. Clears all fields without deallocating.
+    #[inline(always)]
+    pub fn clear(&mut self) {
+        for bc in self.barcodes.iter_mut() {
+            *bc = None;
+        }
+        self.umi = None;
+        self.reads.clear();
+    }
+}
+
 /// Specialized fast extraction for the common case:
 /// R1 has BC at [0..bc_len], UMI at [bc_len..bc_len+umi_len], R2 is the full bio read.
 /// This avoids all step iteration, SmallVec construction, and enum matching.
@@ -142,6 +185,31 @@ pub struct GeneralExtractor {
 }
 
 impl SimpleExtractor {
+    /// Extract into a reusable buffer. Avoids SmallVec construction overhead.
+    /// The buffer's barcodes and reads are overwritten (not cleared then pushed).
+    #[inline(always)]
+    pub fn extract_into<'a>(&self, r1: &'a [u8], r2: &'a [u8], buf: &mut ExtractionBuf<'a>) {
+        let sg = &self.sg;
+        buf.barcodes[0] = if r1.len() >= sg.bc_offset + sg.bc_len {
+            Some(&r1[sg.bc_offset..sg.bc_offset + sg.bc_len])
+        } else {
+            None
+        };
+        buf.umi = if r1.len() >= sg.umi_offset + sg.umi_len {
+            Some(&r1[sg.umi_offset..sg.umi_offset + sg.umi_len])
+        } else {
+            None
+        };
+        // Overwrite reads[0] directly instead of clear+push.
+        // SimpleGeom always produces exactly 1 read.
+        buf.reads.clear();
+        if sg.read_on_r2 {
+            buf.reads.push(r2);
+        } else if sg.read_offset < r1.len() {
+            buf.reads.push(&r1[sg.read_offset..]);
+        }
+    }
+
     /// Extract sequences from a read pair. Zero-cost: no branching, no step iteration.
     #[inline(always)]
     pub fn extract<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> ExtractedSeqs<'a> {
@@ -171,6 +239,30 @@ impl SimpleExtractor {
 }
 
 impl GeneralExtractor {
+    /// Extract into a reusable buffer.
+    #[inline]
+    pub fn extract_into<'a>(&self, r1: &'a [u8], r2: &'a [u8], buf: &mut ExtractionBuf<'a>) {
+        buf.clear();
+        // ExtractionBuf has the same fields as ExtractedSeqs; execute_plan
+        // works on ExtractedSeqs. We build a temporary ExtractedSeqs that
+        // borrows from the same lifetime, then copy results into the buf.
+        let mut result = ExtractedSeqs {
+            barcodes: SmallVec::from_elem(None, self.meta.num_bc_levels),
+            umi: None,
+            reads: SmallVec::new(),
+        };
+        execute_plan(&self.r1_plan, r1, &mut result);
+        execute_plan(&self.r2_plan, r2, &mut result);
+        // Move results into the reusable buf
+        for (i, bc) in result.barcodes.iter().enumerate() {
+            if i < buf.barcodes.len() {
+                buf.barcodes[i] = *bc;
+            }
+        }
+        buf.umi = result.umi;
+        buf.reads = result.reads;
+    }
+
     /// Extract sequences from a read pair using step-based plans.
     #[inline]
     pub fn extract<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> ExtractedSeqs<'a> {
@@ -310,6 +402,15 @@ impl CompiledGeom {
         match self {
             CompiledGeom::Simple(ext) => ext.extract(r1, r2),
             CompiledGeom::General(ext) => ext.extract(r1, r2),
+        }
+    }
+
+    /// Extract into a reusable buffer (avoids per-read allocation).
+    #[inline]
+    pub fn extract_into<'a>(&self, r1: &'a [u8], r2: &'a [u8], buf: &mut ExtractionBuf<'a>) {
+        match self {
+            CompiledGeom::Simple(ext) => ext.extract_into(r1, r2, buf),
+            CompiledGeom::General(ext) => ext.extract_into(r1, r2, buf),
         }
     }
 
