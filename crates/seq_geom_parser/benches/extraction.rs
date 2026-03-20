@@ -8,7 +8,7 @@
 //! Results are saved to `target/criterion/` with HTML reports.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
-use seq_geom_parser::{parse_geometry, validate_geometry, CompiledGeom, SimpleExtractor, ExtractionBuf, Extractor};
+use seq_geom_parser::{parse_geometry, validate_geometry, CompiledGeom, SimpleExtractor};
 
 /// Generate a synthetic read of the given length filled with random-ish bases.
 fn make_read(len: usize, seed: u8) -> Vec<u8> {
@@ -224,32 +224,6 @@ fn bench_hardcoded_vs_compiled(c: &mut Criterion) {
         b.iter(|| simple_v2.extract(black_box(&r1), black_box(&r2)));
     });
 
-    // Compiled v3 via extract_into (reusable buffer)
-    let mut buf = ExtractionBuf::new(compiled_v3.meta());
-    group.bench_function("compiled_v3_into", |b| {
-        b.iter(|| simple_v3.extract_into(black_box(&r1), black_box(&r2), &mut buf));
-    });
-
-    // Stateful Extractor (owns workspace, no return value construction)
-    let mut extractor = Extractor::new(&compiled_v3);
-    group.bench_function("extractor_v3_full", |b| {
-        b.iter(|| {
-            extractor.extract(black_box(&r1), black_box(&r2));
-            unsafe {
-                black_box(extractor.barcode(0));
-                black_box(extractor.umi());
-                black_box(extractor.bio_read(0));
-            }
-        });
-    });
-
-    // Extractor extract-only (no accessor calls)
-    group.bench_function("extractor_v3_extract_only", |b| {
-        b.iter(|| {
-            extractor.extract(black_box(&r1), black_box(&r2));
-            black_box(&extractor);
-        });
-    });
 
     group.finish();
 }
