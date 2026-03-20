@@ -60,14 +60,8 @@ impl Protocol for CustomProtocol {
 
     fn extract_tech_seqs<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> TechSeqs<'a> {
         let seqs = self.compiled.extract(r1, r2);
-
-        // Convert ExtractedSeqs barcodes (SmallVec<[Option<&[u8]>; 4]>)
-        // to TechSeqs barcodes (SmallVec<[Option<&[u8]>; 2]>)
-        let barcodes: SmallVec<[Option<&'a [u8]>; 2]> =
-            seqs.barcodes.into_iter().collect();
-
         TechSeqs {
-            barcodes,
+            barcodes: seqs.barcodes,
             umi: seqs.umi,
         }
     }
@@ -100,11 +94,8 @@ impl Protocol for CustomProtocol {
     fn extract_all<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> (TechSeqs<'a>, AlignableReads<'a>) {
         let seqs = self.compiled.extract(r1, r2);
 
-        let barcodes: SmallVec<[Option<&'a [u8]>; 2]> =
-            seqs.barcodes.into_iter().collect();
-
         let tech = TechSeqs {
-            barcodes,
+            barcodes: seqs.barcodes,
             umi: seqs.umi,
         };
 

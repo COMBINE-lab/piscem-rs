@@ -81,7 +81,7 @@ impl<'a> AlignableReads<'a> {
 /// matching the order of `Protocol::barcode_descs()`.
 /// For bulk protocols, `barcodes` is empty and `umi` is `None`.
 pub struct TechSeqs<'a> {
-    pub barcodes: SmallVec<[Option<&'a [u8]>; 2]>,
+    pub barcodes: SmallVec<[Option<&'a [u8]>; 4]>,
     pub umi: Option<&'a [u8]>,
 }
 
