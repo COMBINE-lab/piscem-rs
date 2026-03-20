@@ -143,6 +143,18 @@ pub trait Protocol: Send + Sync {
     fn is_multi_barcode(&self) -> bool {
         self.num_barcodes() > 1
     }
+
+    /// Extract both technical sequences and mappable reads in a single pass.
+    ///
+    /// The default implementation calls `extract_tech_seqs` and
+    /// `extract_mappable_reads` separately. Protocols that compute both
+    /// from a single extraction (e.g., custom geometries) should override
+    /// this to avoid redundant work.
+    fn extract_all<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> (TechSeqs<'a>, AlignableReads<'a>) {
+        let tech = self.extract_tech_seqs(r1, r2);
+        let reads = self.extract_mappable_reads(r1, r2);
+        (tech, reads)
+    }
 }
 
 // ---------------------------------------------------------------------------

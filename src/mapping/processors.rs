@@ -701,9 +701,9 @@ where
             let r1 = rec1.seq();
             let r2 = rec2.seq();
 
-            // Extract technical sequences
-            // C++ returns nullptr if R1 too short for BC or UMI → skip read
-            let tech = protocol.extract_tech_seqs(&r1, &r2);
+            // Extract technical sequences and mappable reads in one call.
+            // For custom geometries this avoids a redundant second extraction.
+            let (tech, alignable) = protocol.extract_all(&r1, &r2);
 
             // UMI validation (matching C++ umi_kmer.fromChars check)
             let umi_raw = match tech.umi {
@@ -791,10 +791,6 @@ where
                 }
                 bc_packed = pack_bases_2bit(bc_to_pack);
             }
-
-            // Extract mappable reads — the protocol returns exactly what the
-            // mapper needs: Single for SE mapping, Paired for PE mapping.
-            let alignable = protocol.extract_mappable_reads(&r1, &r2);
 
             match alignable {
                 AlignableReads::Paired { read1, read2 } => {

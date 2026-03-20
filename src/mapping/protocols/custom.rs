@@ -97,6 +97,29 @@ impl Protocol for CustomProtocol {
         self.compiled.meta().num_bc_levels
     }
 
+    fn extract_all<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> (TechSeqs<'a>, AlignableReads<'a>) {
+        let seqs = self.compiled.extract(r1, r2);
+
+        let barcodes: SmallVec<[Option<&'a [u8]>; 2]> =
+            seqs.barcodes.into_iter().collect();
+
+        let tech = TechSeqs {
+            barcodes,
+            umi: seqs.umi,
+        };
+
+        let reads = match seqs.reads.len() {
+            0 => AlignableReads::Single(&[]),
+            1 => AlignableReads::Single(seqs.reads[0]),
+            _ => AlignableReads::Paired {
+                read1: seqs.reads[0],
+                read2: seqs.reads[1],
+            },
+        };
+
+        (tech, reads)
+    }
+
     fn barcode_descs(&self) -> Vec<BarcodeDesc> {
         let meta = self.compiled.meta();
         if meta.num_bc_levels <= 1 {
