@@ -154,6 +154,93 @@ fn bench_extract_anchor(c: &mut Criterion) {
     group.finish();
 }
 
+/// Hardcoded extraction mimicking ChromiumProtocol::extract_tech_seqs exactly.
+/// This is the absolute minimum work: two bounds checks, two slices, return.
+#[inline(never)]
+fn hardcoded_chromium_v3_extract<'a>(r1: &'a [u8], r2: &'a [u8]) -> (Option<&'a [u8]>, Option<&'a [u8]>, &'a [u8]) {
+    let bc_len = 16;
+    let umi_len = 12;
+    let barcode = if r1.len() >= bc_len { Some(&r1[..bc_len]) } else { None };
+    let umi = if r1.len() >= bc_len + umi_len { Some(&r1[bc_len..bc_len + umi_len]) } else { None };
+    (barcode, umi, r2)
+}
+
+/// Same but for Chromium v2 (16bp BC, 10bp UMI).
+#[inline(never)]
+fn hardcoded_chromium_v2_extract<'a>(r1: &'a [u8], r2: &'a [u8]) -> (Option<&'a [u8]>, Option<&'a [u8]>, &'a [u8]) {
+    let bc_len = 16;
+    let umi_len = 10;
+    let barcode = if r1.len() >= bc_len { Some(&r1[..bc_len]) } else { None };
+    let umi = if r1.len() >= bc_len + umi_len { Some(&r1[bc_len..bc_len + umi_len]) } else { None };
+    (barcode, umi, r2)
+}
+
+fn bench_hardcoded_vs_compiled(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hardcoded_vs_compiled");
+    group.throughput(Throughput::Elements(1));
+
+    let r1 = make_read(150, 1);
+    let r2 = make_read(150, 2);
+
+    // Hardcoded v3
+    group.bench_function("hardcoded_v3", |b| {
+        b.iter(|| hardcoded_chromium_v3_extract(black_box(&r1), black_box(&r2)));
+    });
+
+    // Compiled v3 (from geometry string)
+    let geom_v3 = parse_geometry("1{b[16]u[12]x:}2{r:}").unwrap();
+    let compiled_v3 = CompiledGeom::from_fragment_geom(&geom_v3).unwrap();
+    group.bench_function("compiled_v3", |b| {
+        b.iter(|| compiled_v3.extract(black_box(&r1), black_box(&r2)));
+    });
+
+    // Hardcoded v2
+    group.bench_function("hardcoded_v2", |b| {
+        b.iter(|| hardcoded_chromium_v2_extract(black_box(&r1), black_box(&r2)));
+    });
+
+    // Compiled v2 (from geometry string)
+    let geom_v2 = parse_geometry("1{b[16]u[10]x:}2{r:}").unwrap();
+    let compiled_v2 = CompiledGeom::from_fragment_geom(&geom_v2).unwrap();
+    group.bench_function("compiled_v2", |b| {
+        b.iter(|| compiled_v2.extract(black_box(&r1), black_box(&r2)));
+    });
+
+    group.finish();
+}
+
+fn bench_hardcoded_vs_compiled_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hardcoded_vs_compiled_batch");
+    let batch_size = 100_000usize;
+    group.throughput(Throughput::Elements(batch_size as u64));
+
+    let reads: Vec<(Vec<u8>, Vec<u8>)> = (0..batch_size)
+        .map(|i| (make_read(150, i as u8), make_read(150, (i + 1) as u8)))
+        .collect();
+
+    // Hardcoded v3 batch
+    group.bench_function("hardcoded_v3_100k", |b| {
+        b.iter(|| {
+            for (r1, r2) in &reads {
+                black_box(hardcoded_chromium_v3_extract(r1, r2));
+            }
+        });
+    });
+
+    // Compiled v3 batch
+    let geom = parse_geometry("1{b[16]u[12]x:}2{r:}").unwrap();
+    let compiled = CompiledGeom::from_fragment_geom(&geom).unwrap();
+    group.bench_function("compiled_v3_100k", |b| {
+        b.iter(|| {
+            for (r1, r2) in &reads {
+                black_box(compiled.extract(r1, r2));
+            }
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_extract_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("throughput");
 
@@ -205,6 +292,8 @@ criterion_group!(
     bench_compile,
     bench_extract_fixed,
     bench_extract_anchor,
+    bench_hardcoded_vs_compiled,
+    bench_hardcoded_vs_compiled_batch,
     bench_extract_throughput,
 );
 criterion_main!(benches);

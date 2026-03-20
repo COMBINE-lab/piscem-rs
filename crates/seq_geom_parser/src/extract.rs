@@ -10,7 +10,7 @@
 //! operation: `&read[offset..offset+len]`. For variable-length geometries with
 //! anchors, a search phase locates the anchor within a small window first.
 
-use smallvec::SmallVec;
+use smallvec::{smallvec, SmallVec};
 
 use crate::types::*;
 
@@ -82,6 +82,21 @@ pub struct ExtractedSeqs<'a> {
     pub reads: SmallVec<[&'a [u8]; 2]>,
 }
 
+/// Specialized fast extraction for the common case:
+/// R1 has BC at [0..bc_len], UMI at [bc_len..bc_len+umi_len], R2 is the full bio read.
+/// This avoids all step iteration, SmallVec construction, and enum matching.
+#[derive(Debug, Clone, Copy)]
+struct SimpleGeom {
+    bc_offset: usize,
+    bc_len: usize,
+    umi_offset: usize,
+    umi_len: usize,
+    /// true = bio read on R2, false = bio read on R1 (after tech prefix)
+    read_on_r2: bool,
+    /// If bio read is on R1, the start offset
+    read_offset: usize,
+}
+
 /// A compiled geometry ready for fast extraction.
 #[derive(Debug, Clone)]
 pub struct CompiledGeom {
@@ -95,6 +110,8 @@ pub struct CompiledGeom {
     pub umi_len: usize,
     /// Whether the biological read is paired (both R1 and R2 have r tags).
     pub is_paired_read: bool,
+    /// Specialized fast path for simple single-barcode geometries.
+    simple: Option<SimpleGeom>,
 }
 
 impl CompiledGeom {
@@ -120,13 +137,72 @@ impl CompiledGeom {
 
         let umi_len = r1_umi_len.max(r2_umi_len);
 
+        let is_paired_read = r1_has_read && r2_has_read;
+
+        // Detect simple geometry: 1 barcode level, no variable steps,
+        // BC+UMI on R1 at fixed offsets, bio read on R2 (unbounded).
+        let simple = if num_bc_levels == 1
+            && !r1_plan.has_variable
+            && !r2_plan.has_variable
+        {
+            // Look for BC and UMI fixed slices in R1 plan
+            let mut bc_info = None;
+            let mut umi_info = None;
+            let mut r1_read_offset = None;
+            for step in &r1_plan.steps {
+                match step {
+                    ExtractionStep::FixedSlice { offset, len, target: ExtractTarget::Barcode(0) } => {
+                        bc_info = Some((*offset, *len));
+                    }
+                    ExtractionStep::FixedSlice { offset, len, target: ExtractTarget::Umi } => {
+                        umi_info = Some((*offset, *len));
+                    }
+                    ExtractionStep::Unbounded { offset, target: ExtractTarget::Read } => {
+                        r1_read_offset = Some(*offset);
+                    }
+                    _ => {}
+                }
+            }
+            // Check if R2 has an unbounded read
+            let r2_has_unbounded_read = r2_plan.steps.iter().any(|s| {
+                matches!(s, ExtractionStep::Unbounded { offset: 0, target: ExtractTarget::Read })
+            });
+
+            match (bc_info, umi_info) {
+                (Some((bc_off, bc_l)), Some((umi_off, umi_l))) if r2_has_unbounded_read => {
+                    Some(SimpleGeom {
+                        bc_offset: bc_off,
+                        bc_len: bc_l,
+                        umi_offset: umi_off,
+                        umi_len: umi_l,
+                        read_on_r2: true,
+                        read_offset: 0,
+                    })
+                }
+                (Some((bc_off, bc_l)), Some((umi_off, umi_l))) if r1_read_offset.is_some() => {
+                    Some(SimpleGeom {
+                        bc_offset: bc_off,
+                        bc_len: bc_l,
+                        umi_offset: umi_off,
+                        umi_len: umi_l,
+                        read_on_r2: false,
+                        read_offset: r1_read_offset.unwrap(),
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         Ok(CompiledGeom {
             r1_plan,
             r2_plan,
             num_bc_levels,
             bc_lens,
             umi_len,
-            is_paired_read: r1_has_read && r2_has_read,
+            is_paired_read,
+            simple,
         })
     }
 
@@ -134,6 +210,33 @@ impl CompiledGeom {
     /// called for every read — it must be fast.
     #[inline]
     pub fn extract<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> ExtractedSeqs<'a> {
+        // Fast path for simple single-barcode geometries (Chromium v2/v3 etc.)
+        // Avoids step iteration, enum matching, and SmallVec construction overhead.
+        if let Some(sg) = &self.simple {
+            let barcode = if r1.len() >= sg.bc_offset + sg.bc_len {
+                Some(&r1[sg.bc_offset..sg.bc_offset + sg.bc_len])
+            } else {
+                None
+            };
+            let umi = if r1.len() >= sg.umi_offset + sg.umi_len {
+                Some(&r1[sg.umi_offset..sg.umi_offset + sg.umi_len])
+            } else {
+                None
+            };
+            let mut reads = SmallVec::new();
+            if sg.read_on_r2 {
+                reads.push(r2);
+            } else if sg.read_offset < r1.len() {
+                reads.push(&r1[sg.read_offset..]);
+            }
+            return ExtractedSeqs {
+                barcodes: smallvec![barcode],
+                umi,
+                reads,
+            };
+        }
+
+        // General path for multi-barcode or variable-length geometries
         let mut result = ExtractedSeqs {
             barcodes: SmallVec::from_elem(None, self.num_bc_levels),
             umi: None,
