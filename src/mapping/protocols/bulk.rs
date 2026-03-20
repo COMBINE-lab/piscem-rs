@@ -2,7 +2,7 @@
 //!
 //! Simple protocol that maps all reads directly (no barcode/UMI extraction).
 
-use super::{AlignableReads, Protocol, TechSeqs};
+use super::{ExtractedSeqs, Protocol};
 
 /// Bulk sequencing protocol.
 #[derive(Debug, Clone)]
@@ -25,21 +25,18 @@ impl Protocol for BulkProtocol {
         self.is_paired
     }
 
-    fn extract_tech_seqs<'a>(&self, _r1: &'a [u8], _r2: &'a [u8]) -> TechSeqs<'a> {
-        TechSeqs {
+    fn extract<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> ExtractedSeqs<'a> {
+        let mut reads = smallvec::SmallVec::new();
+        if self.is_paired {
+            reads.push(r1);
+            reads.push(r2);
+        } else {
+            reads.push(r1);
+        }
+        ExtractedSeqs {
             barcodes: smallvec::smallvec![],
             umi: None,
-        }
-    }
-
-    fn extract_mappable_reads<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> AlignableReads<'a> {
-        if self.is_paired {
-            AlignableReads::Paired {
-                read1: r1,
-                read2: r2,
-            }
-        } else {
-            AlignableReads::Single(r1)
+            reads,
         }
     }
 
@@ -59,34 +56,19 @@ mod tests {
     #[test]
     fn test_bulk_single_end() {
         let proto = BulkProtocol::new(false);
-        assert_eq!(proto.name(), "bulk");
-        assert!(!proto.is_bio_paired_end());
-        assert_eq!(proto.barcode_len(), 0);
-        assert_eq!(proto.umi_len(), 0);
-
-        let reads = proto.extract_mappable_reads(b"ACGT", b"");
-        match reads {
-            AlignableReads::Single(bio) => assert_eq!(bio, b"ACGT"),
-            _ => panic!("SE bulk should return Single"),
-        }
-
-        let tech = proto.extract_tech_seqs(b"ACGT", b"");
-        assert!(tech.barcode().is_none());
-        assert!(tech.umi.is_none());
+        let seqs = proto.extract(b"ACGT", b"");
+        assert!(seqs.barcodes.is_empty());
+        assert!(seqs.umi.is_none());
+        assert_eq!(seqs.reads.len(), 1);
+        assert_eq!(seqs.reads[0], b"ACGT");
     }
 
     #[test]
     fn test_bulk_paired_end() {
         let proto = BulkProtocol::new(true);
-        assert!(proto.is_bio_paired_end());
-
-        let reads = proto.extract_mappable_reads(b"ACGT", b"TGCA");
-        match reads {
-            AlignableReads::Paired { read1, read2 } => {
-                assert_eq!(read1, b"ACGT");
-                assert_eq!(read2, b"TGCA");
-            }
-            _ => panic!("PE bulk should return Paired"),
-        }
+        let seqs = proto.extract(b"ACGT", b"TGCA");
+        assert_eq!(seqs.reads.len(), 2);
+        assert_eq!(seqs.reads[0], b"ACGT");
+        assert_eq!(seqs.reads[1], b"TGCA");
     }
 }

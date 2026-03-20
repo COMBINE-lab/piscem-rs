@@ -9,7 +9,7 @@
 
 use smallvec::smallvec;
 
-use super::{AlignableReads, BarcodeDesc, BarcodeRole, Protocol, TechSeqs};
+use super::{BarcodeDesc, BarcodeRole, ExtractedSeqs, Protocol};
 
 // ---------------------------------------------------------------------------
 // ChromiumFlexProtocol
@@ -72,39 +72,28 @@ impl Protocol for ChromiumFlexProtocol {
         false // Only the probe sequence on R2 is mapped
     }
 
-    fn extract_tech_seqs<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> TechSeqs<'a> {
-        // Cell barcode from R1
+    fn extract<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> ExtractedSeqs<'a> {
         let cell_bc = if r1.len() >= self.cell_bc_len {
             Some(&r1[..self.cell_bc_len])
         } else {
             None
         };
-
-        // UMI from R1
         let umi = if r1.len() >= self.cell_bc_len + self.umi_len {
             Some(&r1[self.cell_bc_len..self.cell_bc_len + self.umi_len])
         } else {
             None
         };
-
-        // Sample barcode from R2 at fixed offset
         let sample_bc = if r2.len() >= self.sample_bc_offset + self.sample_bc_len {
             Some(&r2[self.sample_bc_offset..self.sample_bc_offset + self.sample_bc_len])
         } else {
             None
         };
-
-        // barcodes[0] = sample (b0), barcodes[1] = cell (b1)
-        TechSeqs {
+        let end = self.sample_bc_offset.min(r2.len());
+        ExtractedSeqs {
             barcodes: smallvec![sample_bc, cell_bc],
             umi,
+            reads: smallvec![&r2[..end]],
         }
-    }
-
-    fn extract_mappable_reads<'a>(&self, _r1: &'a [u8], r2: &'a [u8]) -> AlignableReads<'a> {
-        // Single bio read: probe sequence on R2 (up to the sample BC offset)
-        let end = self.sample_bc_offset.min(r2.len());
-        AlignableReads::Single(&r2[..end])
     }
 
     fn barcode_len(&self) -> usize {
@@ -155,39 +144,18 @@ mod tests {
     }
 
     #[test]
-    fn test_flex_extract_tech_seqs() {
+    fn test_flex_extract() {
         let proto = ChromiumFlexProtocol::new(8, 25);
 
-        // R1: 16bp cell BC + 12bp UMI + extra
         let r1 = b"ACGTACGTACGTACGTAAAAAAAAAAAA_extra";
-        // R2: 25bp probe + 8bp sample BC
-        let r2 = b"TTTTTTTTTTTTTTTTTTTTTTTTTSSSSSSSS";
-
-        let tech = proto.extract_tech_seqs(r1, r2);
-
-        // barcodes[0] = sample BC from R2
-        assert_eq!(tech.barcodes[0].unwrap(), b"SSSSSSSS");
-        // barcodes[1] = cell BC from R1
-        assert_eq!(tech.barcodes[1].unwrap(), b"ACGTACGTACGTACGT");
-        // UMI from R1
-        assert_eq!(tech.umi.unwrap(), b"AAAAAAAAAAAA");
-        // barcode() convenience returns first (sample) BC
-        assert_eq!(tech.barcode().unwrap(), b"SSSSSSSS");
-    }
-
-    #[test]
-    fn test_flex_extract_mappable() {
-        let proto = ChromiumFlexProtocol::new(8, 25);
-
-        let r1 = b"ACGTACGTACGTACGTAAAAAAAAAAAA";
         let r2 = b"PROBE_SEQUENCE_25_BASES__SSSSSSSS";
 
-        let reads = proto.extract_mappable_reads(r1, r2);
-        // Single bio read: R2 probe region up to sample BC offset (25 bytes)
-        match reads {
-            AlignableReads::Single(bio) => assert_eq!(bio, b"PROBE_SEQUENCE_25_BASES__"),
-            _ => panic!("Flex should return Single"),
-        }
+        let seqs = proto.extract(r1, r2);
+        assert_eq!(seqs.barcodes[0].unwrap(), b"SSSSSSSS"); // sample BC
+        assert_eq!(seqs.barcodes[1].unwrap(), b"ACGTACGTACGTACGT"); // cell BC
+        assert_eq!(seqs.umi.unwrap(), b"AAAAAAAAAAAA");
+        assert_eq!(seqs.reads.len(), 1);
+        assert_eq!(seqs.reads[0], b"PROBE_SEQUENCE_25_BASES__");
     }
 
     #[test]
@@ -218,8 +186,8 @@ mod tests {
         let r1 = b"ACGTACGTACGTACGTAAAAAAAAAAAA";
         let r2 = b"SHORT";
 
-        let tech = proto.extract_tech_seqs(r1, r2);
-        assert!(tech.barcodes[0].is_none()); // sample BC not extractable
-        assert!(tech.barcodes[1].is_some()); // cell BC still ok
+        let seqs = proto.extract(r1, r2);
+        assert!(seqs.barcodes[0].is_none()); // sample BC not extractable
+        assert!(seqs.barcodes[1].is_some()); // cell BC still ok
     }
 }

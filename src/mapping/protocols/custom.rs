@@ -9,12 +9,12 @@ use anyhow::{Result, bail};
 use smallvec::SmallVec;
 
 use seq_geom_parser::{
-    self as sgp, CompiledGeom, ExtractedSeqs, FragmentGeom, GeomMeta,
+    self as sgp, CompiledGeom, FragmentGeom, GeomMeta,
     SimpleExtractor, GeneralExtractor,
     types::{GeoTagType, BarcodeRole as SgpBarcodeRole},
 };
 
-use super::{AlignableReads, BarcodeDesc, BarcodeRole, Protocol, TechSeqs};
+use super::{BarcodeDesc, BarcodeRole, ExtractedSeqs, Protocol};
 
 // ---------------------------------------------------------------------------
 // CustomProtocol
@@ -58,25 +58,8 @@ impl Protocol for CustomProtocol {
         self.compiled.meta().is_paired_read
     }
 
-    fn extract_tech_seqs<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> TechSeqs<'a> {
-        let seqs = self.compiled.extract(r1, r2);
-        TechSeqs {
-            barcodes: seqs.barcodes,
-            umi: seqs.umi,
-        }
-    }
-
-    fn extract_mappable_reads<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> AlignableReads<'a> {
-        let seqs = self.compiled.extract(r1, r2);
-
-        match seqs.reads.len() {
-            0 => AlignableReads::Single(&[]),
-            1 => AlignableReads::Single(seqs.reads[0]),
-            _ => AlignableReads::Paired {
-                read1: seqs.reads[0],
-                read2: seqs.reads[1],
-            },
-        }
+    fn extract<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> ExtractedSeqs<'a> {
+        self.compiled.extract(r1, r2)
     }
 
     fn barcode_len(&self) -> usize {
@@ -89,26 +72,6 @@ impl Protocol for CustomProtocol {
 
     fn num_barcodes(&self) -> usize {
         self.compiled.meta().num_bc_levels
-    }
-
-    fn extract_all<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> (TechSeqs<'a>, AlignableReads<'a>) {
-        let seqs = self.compiled.extract(r1, r2);
-
-        let tech = TechSeqs {
-            barcodes: seqs.barcodes,
-            umi: seqs.umi,
-        };
-
-        let reads = match seqs.reads.len() {
-            0 => AlignableReads::Single(&[]),
-            1 => AlignableReads::Single(seqs.reads[0]),
-            _ => AlignableReads::Paired {
-                read1: seqs.reads[0],
-                read2: seqs.reads[1],
-            },
-        };
-
-        (tech, reads)
     }
 
     fn barcode_descs(&self) -> Vec<BarcodeDesc> {
@@ -243,15 +206,11 @@ mod tests {
         let r1 = b"ACGTACGTACGTACGTAAAAAAAAAAAA_extra";
         let r2 = b"BIOLOGICAL_READ";
 
-        let tech = proto.extract_tech_seqs(r1, r2);
-        assert_eq!(tech.barcodes[0], Some(&r1[..16]));
-        assert_eq!(tech.umi, Some(&r1[16..28]));
-
-        let reads = proto.extract_mappable_reads(r1, r2);
-        match reads {
-            AlignableReads::Single(r) => assert_eq!(r, r2.as_slice()),
-            _ => panic!("expected Single"),
-        }
+        let seqs = proto.extract(r1, r2);
+        assert_eq!(seqs.barcodes[0], Some(&r1[..16]));
+        assert_eq!(seqs.umi, Some(&r1[16..28]));
+        assert_eq!(seqs.reads.len(), 1);
+        assert_eq!(seqs.reads[0], r2.as_slice());
     }
 
     #[test]
@@ -262,10 +221,10 @@ mod tests {
         let mut r2 = vec![b'N'; 80];
         r2[68..76].copy_from_slice(b"SAMPLEBC");
 
-        let tech = proto.extract_tech_seqs(r1, &r2);
-        assert_eq!(tech.barcodes.len(), 2);
-        assert_eq!(tech.barcodes[0], Some(&r2[68..76])); // sample (b0)
-        assert_eq!(tech.barcodes[1], Some(&r1[..16]));   // cell (b1)
+        let seqs = proto.extract(r1, &r2);
+        assert_eq!(seqs.barcodes.len(), 2);
+        assert_eq!(seqs.barcodes[0], Some(&r2[68..76])); // sample (b0)
+        assert_eq!(seqs.barcodes[1], Some(&r1[..16]));   // cell (b1)
     }
 
     #[test]
@@ -290,10 +249,10 @@ mod tests {
 
         let r2 = b"BIO_READ";
 
-        let tech = proto.extract_tech_seqs(&r1, r2);
-        assert_eq!(tech.barcodes[0], Some(sample.as_slice())); // sample
-        assert_eq!(tech.barcodes[1], Some(bc.as_slice()));     // cell
-        assert_eq!(tech.umi, Some(umi.as_slice()));
+        let seqs = proto.extract(&r1, r2);
+        assert_eq!(seqs.barcodes[0], Some(sample.as_slice())); // sample
+        assert_eq!(seqs.barcodes[1], Some(bc.as_slice()));     // cell
+        assert_eq!(seqs.umi, Some(umi.as_slice()));
     }
 
     #[test]

@@ -36,7 +36,7 @@ use crate::mapping::map_fragment::{
 use crate::mapping::merge_pairs::{remove_duplicate_hits_pub, simple_hit_cmp_bins};
 use crate::mapping::overlap::{OverlapType, find_overlap};
 use crate::mapping::protocols::scrna::{barcode_has_n, count_ns, is_all_acgt, recover_barcode};
-use crate::mapping::protocols::{AlignableReads, Protocol};
+use crate::mapping::protocols::Protocol;
 use crate::mapping::sketch_hit_simple::SketchHitInfoSimple;
 use crate::mapping::streaming_query::PiscemStreamingQuery;
 use crate::mapping::unitig_end_cache::UnitigEndCache;
@@ -701,12 +701,11 @@ where
             let r1 = rec1.seq();
             let r2 = rec2.seq();
 
-            // Extract technical sequences and mappable reads in one call.
-            // For custom geometries this avoids a redundant second extraction.
-            let (tech, alignable) = protocol.extract_all(&r1, &r2);
+            // Extract all sequences (barcodes, UMI, bio reads) in one call.
+            let seqs = protocol.extract(&r1, &r2);
 
             // UMI validation (matching C++ umi_kmer.fromChars check)
-            let umi_raw = match tech.umi {
+            let umi_raw = match seqs.umi {
                 Some(umi) if !umi.is_empty() => umi,
                 _ => continue,
             };
@@ -722,7 +721,7 @@ where
                 multi_bc_packed.clear();
                 let mut all_valid = true;
                 for (i, _desc) in bc_descs.iter().enumerate() {
-                    let bc_raw = match tech.barcodes.get(i) {
+                    let bc_raw = match seqs.barcodes.get(i) {
                         Some(Some(bc)) if !bc.is_empty() => *bc,
                         _ => {
                             all_valid = false;
@@ -764,7 +763,7 @@ where
                 bc_packed = *multi_bc_packed.last().unwrap_or(&0);
             } else {
                 // Single-barcode path (unchanged)
-                let bc_raw = match tech.barcode() {
+                let bc_raw = match seqs.barcodes.first().copied().flatten() {
                     Some(bc) if !bc.is_empty() => bc,
                     _ => continue,
                 };
@@ -792,8 +791,10 @@ where
                 bc_packed = pack_bases_2bit(bc_to_pack);
             }
 
-            match alignable {
-                AlignableReads::Paired { read1, read2 } => {
+            match seqs.reads.len() {
+                2 => {
+                    let read1 = seqs.reads[0];
+                    let read2 = seqs.reads[1];
                     if read1.is_empty() && read2.is_empty() {
                         continue;
                     }
@@ -815,7 +816,8 @@ where
                         st.local_rlen_samples.push(read2.len() as u32);
                     }
                 }
-                AlignableReads::Single(bio_seq) => {
+                1 => {
+                    let bio_seq = seqs.reads[0];
                     if bio_seq.is_empty() {
                         continue;
                     }
@@ -834,6 +836,7 @@ where
                         st.local_rlen_samples.push(bio_seq.len() as u32);
                     }
                 }
+                _ => continue, // no biological reads
             }
 
             if s.poison_state.is_poisoned() {

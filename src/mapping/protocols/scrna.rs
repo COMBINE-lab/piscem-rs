@@ -4,7 +4,7 @@
 
 use smallvec::smallvec;
 
-use super::{AlignableReads, Protocol, TechSeqs};
+use super::{ExtractedSeqs, Protocol};
 
 // ---------------------------------------------------------------------------
 // ChromiumVersion
@@ -100,10 +100,7 @@ impl Protocol for ChromiumProtocol {
         self.is_5prime()
     }
 
-    fn extract_tech_seqs<'a>(&self, r1: &'a [u8], _r2: &'a [u8]) -> TechSeqs<'a> {
-        // Match C++ behavior: return None if R1 is too short for BC or UMI
-        // C++ extract_bc returns nullptr if r1.length() < bc_len
-        // C++ extract_umi returns nullptr if r1.length() < bc_len + umi_len
+    fn extract<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> ExtractedSeqs<'a> {
         let barcode = if r1.len() >= self.bc_len {
             Some(&r1[..self.bc_len])
         } else {
@@ -114,23 +111,18 @@ impl Protocol for ChromiumProtocol {
         } else {
             None
         };
-        TechSeqs {
+        let mut reads = smallvec::SmallVec::new();
+        if self.is_5prime() {
+            let start = self.tech_prefix_len().min(r1.len());
+            reads.push(&r1[start..]);
+            reads.push(r2);
+        } else {
+            reads.push(r2);
+        }
+        ExtractedSeqs {
             barcodes: smallvec![barcode],
             umi,
-        }
-    }
-
-    fn extract_mappable_reads<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> AlignableReads<'a> {
-        if self.is_5prime() {
-            // 5' protocols: map the remainder of R1 (after BC+UMI+TSO) AND R2
-            let start = self.tech_prefix_len().min(r1.len());
-            AlignableReads::Paired {
-                read1: &r1[start..],
-                read2: r2,
-            }
-        } else {
-            // 3' protocols: the biological read is R2
-            AlignableReads::Single(r2)
+            reads,
         }
     }
 
@@ -206,16 +198,11 @@ mod tests {
         let r1 = b"ACGTACGTACGTACGTAAAAAAAAAAAA_extra_bio";
         let r2 = b"TGCATGCATGCA";
 
-        let tech = proto.extract_tech_seqs(r1, r2);
-        assert_eq!(tech.barcode().unwrap(), b"ACGTACGTACGTACGT");
-        assert_eq!(tech.umi.unwrap(), b"AAAAAAAAAAAA");
-
-        // 3' protocol: single biological read from R2
-        let reads = proto.extract_mappable_reads(r1, r2);
-        match reads {
-            AlignableReads::Single(bio) => assert_eq!(bio, b"TGCATGCATGCA"),
-            _ => panic!("3' protocol should return Single"),
-        }
+        let seqs = proto.extract(r1, r2);
+        assert_eq!(seqs.barcodes[0].unwrap(), b"ACGTACGTACGTACGT");
+        assert_eq!(seqs.umi.unwrap(), b"AAAAAAAAAAAA");
+        assert_eq!(seqs.reads.len(), 1);
+        assert_eq!(seqs.reads[0], b"TGCATGCATGCA");
     }
 
     #[test]
@@ -227,23 +214,15 @@ mod tests {
         assert!(proto.is_bio_paired_end());
         assert!(proto.is_5prime());
 
-        // TSO = 13 bases. Tech prefix = 16 + 10 + 13 = 39 bases.
         let r1 = b"ACGTACGTACGTACGTBBBBBBBBBBCCCCCCCCCCCCCMAPPABLE_BIO";
         let r2 = b"SECOND_READ_BIO";
 
-        let tech = proto.extract_tech_seqs(r1, r2);
-        assert_eq!(tech.barcode().unwrap().len(), 16);
-        assert_eq!(tech.umi.unwrap().len(), 10);
-
-        let reads = proto.extract_mappable_reads(r1, r2);
-        // 5' protocol: paired — R1 after tech prefix + R2
-        match reads {
-            AlignableReads::Paired { read1, read2 } => {
-                assert_eq!(read1, b"MAPPABLE_BIO");
-                assert_eq!(read2, b"SECOND_READ_BIO");
-            }
-            _ => panic!("5' protocol should return Paired"),
-        }
+        let seqs = proto.extract(r1, r2);
+        assert_eq!(seqs.barcodes[0].unwrap().len(), 16);
+        assert_eq!(seqs.umi.unwrap().len(), 10);
+        assert_eq!(seqs.reads.len(), 2);
+        assert_eq!(seqs.reads[0], b"MAPPABLE_BIO");
+        assert_eq!(seqs.reads[1], b"SECOND_READ_BIO");
     }
 
     #[test]

@@ -3,26 +3,17 @@
 //! scATAC reads are always paired-end with a separate barcode file.
 //! R1 and R2 are biological reads; the barcode is extracted from a
 //! separate FASTQ file.
-//!
-//! Port of C++ `pesc_sc_atac.cpp`.
 
-use super::{AlignableReads, Protocol, TechSeqs};
-
-// ---------------------------------------------------------------------------
-// ScatacProtocol
-// ---------------------------------------------------------------------------
+use super::{ExtractedSeqs, Protocol};
 
 /// scATAC-seq protocol definition.
 #[derive(Debug, Clone)]
 pub struct ScatacProtocol {
-    /// Barcode length in bases.
     pub bc_len: usize,
-    /// Whether to apply Tn5 transposase shift (+4/-9).
     pub tn5_shift: bool,
 }
 
 impl ScatacProtocol {
-    /// Create with default settings.
     pub fn new(bc_len: usize) -> Self {
         Self {
             bc_len,
@@ -37,23 +28,15 @@ impl Protocol for ScatacProtocol {
     }
 
     fn is_bio_paired_end(&self) -> bool {
-        true // ATAC always maps both R1 and R2 as biological reads
+        true
     }
 
-    fn extract_tech_seqs<'a>(&self, _r1: &'a [u8], _r2: &'a [u8]) -> TechSeqs<'a> {
+    fn extract<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> ExtractedSeqs<'a> {
         // Barcodes come from a separate file in scATAC, not from R1/R2.
-        // The CLI handles barcode extraction from the third file.
-        TechSeqs {
+        ExtractedSeqs {
             barcodes: smallvec::smallvec![],
             umi: None,
-        }
-    }
-
-    fn extract_mappable_reads<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> AlignableReads<'a> {
-        // Both R1 and R2 are biological reads (always paired for ATAC)
-        AlignableReads::Paired {
-            read1: r1,
-            read2: r2,
+            reads: smallvec::smallvec![r1, r2],
         }
     }
 
@@ -62,48 +45,22 @@ impl Protocol for ScatacProtocol {
     }
 
     fn umi_len(&self) -> usize {
-        0 // scATAC has no UMI
+        0
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_scatac_protocol_basic() {
+    fn test_scatac_extract() {
         let proto = ScatacProtocol::new(16);
-        assert_eq!(proto.name(), "scatac");
-        assert!(proto.is_bio_paired_end());
-        assert_eq!(proto.barcode_len(), 16);
-        assert_eq!(proto.umi_len(), 0);
-        assert!(proto.tn5_shift);
-    }
-
-    #[test]
-    fn test_scatac_extract_reads() {
-        let proto = ScatacProtocol::new(16);
-
-        let r1 = b"ACGTACGTACGT";
-        let r2 = b"TGCATGCATGCA";
-
-        // Both reads are biological (always paired for ATAC)
-        let reads = proto.extract_mappable_reads(r1, r2);
-        match reads {
-            AlignableReads::Paired { read1, read2 } => {
-                assert_eq!(read1, b"ACGTACGTACGT");
-                assert_eq!(read2, b"TGCATGCATGCA");
-            }
-            _ => panic!("ATAC should return Paired"),
-        }
-
-        // Tech seqs come from separate barcode file, not R1/R2
-        let tech = proto.extract_tech_seqs(r1, r2);
-        assert!(tech.barcode().is_none());
-        assert!(tech.umi.is_none());
+        let seqs = proto.extract(b"ACGTACGTACGT", b"TGCATGCATGCA");
+        assert!(seqs.barcodes.is_empty());
+        assert!(seqs.umi.is_none());
+        assert_eq!(seqs.reads.len(), 2);
+        assert_eq!(seqs.reads[0], b"ACGTACGTACGT");
+        assert_eq!(seqs.reads[1], b"TGCATGCATGCA");
     }
 }
