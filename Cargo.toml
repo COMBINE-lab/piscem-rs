@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/py-piscem"]
+members = [".", "crates/py-piscem", "crates/seq_geom_parser"]
 
 [package]
 name = "piscem-rs"

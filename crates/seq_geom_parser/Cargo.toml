@@ -1,0 +1,17 @@
+[package]
+name = "seq_geom_parser"
+version = "1.0.0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "Parser and extractor for sequencing read geometry descriptions"
+repository = "https://github.com/COMBINE-lab/piscem-rs"
+homepage = "https://github.com/COMBINE-lab/piscem-rs"
+documentation = "https://docs.rs/seq_geom_parser"
+keywords = ["bioinformatics", "genomics", "sequencing", "parser"]
+categories = ["science", "parser-implementations"]
+
+[dependencies]
+chumsky = "0.12.0"
+smallvec = "1.15"
+ariadne = "0.5"
+thiserror = "2"
