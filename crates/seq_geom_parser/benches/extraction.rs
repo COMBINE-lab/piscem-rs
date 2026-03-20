@@ -8,7 +8,7 @@
 //! Results are saved to `target/criterion/` with HTML reports.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
-use seq_geom_parser::{parse_geometry, validate_geometry, CompiledGeom};
+use seq_geom_parser::{parse_geometry, validate_geometry, CompiledGeom, SimpleExtractor};
 
 /// Generate a synthetic read of the given length filled with random-ish bases.
 fn make_read(len: usize, seed: u8) -> Vec<u8> {
@@ -187,11 +187,20 @@ fn bench_hardcoded_vs_compiled(c: &mut Criterion) {
         b.iter(|| hardcoded_chromium_v3_extract(black_box(&r1), black_box(&r2)));
     });
 
-    // Compiled v3 (from geometry string)
+    // Compiled v3 via enum dispatch
     let geom_v3 = parse_geometry("1{b[16]u[12]x:}2{r:}").unwrap();
     let compiled_v3 = CompiledGeom::from_fragment_geom(&geom_v3).unwrap();
-    group.bench_function("compiled_v3", |b| {
+    group.bench_function("compiled_v3_dispatch", |b| {
         b.iter(|| compiled_v3.extract(black_box(&r1), black_box(&r2)));
+    });
+
+    // Compiled v3 via direct variant call (no enum branch)
+    let simple_v3 = match &compiled_v3 {
+        CompiledGeom::Simple(ext) => ext,
+        _ => panic!("expected Simple variant for v3"),
+    };
+    group.bench_function("compiled_v3_direct", |b| {
+        b.iter(|| simple_v3.extract(black_box(&r1), black_box(&r2)));
     });
 
     // Hardcoded v2
@@ -199,11 +208,20 @@ fn bench_hardcoded_vs_compiled(c: &mut Criterion) {
         b.iter(|| hardcoded_chromium_v2_extract(black_box(&r1), black_box(&r2)));
     });
 
-    // Compiled v2 (from geometry string)
+    // Compiled v2 via enum dispatch
     let geom_v2 = parse_geometry("1{b[16]u[10]x:}2{r:}").unwrap();
     let compiled_v2 = CompiledGeom::from_fragment_geom(&geom_v2).unwrap();
-    group.bench_function("compiled_v2", |b| {
+    group.bench_function("compiled_v2_dispatch", |b| {
         b.iter(|| compiled_v2.extract(black_box(&r1), black_box(&r2)));
+    });
+
+    // Compiled v2 via direct variant call
+    let simple_v2 = match &compiled_v2 {
+        CompiledGeom::Simple(ext) => ext,
+        _ => panic!("expected Simple variant for v2"),
+    };
+    group.bench_function("compiled_v2_direct", |b| {
+        b.iter(|| simple_v2.extract(black_box(&r1), black_box(&r2)));
     });
 
     group.finish();

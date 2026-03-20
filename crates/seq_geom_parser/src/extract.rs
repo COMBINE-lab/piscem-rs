@@ -98,20 +98,91 @@ struct SimpleGeom {
 }
 
 /// A compiled geometry ready for fast extraction.
+///
+/// This is an enum so that callers can match once at startup and then call
+/// the variant-specific `extract` method in a tight loop with no per-read
+/// branching. The branch predictor would handle the enum match on `extract()`
+/// perfectly (variant never changes), but callers who want guaranteed zero
+/// overhead can match once and hold the inner type directly.
 #[derive(Debug, Clone)]
-pub struct CompiledGeom {
-    r1_plan: ReadPlan,
-    r2_plan: ReadPlan,
+pub enum CompiledGeom {
+    /// Fast path for simple single-barcode geometries (e.g. Chromium v2/v3).
+    /// BC+UMI on one read at fixed offsets, bio read on the other.
+    Simple(SimpleExtractor),
+    /// General path for multi-barcode or variable-length geometries.
+    General(GeneralExtractor),
+}
+
+/// Metadata common to all extractor variants.
+#[derive(Debug, Clone)]
+pub struct GeomMeta {
     /// Number of barcode levels.
     pub num_bc_levels: usize,
     /// Barcode lengths (fixed, after normalization). One per level.
     pub bc_lens: SmallVec<[usize; MAX_INLINE_BARCODES]>,
     /// UMI length (fixed, after normalization).
     pub umi_len: usize,
-    /// Whether the biological read is paired (both R1 and R2 have r tags).
+    /// Whether the biological read is paired.
     pub is_paired_read: bool,
-    /// Specialized fast path for simple single-barcode geometries.
-    simple: Option<SimpleGeom>,
+}
+
+/// Fast extractor for simple single-barcode geometries.
+#[derive(Debug, Clone)]
+pub struct SimpleExtractor {
+    pub meta: GeomMeta,
+    sg: SimpleGeom,
+}
+
+/// General extractor for complex geometries.
+#[derive(Debug, Clone)]
+pub struct GeneralExtractor {
+    pub meta: GeomMeta,
+    r1_plan: ReadPlan,
+    r2_plan: ReadPlan,
+}
+
+impl SimpleExtractor {
+    /// Extract sequences from a read pair. Zero-cost: no branching, no step iteration.
+    #[inline(always)]
+    pub fn extract<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> ExtractedSeqs<'a> {
+        let sg = &self.sg;
+        let barcode = if r1.len() >= sg.bc_offset + sg.bc_len {
+            Some(&r1[sg.bc_offset..sg.bc_offset + sg.bc_len])
+        } else {
+            None
+        };
+        let umi = if r1.len() >= sg.umi_offset + sg.umi_len {
+            Some(&r1[sg.umi_offset..sg.umi_offset + sg.umi_len])
+        } else {
+            None
+        };
+        let mut reads = SmallVec::new();
+        if sg.read_on_r2 {
+            reads.push(r2);
+        } else if sg.read_offset < r1.len() {
+            reads.push(&r1[sg.read_offset..]);
+        }
+        ExtractedSeqs {
+            barcodes: smallvec![barcode],
+            umi,
+            reads,
+        }
+    }
+}
+
+impl GeneralExtractor {
+    /// Extract sequences from a read pair using step-based plans.
+    #[inline]
+    pub fn extract<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> ExtractedSeqs<'a> {
+        let mut result = ExtractedSeqs {
+            barcodes: SmallVec::from_elem(None, self.meta.num_bc_levels),
+            umi: None,
+            reads: SmallVec::new(),
+        };
+        execute_plan(&self.r1_plan, r1, &mut result);
+        execute_plan(&self.r2_plan, r2, &mut result);
+        result
+    }
 }
 
 impl CompiledGeom {
@@ -195,58 +266,59 @@ impl CompiledGeom {
             None
         };
 
-        Ok(CompiledGeom {
-            r1_plan,
-            r2_plan,
+        let meta = GeomMeta {
             num_bc_levels,
             bc_lens,
             umi_len,
             is_paired_read,
-            simple,
-        })
-    }
-
-    /// Extract sequences from a read pair. This is the hot-path function
-    /// called for every read — it must be fast.
-    #[inline]
-    pub fn extract<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> ExtractedSeqs<'a> {
-        // Fast path for simple single-barcode geometries (Chromium v2/v3 etc.)
-        // Avoids step iteration, enum matching, and SmallVec construction overhead.
-        if let Some(sg) = &self.simple {
-            let barcode = if r1.len() >= sg.bc_offset + sg.bc_len {
-                Some(&r1[sg.bc_offset..sg.bc_offset + sg.bc_len])
-            } else {
-                None
-            };
-            let umi = if r1.len() >= sg.umi_offset + sg.umi_len {
-                Some(&r1[sg.umi_offset..sg.umi_offset + sg.umi_len])
-            } else {
-                None
-            };
-            let mut reads = SmallVec::new();
-            if sg.read_on_r2 {
-                reads.push(r2);
-            } else if sg.read_offset < r1.len() {
-                reads.push(&r1[sg.read_offset..]);
-            }
-            return ExtractedSeqs {
-                barcodes: smallvec![barcode],
-                umi,
-                reads,
-            };
-        }
-
-        // General path for multi-barcode or variable-length geometries
-        let mut result = ExtractedSeqs {
-            barcodes: SmallVec::from_elem(None, self.num_bc_levels),
-            umi: None,
-            reads: SmallVec::new(),
         };
 
-        execute_plan(&self.r1_plan, r1, &mut result);
-        execute_plan(&self.r2_plan, r2, &mut result);
+        if let Some(sg) = simple {
+            Ok(CompiledGeom::Simple(SimpleExtractor { meta, sg }))
+        } else {
+            Ok(CompiledGeom::General(GeneralExtractor {
+                meta,
+                r1_plan,
+                r2_plan,
+            }))
+        }
+    }
 
-        result
+    /// Extract sequences from a read pair.
+    ///
+    /// This dispatches to the variant-specific extractor. For maximum
+    /// performance in tight loops, match on the enum once at startup and
+    /// call the variant's `extract` method directly — this eliminates even
+    /// the (perfectly-predicted) enum branch.
+    ///
+    /// ```ignore
+    /// match compiled {
+    ///     CompiledGeom::Simple(ext) => {
+    ///         for (r1, r2) in reads {
+    ///             let seqs = ext.extract(r1, r2); // no dispatch
+    ///         }
+    ///     }
+    ///     CompiledGeom::General(ext) => {
+    ///         for (r1, r2) in reads {
+    ///             let seqs = ext.extract(r1, r2);
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    #[inline]
+    pub fn extract<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> ExtractedSeqs<'a> {
+        match self {
+            CompiledGeom::Simple(ext) => ext.extract(r1, r2),
+            CompiledGeom::General(ext) => ext.extract(r1, r2),
+        }
+    }
+
+    /// Access geometry metadata (barcode lengths, UMI length, etc.).
+    pub fn meta(&self) -> &GeomMeta {
+        match self {
+            CompiledGeom::Simple(ext) => &ext.meta,
+            CompiledGeom::General(ext) => &ext.meta,
+        }
     }
 }
 
@@ -688,7 +760,7 @@ mod tests {
         let geom = parse_geometry("1{b[16]u[12]x:}2{r[50]x[18]s[8]x:}").unwrap();
         let compiled = CompiledGeom::from_fragment_geom(&geom).unwrap();
 
-        assert_eq!(compiled.num_bc_levels, 2);
+        assert_eq!(compiled.meta().num_bc_levels, 2);
 
         // Build synthetic reads
         let r1 = b"CELLBARCODEACGTUMI_AAAAAAAA_extra_stuff_here";
