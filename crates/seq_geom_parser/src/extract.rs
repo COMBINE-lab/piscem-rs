@@ -125,6 +125,175 @@ impl<'a> ExtractionBuf<'a> {
     }
 }
 
+/// A stateful extractor that owns its workspace. Create once per thread,
+/// call `extract()` for each read pair, then access results via getters.
+///
+/// This is the recommended API for hot loops: no per-read allocation,
+/// no return value construction, no SmallVec overhead. Results are stored
+/// internally and accessed via `barcode()`, `umi()`, `bio_read()`.
+///
+/// ```ignore
+/// let mut ext = Extractor::new(&compiled_geom);
+/// for (r1, r2) in reads {
+///     ext.extract(r1, r2);
+///     let bc = ext.barcode(0);   // &[u8] or None
+///     let umi = ext.umi();
+///     let read = ext.bio_read(0);
+/// }
+/// ```
+pub struct Extractor {
+    /// The extraction strategy.
+    kind: ExtractorKind,
+    /// Barcode results (fixed-size, indexed by level).
+    bc_ptrs: SmallVec<[(*const u8, usize); MAX_INLINE_BARCODES]>,
+    /// UMI result.
+    umi_ptr: (*const u8, usize),
+    /// Bio read results.
+    read_ptrs: SmallVec<[(*const u8, usize); 2]>,
+    /// Whether the last extract() call found a valid anchor (for variable geometries).
+    pub anchor_found: bool,
+}
+
+enum ExtractorKind {
+    Simple(SimpleGeom),
+    General { r1_plan: ReadPlan, r2_plan: ReadPlan, num_bc_levels: usize },
+}
+
+// SAFETY: Extractor stores raw pointers to read data. The pointers are only
+// valid between an extract() call and the next extract() call (or drop).
+// The caller must not use barcode()/umi()/bio_read() after the read data
+// they came from is dropped. This is enforced by the intended usage pattern
+// where reads are processed sequentially in a loop.
+unsafe impl Send for Extractor {}
+
+impl Extractor {
+    /// Create a new extractor for the given compiled geometry.
+    pub fn new(compiled: &CompiledGeom) -> Self {
+        let (kind, num_bc) = match compiled {
+            CompiledGeom::Simple(ext) => (ExtractorKind::Simple(ext.sg), 1),
+            CompiledGeom::General(ext) => (
+                ExtractorKind::General {
+                    r1_plan: ext.r1_plan.clone(),
+                    r2_plan: ext.r2_plan.clone(),
+                    num_bc_levels: ext.meta.num_bc_levels,
+                },
+                ext.meta.num_bc_levels,
+            ),
+        };
+        Self {
+            kind,
+            bc_ptrs: SmallVec::from_elem((std::ptr::null(), 0), num_bc),
+            umi_ptr: (std::ptr::null(), 0),
+            read_ptrs: SmallVec::new(),
+            anchor_found: true,
+        }
+    }
+
+    /// Extract sequences from a read pair. Results are stored internally
+    /// and accessed via `barcode()`, `umi()`, `bio_read()`.
+    #[inline]
+    pub fn extract(&mut self, r1: &[u8], r2: &[u8]) {
+        self.anchor_found = true;
+        match &self.kind {
+            ExtractorKind::Simple(sg) => {
+                if r1.len() >= sg.bc_offset + sg.bc_len {
+                    self.bc_ptrs[0] = (r1[sg.bc_offset..].as_ptr(), sg.bc_len);
+                } else {
+                    self.bc_ptrs[0] = (std::ptr::null(), 0);
+                }
+                if r1.len() >= sg.umi_offset + sg.umi_len {
+                    self.umi_ptr = (r1[sg.umi_offset..].as_ptr(), sg.umi_len);
+                } else {
+                    self.umi_ptr = (std::ptr::null(), 0);
+                }
+                self.read_ptrs.clear();
+                if sg.read_on_r2 {
+                    self.read_ptrs.push((r2.as_ptr(), r2.len()));
+                } else if sg.read_offset < r1.len() {
+                    self.read_ptrs.push((r1[sg.read_offset..].as_ptr(), r1.len() - sg.read_offset));
+                }
+            }
+            ExtractorKind::General { r1_plan, r2_plan, num_bc_levels } => {
+                // Reset
+                for bc in self.bc_ptrs.iter_mut() {
+                    *bc = (std::ptr::null(), 0);
+                }
+                self.umi_ptr = (std::ptr::null(), 0);
+                self.read_ptrs.clear();
+                // Use the general extraction via ExtractedSeqs, then copy pointers
+                let mut result = ExtractedSeqs {
+                    barcodes: SmallVec::from_elem(None, *num_bc_levels),
+                    umi: None,
+                    reads: SmallVec::new(),
+                };
+                execute_plan(r1_plan, r1, &mut result);
+                execute_plan(r2_plan, r2, &mut result);
+                for (i, bc) in result.barcodes.iter().enumerate() {
+                    if let Some(slice) = bc {
+                        self.bc_ptrs[i] = (slice.as_ptr(), slice.len());
+                    }
+                }
+                if let Some(umi) = result.umi {
+                    self.umi_ptr = (umi.as_ptr(), umi.len());
+                }
+                for r in &result.reads {
+                    self.read_ptrs.push((r.as_ptr(), r.len()));
+                }
+            }
+        }
+    }
+
+    /// Get barcode at the given level. Returns None if the barcode wasn't
+    /// found (read too short) or the level doesn't exist.
+    ///
+    /// # Safety
+    /// The returned slice borrows from the read data passed to the most
+    /// recent `extract()` call. Do not use after that data is dropped.
+    #[inline(always)]
+    pub unsafe fn barcode(&self, level: usize) -> Option<&[u8]> {
+        if level < self.bc_ptrs.len() {
+            let (ptr, len) = self.bc_ptrs[level];
+            if !ptr.is_null() {
+                return Some(std::slice::from_raw_parts(ptr, len));
+            }
+        }
+        None
+    }
+
+    /// Get the UMI sequence.
+    ///
+    /// # Safety
+    /// Same as `barcode()`.
+    #[inline(always)]
+    pub unsafe fn umi(&self) -> Option<&[u8]> {
+        if !self.umi_ptr.0.is_null() {
+            Some(std::slice::from_raw_parts(self.umi_ptr.0, self.umi_ptr.1))
+        } else {
+            None
+        }
+    }
+
+    /// Get the biological read at the given index (0 for SE, 0+1 for PE).
+    ///
+    /// # Safety
+    /// Same as `barcode()`.
+    #[inline(always)]
+    pub unsafe fn bio_read(&self, idx: usize) -> Option<&[u8]> {
+        if idx < self.read_ptrs.len() {
+            let (ptr, len) = self.read_ptrs[idx];
+            Some(std::slice::from_raw_parts(ptr, len))
+        } else {
+            None
+        }
+    }
+
+    /// Number of biological reads from the last extraction.
+    #[inline(always)]
+    pub fn num_bio_reads(&self) -> usize {
+        self.read_ptrs.len()
+    }
+}
+
 /// Specialized fast extraction for the common case:
 /// R1 has BC at [0..bc_len], UMI at [bc_len..bc_len+umi_len], R2 is the full bio read.
 /// This avoids all step iteration, SmallVec construction, and enum matching.
