@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(name = "piscem-rs")]
 #[command(about = "Rust implementation of piscem")]
+#[command(version = crate::VERSION)]
 pub struct Cli {
     #[command(subcommand)]
     command: Commands,
