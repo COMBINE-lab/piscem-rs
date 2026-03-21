@@ -23,7 +23,7 @@
 //! assert_eq!(padded, b"ACGTACGTAC");
 //! ```
 
-use crate::types::{GeoLen, VAR_LEN_PADDING, MAX_RANGE_WIDTH};
+use crate::types::{GeoLen, VAR_LEN_PADDING};
 
 /// Maximum barcode/UMI length we support (in bases).
 /// This limits the size of inline buffers.

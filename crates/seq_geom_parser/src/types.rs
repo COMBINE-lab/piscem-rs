@@ -75,6 +75,84 @@ pub struct FragmentGeom {
     pub read2: ReadGeom,
 }
 
+/// The executor complexity tier required to interpret a geometry.
+///
+/// This separates geometries that can be handled by the current mostly
+/// left-to-right executor from those that require a more general boundary
+/// solver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeometryComplexity {
+    /// Every field has a fixed width and can be extracted by static offsets.
+    FixedOffsets,
+    /// Exactly one variable-width region per read, and each such region is
+    /// inferable from a fixed right boundary or the end of the read.
+    ///
+    /// This is the tier handled by the current executor.
+    InferableVariable,
+    /// A more general boundary-solving geometry, such as an interior `r:` or
+    /// a variable region that must be inferred from both left and right
+    /// boundaries after anchor resolution.
+    ///
+    /// Example: `1{r:f[ACAGT]b[9-11]}`.
+    BoundarySolved,
+}
+
+/// A resolved boundary that can constrain a variable-width region.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundaryConstraint {
+    /// The start of the read.
+    ReadStart,
+    /// The end of the read.
+    ReadEnd,
+    /// A fixed anchor sequence located within the read.
+    Anchor(AnchorConstraint),
+}
+
+/// A fixed-sequence anchor used as a boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorConstraint {
+    pub sequence: Vec<u8>,
+    pub tolerance: Option<MatchTolerance>,
+}
+
+/// A bounded variable-width region inferred from explicit boundaries.
+///
+/// This is the natural unit for the current executor tier: once the left and
+/// right boundaries are resolved, the width of the region is uniquely
+/// determined and its inner tags can be sliced directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferableRegion {
+    pub left_boundary: BoundaryConstraint,
+    pub right_boundary: BoundaryConstraint,
+    pub parts: Vec<GeoPart>,
+}
+
+/// Sketch of a more general geometry representation for a boundary-solving
+/// executor.
+///
+/// The intended model is that a read is decomposed into segments separated by
+/// constraints, and extraction becomes a process of resolving boundary
+/// positions and then assigning the spans between them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundarySolvedReadGeom {
+    pub segments: Vec<BoundarySolvedSegment>,
+}
+
+/// One segment in a boundary-solving read geometry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundarySolvedSegment {
+    /// A field or group of fields whose span is determined after solving its
+    /// surrounding boundaries.
+    Region(InferableRegion),
+    /// A field that semantically consumes the maximal interval consistent with
+    /// the remaining constraints, such as an interior `r:`.
+    OpenEnded {
+        tag: GeoTagType,
+        left_boundary: BoundaryConstraint,
+        right_boundary: BoundaryConstraint,
+    },
+}
+
 /// Information about barcode levels discovered in the geometry.
 #[derive(Debug, Clone)]
 pub struct BarcodeInfo {

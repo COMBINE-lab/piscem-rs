@@ -27,16 +27,29 @@
 //!
 //! ## Variable-length normalization
 //!
-//! When barcodes or UMIs have variable length (`b[9-10]`, `u[10-12]`), the
-//! extracted sequence is padded to the maximum length using a collision-free
-//! padding scheme, ensuring downstream fixed-width tools work correctly.
+//! Variable-length tags are supported when a downstream fixed anchor makes
+//! their boundaries inferable, such as `b[9-10]u[12]f[SEQ]` or
+//! `x[0-3]f[SEQ]s[10]`. Normalization helpers are exposed in [`normalize`] so
+//! callers can pad extracted variable-length barcode/UMI sequences to their
+//! declared maximum width when needed.
+//!
+//! ## Complexity Tiers
+//!
+//! The public types distinguish between two executor tiers:
+//! - [`GeometryComplexity::FixedOffsets`]: fully static offsets
+//! - [`GeometryComplexity::InferableVariable`]: one inferable variable region
+//!   per read, resolved against an anchor or read boundary
+//!
+//! The crate also exposes sketch types for a future
+//! [`GeometryComplexity::BoundarySolved`] executor, which would be needed for
+//! broader grammars such as `1{r:f[ACAGT]b[9-11]}`.
 
-pub mod types;
-pub mod parse;
 pub mod extract;
 pub mod normalize;
+pub mod parse;
+pub mod types;
 
 // Re-export key types at crate root
+pub use extract::{CompiledGeom, ExtractedSeqs, GeneralExtractor, GeomMeta, SimpleExtractor};
+pub use parse::{format_errors, geometry_complexity, parse_geometry, validate_geometry};
 pub use types::*;
-pub use parse::{parse_geometry, validate_geometry, format_errors};
-pub use extract::{CompiledGeom, SimpleExtractor, GeneralExtractor, GeomMeta, ExtractedSeqs};

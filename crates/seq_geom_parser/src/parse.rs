@@ -28,10 +28,7 @@ use crate::types::*;
 /// and descriptive messages on failure.
 pub fn parse_geometry(input: &str) -> Result<FragmentGeom, Vec<Rich<'_, char>>> {
     let result = fragment_geom_parser().parse(input);
-    match result.into_result() {
-        Ok(fg) => Ok(fg),
-        Err(errs) => Err(errs),
-    }
+    result.into_result()
 }
 
 /// Format parse errors into human-readable strings.
@@ -57,8 +54,8 @@ pub fn format_errors(input: &str, errors: &[Rich<'_, char>]) -> String {
 
 // ── Parser combinators ──────────────────────────────────────────────
 
-fn fragment_geom_parser<'a>(
-) -> impl Parser<'a, &'a str, FragmentGeom, extra::Err<Rich<'a, char>>> {
+fn fragment_geom_parser<'a>() -> impl Parser<'a, &'a str, FragmentGeom, extra::Err<Rich<'a, char>>>
+{
     read_desc_parser('1')
         .then(read_desc_parser('2'))
         .then_ignore(end())
@@ -156,8 +153,7 @@ fn tag_spec_parser<'a>() -> impl Parser<'a, &'a str, GeoPart, extra::Err<Rich<'a
 fn len_spec_parser<'a>() -> impl Parser<'a, &'a str, GeoLen, extra::Err<Rich<'a, char>>> {
     let num = text::int(10).map(|s: &str| s.parse::<u32>().unwrap());
 
-    num.clone()
-        .then(just('-').ignore_then(num).or_not())
+    num.then(just('-').ignore_then(num).or_not())
         .map(|(n, m)| match m {
             Some(m) => GeoLen::Range(n, m),
             None => GeoLen::Fixed(n),
@@ -165,21 +161,19 @@ fn len_spec_parser<'a>() -> impl Parser<'a, &'a str, GeoLen, extra::Err<Rich<'a,
 }
 
 fn unbounded_desc_parser<'a>() -> impl Parser<'a, &'a str, GeoPart, extra::Err<Rich<'a, char>>> {
-    one_of("xr")
-        .then_ignore(just(':'))
-        .map(|tag_char| {
-            let tag = match tag_char {
-                'x' => GeoTagType::Discard,
-                'r' => GeoTagType::Read,
-                _ => unreachable!(),
-            };
-            GeoPart {
-                tag,
-                len: GeoLen::Unbounded,
-                sequence: None,
-                tolerance: None,
-            }
-        })
+    one_of("xr").then_ignore(just(':')).map(|tag_char| {
+        let tag = match tag_char {
+            'x' => GeoTagType::Discard,
+            'r' => GeoTagType::Read,
+            _ => unreachable!(),
+        };
+        GeoPart {
+            tag,
+            len: GeoLen::Unbounded,
+            sequence: None,
+            tolerance: None,
+        }
+    })
 }
 
 fn dist_func_parser<'a>() -> impl Parser<'a, &'a str, GeoPart, extra::Err<Rich<'a, char>>> {
@@ -192,7 +186,7 @@ fn dist_func_parser<'a>() -> impl Parser<'a, &'a str, GeoPart, extra::Err<Rich<'
                 .ignore_then(tag_spec_parser())
                 .then_ignore(just(','))
                 .then_ignore(just(' ').or_not())
-                .then(num.clone())
+                .then(num)
                 .then_ignore(just(')')),
         )
         .map(|(mut part, max_dist)| {
@@ -224,9 +218,7 @@ pub fn validate_geometry(geom: &FragmentGeom) -> Result<(), String> {
     let has_barcode = all_parts.iter().any(|p| {
         matches!(
             p.tag,
-            GeoTagType::Barcode
-                | GeoTagType::SampleBarcode
-                | GeoTagType::NumberedBarcode(_)
+            GeoTagType::Barcode | GeoTagType::SampleBarcode | GeoTagType::NumberedBarcode(_)
         )
     });
     if !has_barcode {
@@ -265,23 +257,71 @@ pub fn validate_geometry(geom: &FragmentGeom) -> Result<(), String> {
         }
     }
 
-    // Variable-length discard must be followed by a fixed anchor
     for read in [&geom.read1, &geom.read2] {
-        for (i, part) in read.parts.iter().enumerate() {
-            if matches!(part.tag, GeoTagType::Discard) && matches!(part.len, GeoLen::Range(_, _)) {
-                let next = read.parts.get(i + 1);
-                let has_anchor = next.is_some_and(|p| matches!(p.tag, GeoTagType::Fixed));
-                if !has_anchor {
-                    return Err(
-                        "variable-length discard (x[N-M]) must be followed by a fixed anchor (f[SEQ])"
-                            .into(),
-                    );
-                }
-            }
+        let Some(first_range_idx) = read
+            .parts
+            .iter()
+            .position(|part| matches!(part.len, GeoLen::Range(_, _)))
+        else {
+            continue;
+        };
+
+        let Some(anchor_rel_idx) = read.parts[(first_range_idx + 1)..]
+            .iter()
+            .position(|part| matches!(part.tag, GeoTagType::Fixed))
+        else {
+            return Err(
+                "variable-length fields must be followed by a fixed anchor (f[SEQ]) so their boundaries can be inferred"
+                    .into(),
+            );
+        };
+
+        let anchor_idx = first_range_idx + 1 + anchor_rel_idx;
+        let variable_count = read.parts[first_range_idx..anchor_idx]
+            .iter()
+            .filter(|part| matches!(part.len, GeoLen::Range(_, _)))
+            .count();
+        if variable_count > 1 {
+            return Err(
+                "at most one variable-length field before a fixed anchor is currently supported"
+                    .into(),
+            );
+        }
+
+        if read.parts[(anchor_idx + 1)..]
+            .iter()
+            .any(|part| matches!(part.len, GeoLen::Range(_, _)))
+        {
+            return Err(
+                "multiple variable-length anchored regions in the same read are not yet supported"
+                    .into(),
+            );
         }
     }
 
     Ok(())
+}
+
+/// Classify the executor complexity tier required for a geometry.
+///
+/// With the current grammar, geometries classify as either
+/// [`GeometryComplexity::FixedOffsets`] or
+/// [`GeometryComplexity::InferableVariable`]. The
+/// [`GeometryComplexity::BoundarySolved`] tier is reserved for a broader
+/// grammar with bidirectional anchors and interior unbounded fields.
+pub fn geometry_complexity(geom: &FragmentGeom) -> GeometryComplexity {
+    let has_variable = geom
+        .read1
+        .parts
+        .iter()
+        .chain(geom.read2.parts.iter())
+        .any(|part| matches!(part.len, GeoLen::Range(_, _)));
+
+    if has_variable {
+        GeometryComplexity::InferableVariable
+    } else {
+        GeometryComplexity::FixedOffsets
+    }
 }
 
 #[cfg(test)]
@@ -315,26 +355,20 @@ mod tests {
 
     #[test]
     fn parse_flex_v2_with_anchor() {
-        let geom =
-            parse_geometry("1{b[16]u[12]x[0-3]f[TTGCTAGGACCG]s[10]x:}2{r:}").unwrap();
+        let geom = parse_geometry("1{b[16]u[12]x[0-3]f[TTGCTAGGACCG]s[10]x:}2{r:}").unwrap();
         assert_eq!(geom.read1.parts.len(), 6);
         assert_eq!(geom.read1.parts[2].tag, GeoTagType::Discard);
         assert_eq!(geom.read1.parts[2].len, GeoLen::Range(0, 3));
         assert_eq!(geom.read1.parts[3].tag, GeoTagType::Fixed);
-        assert_eq!(
-            geom.read1.parts[3].sequence,
-            Some(b"TTGCTAGGACCG".to_vec())
-        );
+        assert_eq!(geom.read1.parts[3].sequence, Some(b"TTGCTAGGACCG".to_vec()));
         assert_eq!(geom.read1.parts[4].tag, GeoTagType::SampleBarcode);
         assert_eq!(geom.read1.parts[4].len, GeoLen::Fixed(10));
     }
 
     #[test]
     fn parse_hamming_distance() {
-        let geom = parse_geometry(
-            "1{b[16]u[12]x[0-3]hamming(f[TTGCTAGGACCG],1)s[10]x:}2{r:}",
-        )
-        .unwrap();
+        let geom =
+            parse_geometry("1{b[16]u[12]x[0-3]hamming(f[TTGCTAGGACCG],1)s[10]x:}2{r:}").unwrap();
         let anchor = &geom.read1.parts[3];
         assert_eq!(anchor.tag, GeoTagType::Fixed);
         assert_eq!(
@@ -380,16 +414,33 @@ mod tests {
         let geom = parse_geometry("1{b[16]u[12]x[0-3]s[10]x:}2{r:}").unwrap();
         let err = validate_geometry(&geom);
         assert!(err.is_err());
-        assert!(err.unwrap_err().contains("must be followed by a fixed anchor"));
+        assert!(err
+            .unwrap_err()
+            .contains("must be followed by a fixed anchor"));
     }
 
     #[test]
     fn validate_range_too_wide() {
-        let geom =
-            parse_geometry("1{b[16]u[12]x[0-5]f[TTGCTAGGACCG]s[10]x:}2{r:}").unwrap();
+        let geom = parse_geometry("1{b[16]u[12]x[0-5]f[TTGCTAGGACCG]s[10]x:}2{r:}").unwrap();
         let err = validate_geometry(&geom);
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn validate_variable_length_barcode_with_anchor() {
+        let geom = parse_geometry("1{b[9-10]u[12]f[ACGT]x:}2{r:}").unwrap();
+        assert!(validate_geometry(&geom).is_ok());
+    }
+
+    #[test]
+    fn validate_variable_length_barcode_without_anchor_rejected() {
+        let geom = parse_geometry("1{b[9-10]u[12]x:}2{r:}").unwrap();
+        let err = validate_geometry(&geom);
+        assert!(err.is_err());
+        assert!(err
+            .unwrap_err()
+            .contains("must be followed by a fixed anchor"));
     }
 
     #[test]
@@ -407,10 +458,8 @@ mod tests {
     #[test]
     fn parse_hamming_with_space() {
         // Allow optional space after comma
-        let geom = parse_geometry(
-            "1{b[16]u[12]x[0-3]hamming(f[TTGCTAGGACCG], 1)s[10]x:}2{r:}",
-        )
-        .unwrap();
+        let geom =
+            parse_geometry("1{b[16]u[12]x[0-3]hamming(f[TTGCTAGGACCG], 1)s[10]x:}2{r:}").unwrap();
         let anchor = &geom.read1.parts[3];
         assert_eq!(
             anchor.tolerance,
@@ -418,6 +467,21 @@ mod tests {
                 kind: DistanceKind::Hamming,
                 max_dist: 1,
             })
+        );
+    }
+
+    #[test]
+    fn classify_fixed_vs_variable_complexity() {
+        let fixed = parse_geometry("1{b[16]u[12]x:}2{r:}").unwrap();
+        assert_eq!(
+            geometry_complexity(&fixed),
+            GeometryComplexity::FixedOffsets
+        );
+
+        let variable = parse_geometry("1{b[9-10]u[12]f[ACGT]x:}2{r:}").unwrap();
+        assert_eq!(
+            geometry_complexity(&variable),
+            GeometryComplexity::InferableVariable
         );
     }
 }

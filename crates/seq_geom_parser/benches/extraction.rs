@@ -7,13 +7,15 @@
 //!
 //! Results are saved to `target/criterion/` with HTML reports.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
-use seq_geom_parser::{parse_geometry, validate_geometry, CompiledGeom, SimpleExtractor};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use seq_geom_parser::{parse_geometry, CompiledGeom};
 
 /// Generate a synthetic read of the given length filled with random-ish bases.
 fn make_read(len: usize, seed: u8) -> Vec<u8> {
     let bases = [b'A', b'C', b'G', b'T'];
-    (0..len).map(|i| bases[((i as u8).wrapping_add(seed)) as usize % 4]).collect()
+    (0..len)
+        .map(|i| bases[((i as u8).wrapping_add(seed)) as usize % 4])
+        .collect()
 }
 
 /// Build a Flex v1 R2 read: 50bp bio + 18bp linker + 8bp sample BC + rest
@@ -43,7 +45,10 @@ fn bench_parse(c: &mut Criterion) {
         ("chromium_v3", "1{b[16]u[12]x:}2{r:}"),
         ("flex_v1", "1{b[16]u[12]x:}2{r[50]x[18]s[8]x:}"),
         ("flex_v2", "1{b[16]u[12]x[0-3]f[TTGCTAGGACCG]s[10]x:}2{r:}"),
-        ("flex_v2_hamming", "1{b[16]u[12]x[0-3]hamming(f[TTGCTAGGACCG],1)s[10]x:}2{r:}"),
+        (
+            "flex_v2_hamming",
+            "1{b[16]u[12]x[0-3]hamming(f[TTGCTAGGACCG],1)s[10]x:}2{r:}",
+        ),
     ];
 
     for (name, geom_str) in &geometries {
@@ -125,10 +130,7 @@ fn bench_extract_anchor(c: &mut Criterion) {
     }
 
     // Flex v2 with hamming(1) tolerance
-    let geom = parse_geometry(
-        "1{b[16]u[12]x[0-3]hamming(f[TTGCTAGGACCG],1)s[10]x:}2{r:}",
-    )
-    .unwrap();
+    let geom = parse_geometry("1{b[16]u[12]x[0-3]hamming(f[TTGCTAGGACCG],1)s[10]x:}2{r:}").unwrap();
     let compiled_h1 = CompiledGeom::from_fragment_geom(&geom).unwrap();
 
     // Exact match with hamming enabled (should still be fast)
@@ -157,21 +159,43 @@ fn bench_extract_anchor(c: &mut Criterion) {
 /// Hardcoded extraction mimicking ChromiumProtocol::extract_tech_seqs exactly.
 /// This is the absolute minimum work: two bounds checks, two slices, return.
 #[inline(never)]
-fn hardcoded_chromium_v3_extract<'a>(r1: &'a [u8], r2: &'a [u8]) -> (Option<&'a [u8]>, Option<&'a [u8]>, &'a [u8]) {
+fn hardcoded_chromium_v3_extract<'a>(
+    r1: &'a [u8],
+    r2: &'a [u8],
+) -> (Option<&'a [u8]>, Option<&'a [u8]>, &'a [u8]) {
     let bc_len = 16;
     let umi_len = 12;
-    let barcode = if r1.len() >= bc_len { Some(&r1[..bc_len]) } else { None };
-    let umi = if r1.len() >= bc_len + umi_len { Some(&r1[bc_len..bc_len + umi_len]) } else { None };
+    let barcode = if r1.len() >= bc_len {
+        Some(&r1[..bc_len])
+    } else {
+        None
+    };
+    let umi = if r1.len() >= bc_len + umi_len {
+        Some(&r1[bc_len..bc_len + umi_len])
+    } else {
+        None
+    };
     (barcode, umi, r2)
 }
 
 /// Same but for Chromium v2 (16bp BC, 10bp UMI).
 #[inline(never)]
-fn hardcoded_chromium_v2_extract<'a>(r1: &'a [u8], r2: &'a [u8]) -> (Option<&'a [u8]>, Option<&'a [u8]>, &'a [u8]) {
+fn hardcoded_chromium_v2_extract<'a>(
+    r1: &'a [u8],
+    r2: &'a [u8],
+) -> (Option<&'a [u8]>, Option<&'a [u8]>, &'a [u8]) {
     let bc_len = 16;
     let umi_len = 10;
-    let barcode = if r1.len() >= bc_len { Some(&r1[..bc_len]) } else { None };
-    let umi = if r1.len() >= bc_len + umi_len { Some(&r1[bc_len..bc_len + umi_len]) } else { None };
+    let barcode = if r1.len() >= bc_len {
+        Some(&r1[..bc_len])
+    } else {
+        None
+    };
+    let umi = if r1.len() >= bc_len + umi_len {
+        Some(&r1[bc_len..bc_len + umi_len])
+    } else {
+        None
+    };
     (barcode, umi, r2)
 }
 
@@ -223,7 +247,6 @@ fn bench_hardcoded_vs_compiled(c: &mut Criterion) {
     group.bench_function("compiled_v2_direct", |b| {
         b.iter(|| simple_v2.extract(black_box(&r1), black_box(&r2)));
     });
-
 
     group.finish();
 }
@@ -290,7 +313,10 @@ fn bench_extract_throughput(c: &mut Criterion) {
     let reads_v2: Vec<(Vec<u8>, Vec<u8>)> = (0..batch_size)
         .map(|i| {
             let gap = i % 4; // vary gap length
-            (make_flex_v2_r1(gap, anchor, sample_bc), make_read(150, (i + 1) as u8))
+            (
+                make_flex_v2_r1(gap, anchor, sample_bc),
+                make_read(150, (i + 1) as u8),
+            )
         })
         .collect();
 

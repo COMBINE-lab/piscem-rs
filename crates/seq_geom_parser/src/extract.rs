@@ -7,8 +7,9 @@
 //!    path and must be as fast as possible — zero allocation, minimal branching.
 //!
 //! For fixed-length geometries (the common case), extraction is a simple slice
-//! operation: `&read[offset..offset+len]`. For variable-length geometries with
-//! anchors, a search phase locates the anchor within a small window first.
+//! operation: `&read[offset..offset+len]`. For inferable variable-length
+//! geometries, a search phase locates the right boundary (an anchor or the read
+//! end) and resolves the variable-width span before slicing.
 
 use smallvec::{smallvec, SmallVec};
 
@@ -33,17 +34,19 @@ enum ExtractionStep {
         target: ExtractTarget,
     },
     /// Skip a fixed number of bases (no extraction).
-    FixedSkip { offset: usize, len: usize },
+    FixedSkip,
     /// Extract from offset to end of read.
     Unbounded {
         offset: usize,
         target: ExtractTarget,
     },
     /// Skip to end of read (unbounded discard).
-    UnboundedSkip { offset: usize },
+    UnboundedSkip,
     /// Search for an anchor sequence within a window, then continue
     /// extraction relative to the anchor position.
     AnchorSearch {
+        /// Absolute offset where the bounded region starts.
+        region_start_offset: usize,
         /// Minimum offset to start searching.
         min_offset: usize,
         /// Maximum offset to start searching (inclusive).
@@ -54,9 +57,24 @@ enum ExtractionStep {
         max_dist: u8,
         /// Distance metric kind.
         dist_kind: DistanceKind,
+        /// Steps within the bounded region immediately preceding the anchor.
+        pre_anchor_parts: Vec<AnchoredPart>,
         /// Steps to execute after the anchor is found. Offsets are relative
         /// to the position immediately after the anchor.
         post_anchor_steps: Vec<ExtractionStep>,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum AnchoredPart {
+    Fixed {
+        len: usize,
+        target: Option<ExtractTarget>,
+    },
+    Variable {
+        min_len: usize,
+        max_len: usize,
+        target: Option<ExtractTarget>,
     },
 }
 
@@ -243,23 +261,31 @@ impl CompiledGeom {
 
         // Detect simple geometry: 1 barcode level, no variable steps,
         // BC+UMI on R1 at fixed offsets, bio read on R2 (unbounded).
-        let simple = if num_bc_levels == 1
-            && !r1_plan.has_variable
-            && !r2_plan.has_variable
-        {
+        let simple = if num_bc_levels == 1 && !r1_plan.has_variable && !r2_plan.has_variable {
             // Look for BC and UMI fixed slices in R1 plan
             let mut bc_info = None;
             let mut umi_info = None;
             let mut r1_read_offset = None;
             for step in &r1_plan.steps {
                 match step {
-                    ExtractionStep::FixedSlice { offset, len, target: ExtractTarget::Barcode(0) } => {
+                    ExtractionStep::FixedSlice {
+                        offset,
+                        len,
+                        target: ExtractTarget::Barcode(0),
+                    } => {
                         bc_info = Some((*offset, *len));
                     }
-                    ExtractionStep::FixedSlice { offset, len, target: ExtractTarget::Umi } => {
+                    ExtractionStep::FixedSlice {
+                        offset,
+                        len,
+                        target: ExtractTarget::Umi,
+                    } => {
                         umi_info = Some((*offset, *len));
                     }
-                    ExtractionStep::Unbounded { offset, target: ExtractTarget::Read } => {
+                    ExtractionStep::Unbounded {
+                        offset,
+                        target: ExtractTarget::Read,
+                    } => {
                         r1_read_offset = Some(*offset);
                     }
                     _ => {}
@@ -267,7 +293,13 @@ impl CompiledGeom {
             }
             // Check if R2 has an unbounded read
             let r2_has_unbounded_read = r2_plan.steps.iter().any(|s| {
-                matches!(s, ExtractionStep::Unbounded { offset: 0, target: ExtractTarget::Read })
+                matches!(
+                    s,
+                    ExtractionStep::Unbounded {
+                        offset: 0,
+                        target: ExtractTarget::Read
+                    }
+                )
             });
 
             match (bc_info, umi_info) {
@@ -369,19 +401,15 @@ fn execute_plan<'a>(plan: &ReadPlan, read: &'a [u8], result: &mut ExtractedSeqs<
 
 /// Execute a single fixed-offset step (no branching on variable-length).
 #[inline(always)]
-fn execute_fixed_step<'a>(
-    step: &ExtractionStep,
-    read: &'a [u8],
-    result: &mut ExtractedSeqs<'a>,
-) {
+fn execute_fixed_step<'a>(step: &ExtractionStep, read: &'a [u8], result: &mut ExtractedSeqs<'a>) {
     match step {
         ExtractionStep::FixedSlice {
             offset,
             len,
             target,
         } => {
-            let end = (*offset + *len).min(read.len());
-            if *offset < read.len() {
+            let end = *offset + *len;
+            if end <= read.len() {
                 let slice = &read[*offset..end];
                 assign_target(target, slice, result);
             }
@@ -391,7 +419,7 @@ fn execute_fixed_step<'a>(
                 assign_target(target, &read[*offset..], result);
             }
         }
-        ExtractionStep::FixedSkip { .. } | ExtractionStep::UnboundedSkip { .. } => {
+        ExtractionStep::FixedSkip | ExtractionStep::UnboundedSkip => {
             // Nothing to extract
         }
         ExtractionStep::AnchorSearch { .. } => {
@@ -409,17 +437,31 @@ fn execute_steps_with_search<'a>(
     for step in steps {
         match step {
             ExtractionStep::AnchorSearch {
+                region_start_offset,
                 min_offset,
                 max_offset,
                 anchor,
                 max_dist,
                 dist_kind,
+                pre_anchor_parts,
                 post_anchor_steps,
             } => {
                 // Search for the anchor within the window
-                if let Some(anchor_pos) =
-                    find_anchor(read, *min_offset, *max_offset, anchor, *max_dist, *dist_kind)
-                {
+                if let Some(anchor_pos) = find_anchor(
+                    read,
+                    *min_offset,
+                    *max_offset,
+                    anchor,
+                    *max_dist,
+                    *dist_kind,
+                ) {
+                    execute_anchored_parts(
+                        *region_start_offset,
+                        anchor_pos,
+                        pre_anchor_parts,
+                        read,
+                        result,
+                    );
                     let after_anchor = anchor_pos + anchor.len();
                     // Execute post-anchor steps with offsets relative to after_anchor
                     for post_step in post_anchor_steps {
@@ -448,8 +490,8 @@ fn execute_fixed_step_with_base<'a>(
             target,
         } => {
             let abs_offset = base + *offset;
-            let end = (abs_offset + *len).min(read.len());
-            if abs_offset < read.len() {
+            let end = abs_offset + *len;
+            if end <= read.len() {
                 assign_target(target, &read[abs_offset..end], result);
             }
         }
@@ -459,9 +501,78 @@ fn execute_fixed_step_with_base<'a>(
                 assign_target(target, &read[abs_offset..], result);
             }
         }
-        ExtractionStep::FixedSkip { .. } | ExtractionStep::UnboundedSkip { .. } => {}
+        ExtractionStep::FixedSkip | ExtractionStep::UnboundedSkip => {}
         ExtractionStep::AnchorSearch { .. } => {
             // Nested anchor searches not supported
+        }
+    }
+}
+
+fn execute_anchored_parts<'a>(
+    region_start_offset: usize,
+    anchor_pos: usize,
+    parts: &[AnchoredPart],
+    read: &'a [u8],
+    result: &mut ExtractedSeqs<'a>,
+) {
+    let total_span = match anchor_pos.checked_sub(region_start_offset) {
+        Some(span) => span,
+        None => return,
+    };
+
+    let fixed_total = parts
+        .iter()
+        .map(|part| match part {
+            AnchoredPart::Fixed { len, .. } => *len,
+            AnchoredPart::Variable { .. } => 0,
+        })
+        .sum::<usize>();
+
+    let variable_part = parts.iter().find_map(|part| match part {
+        AnchoredPart::Variable {
+            min_len, max_len, ..
+        } => Some((*min_len, *max_len)),
+        AnchoredPart::Fixed { .. } => None,
+    });
+
+    let variable_len = if let Some((min_len, max_len)) = variable_part {
+        let len = match total_span.checked_sub(fixed_total) {
+            Some(len) => len,
+            None => return,
+        };
+        if len < min_len || len > max_len {
+            return;
+        }
+        len
+    } else if total_span == fixed_total {
+        0
+    } else {
+        return;
+    };
+
+    let mut offset = region_start_offset;
+    for part in parts {
+        match part {
+            AnchoredPart::Fixed { len, target } => {
+                let end = offset + *len;
+                if end > read.len() {
+                    return;
+                }
+                if let Some(target) = target {
+                    assign_target(target, &read[offset..end], result);
+                }
+                offset = end;
+            }
+            AnchoredPart::Variable { target, .. } => {
+                let end = offset + variable_len;
+                if end > read.len() {
+                    return;
+                }
+                if let Some(target) = target {
+                    assign_target(target, &read[offset..end], result);
+                }
+                offset = end;
+            }
         }
     }
 }
@@ -516,9 +627,7 @@ fn find_anchor(
                 continue;
             }
             let d = match dist_kind {
-                DistanceKind::Hamming => {
-                    hamming_distance(&read[pos..pos + anchor_len], anchor)
-                }
+                DistanceKind::Hamming => hamming_distance(&read[pos..pos + anchor_len], anchor),
                 DistanceKind::Levenshtein => {
                     // TODO: implement when needed
                     u8::MAX
@@ -604,63 +713,115 @@ fn compile_read_plan_with_levels(
     let mut umi_len = 0usize;
     let mut has_read = false;
     let mut has_variable = false;
-    let bc_level_fn = bc_level_fn;
-
     let mut i = 0;
     while i < read_geom.parts.len() {
         let part = &read_geom.parts[i];
 
-        match (&part.tag, &part.len) {
-            // Variable-length discard followed by anchor: compile as AnchorSearch
-            (GeoTagType::Discard, GeoLen::Range(min, max)) => {
-                has_variable = true;
-                let min_off = offset + *min as usize;
-                let max_off = offset + *max as usize;
+        if matches!(part.len, GeoLen::Range(_, _)) {
+            has_variable = true;
 
-                // The next part must be a Fixed anchor (validated earlier)
-                let anchor_part = &read_geom.parts[i + 1];
-                let anchor_seq = anchor_part.sequence.as_ref().unwrap().clone();
-                let (max_dist, dist_kind) = match &anchor_part.tolerance {
-                    Some(t) => (t.max_dist, t.kind),
-                    None => (0, DistanceKind::Hamming),
-                };
-                let anchor_len = anchor_seq.len();
+            let anchor_idx = read_geom.parts[(i + 1)..]
+                .iter()
+                .position(|part| matches!(part.tag, GeoTagType::Fixed))
+                .map(|rel_idx| i + 1 + rel_idx)
+                .ok_or_else(|| {
+                    "variable-length fields must be followed by a fixed anchor (f[SEQ])".to_string()
+                })?;
 
-                // Compile post-anchor steps with relative offsets (from end of anchor)
-                let mut post_steps = Vec::new();
-                let mut post_offset = 0usize;
-                for j in (i + 2)..read_geom.parts.len() {
-                    let pp = &read_geom.parts[j];
-                    compile_part_to_step(
-                        pp,
-                        &mut post_offset,
-                        &mut post_steps,
-                        &mut bc_lens,
-                        &mut umi_len,
-                        &mut has_read,
-                        bc_level_fn,
-                    );
+            let region_start_offset = offset;
+            let mut min_off = offset;
+            let mut max_off = offset;
+            let mut pre_anchor_parts = Vec::new();
+            for pp in &read_geom.parts[i..anchor_idx] {
+                let target = extract_target_for_part(pp, bc_level_fn);
+                match &pp.len {
+                    GeoLen::Fixed(len) => {
+                        let len = *len as usize;
+                        pre_anchor_parts.push(AnchoredPart::Fixed { len, target });
+                        min_off += len;
+                        max_off += len;
+                        if let Some(target) = target {
+                            record_target_len(
+                                target,
+                                len,
+                                &mut bc_lens,
+                                &mut umi_len,
+                                &mut has_read,
+                            );
+                        }
+                    }
+                    GeoLen::Range(min, max) => {
+                        pre_anchor_parts.push(AnchoredPart::Variable {
+                            min_len: *min as usize,
+                            max_len: *max as usize,
+                            target,
+                        });
+                        min_off += *min as usize;
+                        max_off += *max as usize;
+                        if let Some(target) = target {
+                            record_target_len(
+                                target,
+                                *max as usize,
+                                &mut bc_lens,
+                                &mut umi_len,
+                                &mut has_read,
+                            );
+                        }
+                    }
+                    GeoLen::Unbounded => {
+                        return Err(
+                            "unbounded fields cannot appear before an anchored variable-length region"
+                                .into(),
+                        );
+                    }
                 }
-
-                steps.push(ExtractionStep::AnchorSearch {
-                    min_offset: min_off,
-                    max_offset: max_off,
-                    anchor: anchor_seq,
-                    max_dist,
-                    dist_kind,
-                    post_anchor_steps: post_steps,
-                });
-
-                // Skip all remaining parts (handled by post_anchor_steps)
-                break;
             }
 
-            // Fixed anchor (not preceded by variable discard): just skip it
+            let anchor_part = &read_geom.parts[anchor_idx];
+            let anchor_seq = anchor_part.sequence.as_ref().unwrap().clone();
+            let (max_dist, dist_kind) = match &anchor_part.tolerance {
+                Some(t) => (t.max_dist, t.kind),
+                None => (0, DistanceKind::Hamming),
+            };
+
+            let mut post_steps = Vec::new();
+            let mut post_offset = 0usize;
+            for pp in &read_geom.parts[(anchor_idx + 1)..] {
+                if matches!(pp.len, GeoLen::Range(_, _)) {
+                    return Err(
+                        "multiple variable-length anchored regions in the same read are not yet supported"
+                            .into(),
+                    );
+                }
+                compile_part_to_step(
+                    pp,
+                    &mut post_offset,
+                    &mut post_steps,
+                    &mut bc_lens,
+                    &mut umi_len,
+                    &mut has_read,
+                    bc_level_fn,
+                );
+            }
+
+            steps.push(ExtractionStep::AnchorSearch {
+                region_start_offset,
+                min_offset: min_off,
+                max_offset: max_off,
+                anchor: anchor_seq,
+                max_dist,
+                dist_kind,
+                pre_anchor_parts,
+                post_anchor_steps: post_steps,
+            });
+
+            break;
+        }
+
+        match (&part.tag, &part.len) {
             (GeoTagType::Fixed, GeoLen::Fixed(len)) if part.tolerance.is_none() => {
                 offset += *len as usize;
             }
-
-            // All other parts: compile to fixed steps
             _ => {
                 compile_part_to_step(
                     part,
@@ -677,7 +838,15 @@ fn compile_read_plan_with_levels(
         i += 1;
     }
 
-    Ok((ReadPlan { steps, has_variable }, bc_lens, umi_len, has_read))
+    Ok((
+        ReadPlan {
+            steps,
+            has_variable,
+        },
+        bc_lens,
+        umi_len,
+        has_read,
+    ))
 }
 
 /// Compile a single GeoPart into an ExtractionStep.
@@ -690,12 +859,7 @@ fn compile_part_to_step(
     has_read: &mut bool,
     bc_level_fn: &dyn Fn(&GeoTagType) -> Option<u8>,
 ) {
-    let target = match &part.tag {
-        GeoTagType::Umi => Some(ExtractTarget::Umi),
-        GeoTagType::Read => Some(ExtractTarget::Read),
-        GeoTagType::Discard | GeoTagType::Fixed => None,
-        tag => bc_level_fn(tag).map(ExtractTarget::Barcode),
-    };
+    let target = extract_target_for_part(part, bc_level_fn);
 
     match &part.len {
         GeoLen::Fixed(len) => {
@@ -706,25 +870,13 @@ fn compile_part_to_step(
                     len: l,
                     target: t,
                 });
-                match t {
-                    ExtractTarget::Barcode(level) => {
-                        while bc_lens.len() <= level as usize {
-                            bc_lens.push(0);
-                        }
-                        bc_lens[level as usize] = l;
-                    }
-                    ExtractTarget::Umi => *umi_len = l,
-                    ExtractTarget::Read => *has_read = true,
-                }
+                record_target_len(t, l, bc_lens, umi_len, has_read);
             } else {
-                steps.push(ExtractionStep::FixedSkip {
-                    offset: *offset,
-                    len: l,
-                });
+                steps.push(ExtractionStep::FixedSkip);
             }
             *offset += l;
         }
-        GeoLen::Range(min, max) => {
+        GeoLen::Range(_, max) => {
             // Variable-length barcode/UMI: use max length for the extraction slot.
             // Normalization (padding) happens at a higher level.
             let l = *max as usize;
@@ -734,16 +886,7 @@ fn compile_part_to_step(
                     len: l,
                     target: t,
                 });
-                match t {
-                    ExtractTarget::Barcode(level) => {
-                        while bc_lens.len() <= level as usize {
-                            bc_lens.push(0);
-                        }
-                        bc_lens[level as usize] = l;
-                    }
-                    ExtractTarget::Umi => *umi_len = l,
-                    ExtractTarget::Read => *has_read = true,
-                }
+                record_target_len(t, l, bc_lens, umi_len, has_read);
             }
             // Note: offset advance depends on actual captured length at runtime.
             // For variable-length, this is handled by AnchorSearch in the caller.
@@ -759,10 +902,41 @@ fn compile_part_to_step(
                     *has_read = true;
                 }
             } else {
-                steps.push(ExtractionStep::UnboundedSkip { offset: *offset });
+                steps.push(ExtractionStep::UnboundedSkip);
             }
             // Unbounded: no more parts after this
         }
+    }
+}
+
+fn extract_target_for_part(
+    part: &GeoPart,
+    bc_level_fn: &dyn Fn(&GeoTagType) -> Option<u8>,
+) -> Option<ExtractTarget> {
+    match &part.tag {
+        GeoTagType::Umi => Some(ExtractTarget::Umi),
+        GeoTagType::Read => Some(ExtractTarget::Read),
+        GeoTagType::Discard | GeoTagType::Fixed => None,
+        tag => bc_level_fn(tag).map(ExtractTarget::Barcode),
+    }
+}
+
+fn record_target_len(
+    target: ExtractTarget,
+    len: usize,
+    bc_lens: &mut Vec<usize>,
+    umi_len: &mut usize,
+    has_read: &mut bool,
+) {
+    match target {
+        ExtractTarget::Barcode(level) => {
+            while bc_lens.len() <= level as usize {
+                bc_lens.push(0);
+            }
+            bc_lens[level as usize] = len;
+        }
+        ExtractTarget::Umi => *umi_len = len,
+        ExtractTarget::Read => *has_read = true,
     }
 }
 
@@ -809,8 +983,7 @@ mod tests {
 
     #[test]
     fn extract_flex_v2_exact_anchor() {
-        let geom =
-            parse_geometry("1{b[16]u[12]x[0-3]f[TTGCTAGGACCG]s[10]x:}2{r:}").unwrap();
+        let geom = parse_geometry("1{b[16]u[12]x[0-3]f[TTGCTAGGACCG]s[10]x:}2{r:}").unwrap();
         let compiled = CompiledGeom::from_fragment_geom(&geom).unwrap();
 
         // Build read with 2bp gap before anchor
@@ -840,8 +1013,7 @@ mod tests {
 
     #[test]
     fn extract_flex_v2_no_gap() {
-        let geom =
-            parse_geometry("1{b[16]u[12]x[0-3]f[TTGCTAGGACCG]s[10]x:}2{r:}").unwrap();
+        let geom = parse_geometry("1{b[16]u[12]x[0-3]f[TTGCTAGGACCG]s[10]x:}2{r:}").unwrap();
         let compiled = CompiledGeom::from_fragment_geom(&geom).unwrap();
 
         // Build read with 0bp gap (anchor immediately after UMI)
@@ -864,12 +1036,11 @@ mod tests {
 
     #[test]
     fn extract_flex_v2_anchor_not_found() {
-        let geom =
-            parse_geometry("1{b[16]u[12]x[0-3]f[TTGCTAGGACCG]s[10]x:}2{r:}").unwrap();
+        let geom = parse_geometry("1{b[16]u[12]x[0-3]f[TTGCTAGGACCG]s[10]x:}2{r:}").unwrap();
         let compiled = CompiledGeom::from_fragment_geom(&geom).unwrap();
 
         // Read with wrong anchor
-        let mut r1 = vec![b'A'; 60];
+        let r1 = vec![b'A'; 60];
         let r2 = b"BIO";
 
         let result = compiled.extract(&r1, r2);
@@ -882,10 +1053,8 @@ mod tests {
 
     #[test]
     fn extract_hamming_tolerance() {
-        let geom = parse_geometry(
-            "1{b[16]u[12]x[0-3]hamming(f[TTGCTAGGACCG],1)s[10]x:}2{r:}",
-        )
-        .unwrap();
+        let geom =
+            parse_geometry("1{b[16]u[12]x[0-3]hamming(f[TTGCTAGGACCG],1)s[10]x:}2{r:}").unwrap();
         let compiled = CompiledGeom::from_fragment_geom(&geom).unwrap();
 
         // Build read with 1 mismatch in anchor
@@ -906,6 +1075,38 @@ mod tests {
 
         let result = compiled.extract(&r1, r2);
         assert_eq!(result.barcodes[0], Some(sample.as_slice()));
+    }
+
+    #[test]
+    fn extract_variable_barcode_with_anchor() {
+        let geom = parse_geometry("1{b[9-10]u[12]f[ACGT]x:}2{r:}").unwrap();
+        let compiled = CompiledGeom::from_fragment_geom(&geom).unwrap();
+
+        let bc = b"ACGTACGTA";
+        let umi = b"TTTTTTTTTTTT";
+        let anchor = b"ACGT";
+        let mut r1 = Vec::new();
+        r1.extend_from_slice(bc);
+        r1.extend_from_slice(umi);
+        r1.extend_from_slice(anchor);
+        r1.extend_from_slice(b"TAIL");
+
+        let result = compiled.extract(&r1, b"BIO");
+        assert_eq!(result.barcodes[0], Some(bc.as_slice()));
+        assert_eq!(result.umi, Some(umi.as_slice()));
+    }
+
+    #[test]
+    fn general_extractor_does_not_return_truncated_fields() {
+        let geom = parse_geometry("1{b[16]u[12]x[0-3]f[TTGCTAGGACCG]s[10]x:}2{r:}").unwrap();
+        let compiled = CompiledGeom::from_fragment_geom(&geom).unwrap();
+
+        let r1 = b"SHORT";
+        let r2 = b"BIO";
+
+        let result = compiled.extract(r1, r2);
+        assert_eq!(result.barcodes[1], None);
+        assert_eq!(result.umi, None);
     }
 
     #[test]
