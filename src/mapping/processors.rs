@@ -15,6 +15,7 @@ use ahash::AHashMap;
 use indicatif::ProgressBar;
 use paraseq::Record;
 use paraseq::parallel::{MultiParallelProcessor, PairedParallelProcessor, ParallelProcessor};
+use seq_geom_parser::normalize::PadBuf;
 use smallvec::SmallVec;
 use sshash_lib::{Kmer, KmerBits};
 
@@ -463,6 +464,27 @@ enum UnmappedBcCounts {
     },
 }
 
+#[derive(Clone, Debug, Default)]
+struct TechNormalizationPlan {
+    any_normalization: bool,
+    bc_needs_padding: SmallVec<[bool; 4]>,
+    umi_needs_padding: bool,
+}
+
+struct TechNormalizationState {
+    bc_pad_buf: PadBuf,
+    umi_pad_buf: PadBuf,
+}
+
+impl TechNormalizationState {
+    fn new() -> Self {
+        Self {
+            bc_pad_buf: PadBuf::new(),
+            umi_pad_buf: PadBuf::new(),
+        }
+    }
+}
+
 impl UnmappedBcCounts {
     fn new_single(bc_len: u16) -> Self {
         UnmappedBcCounts::Single {
@@ -546,6 +568,57 @@ impl UnmappedBcCounts {
     }
 }
 
+#[inline]
+fn normalized_barcode_packed(
+    raw: &[u8],
+    target_len: usize,
+    needs_padding: bool,
+    pad_buf: &mut PadBuf,
+) -> Option<u64> {
+    let n_count = count_ns(raw);
+    if n_count > 1 {
+        return None;
+    }
+
+    let recovered = if n_count == 1 {
+        recover_barcode(raw)
+    } else {
+        None
+    };
+    let seq = match &recovered {
+        Some(bc) => bc.as_slice(),
+        None => raw,
+    };
+
+    if !is_all_acgt(seq) {
+        return None;
+    }
+
+    if needs_padding && seq.len() < target_len {
+        Some(pack_bases_2bit(pad_buf.pad(seq, target_len)))
+    } else {
+        Some(pack_bases_2bit(seq))
+    }
+}
+
+#[inline]
+fn normalized_umi_packed(
+    raw: &[u8],
+    target_len: usize,
+    needs_padding: bool,
+    pad_buf: &mut PadBuf,
+) -> Option<u64> {
+    if !is_all_acgt(raw) {
+        return None;
+    }
+
+    if needs_padding && raw.len() < target_len {
+        Some(pack_bases_2bit(pad_buf.pad(raw, target_len)))
+    } else {
+        Some(pack_bases_2bit(raw))
+    }
+}
+
 /// Per-thread state for scRNA mapping (extends common state).
 struct ScrnaThreadState<'a, const K: usize, S: SketchHitInfo + Send + 'static = SketchHitInfoSimple>
 where
@@ -554,6 +627,7 @@ where
     common: CommonThreadState<'a, K, S>,
     local_rlen_samples: Vec<u32>,
     unmapped_bc_counts: UnmappedBcCounts,
+    normalization: Option<TechNormalizationState>,
 }
 
 /// Parallel processor for scRNA-seq mapping.
@@ -577,6 +651,7 @@ pub struct ScrnaProcessor<
     protocol: &'a dyn Protocol,
     bc_len: u16,
     umi_len: u16,
+    normalization_plan: TechNormalizationPlan,
     with_position: bool,
     read_length_samples: &'a Mutex<Vec<u32>>,
     state: Option<ScrnaThreadState<'a, K, S>>,
@@ -601,6 +676,14 @@ where
         read_length_samples: &'a Mutex<Vec<u32>>,
         progress: &'a ProgressBar,
     ) -> Self {
+        let normalization_plan = protocol
+            .normalization_meta()
+            .map(|meta| TechNormalizationPlan {
+                any_normalization: meta.any_normalization,
+                bc_needs_padding: meta.bc_needs_padding.clone(),
+                umi_needs_padding: meta.umi_needs_padding,
+            })
+            .unwrap_or_default();
         Self {
             index,
             end_cache,
@@ -612,6 +695,7 @@ where
             protocol,
             bc_len,
             umi_len,
+            normalization_plan,
             with_position,
             read_length_samples,
             state: None,
@@ -635,6 +719,7 @@ where
             protocol: self.protocol,
             bc_len: self.bc_len,
             umi_len: self.umi_len,
+            normalization_plan: self.normalization_plan.clone(),
             with_position: self.with_position,
             read_length_samples: self.read_length_samples,
             state: None,
@@ -665,6 +750,7 @@ where
         let protocol = self.protocol;
         let bc_len = self.bc_len;
         let umi_len = self.umi_len;
+        let normalization_plan = &self.normalization_plan;
         let with_position = self.with_position;
         let max_rlen_samples: usize = 10;
 
@@ -680,6 +766,9 @@ where
             } else {
                 UnmappedBcCounts::new_single(bc_len)
             },
+            normalization: normalization_plan
+                .any_normalization
+                .then(TechNormalizationState::new),
         });
         let s = &mut st.common;
         s.ensure_chunk_started();
@@ -704,92 +793,162 @@ where
             // Extract all sequences (barcodes, UMI, bio reads) in one call.
             let seqs = protocol.extract(&r1, &r2);
 
-            // UMI validation (matching C++ umi_kmer.fromChars check)
-            let umi_raw = match seqs.umi {
-                Some(umi) if !umi.is_empty() => umi,
-                _ => continue,
-            };
-            if !is_all_acgt(umi_raw) {
-                continue;
-            }
-            let umi_packed = pack_bases_2bit(umi_raw);
+            let (umi_packed, bc_packed) = if normalization_plan.any_normalization {
+                let norm = st
+                    .normalization
+                    .as_mut()
+                    .expect("normalization state missing for variable-length protocol");
+                let umi_raw = match seqs.umi {
+                    Some(umi) if !umi.is_empty() => umi,
+                    _ => continue,
+                };
+                let umi_packed = match normalized_umi_packed(
+                    umi_raw,
+                    umi_len as usize,
+                    normalization_plan.umi_needs_padding,
+                    &mut norm.umi_pad_buf,
+                ) {
+                    Some(umi) => umi,
+                    None => continue,
+                };
 
-            // Multi-barcode path: validate and pack each barcode independently
-            let bc_packed: u64;
+                let bc_packed = if is_multi_bc {
+                    multi_bc_packed.clear();
+                    let mut all_valid = true;
+                    for (i, _desc) in bc_descs.iter().enumerate() {
+                        let bc_raw = match seqs.barcodes.get(i) {
+                            Some(Some(bc)) if !bc.is_empty() => *bc,
+                            _ => {
+                                all_valid = false;
+                                break;
+                            }
+                        };
+                        let needs_padding = normalization_plan
+                            .bc_needs_padding
+                            .get(i)
+                            .copied()
+                            .unwrap_or(false);
+                        match normalized_barcode_packed(
+                            bc_raw,
+                            multi_bc_lens[i] as usize,
+                            needs_padding,
+                            &mut norm.bc_pad_buf,
+                        ) {
+                            Some(bc) => multi_bc_packed.push(bc),
+                            None => {
+                                all_valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !all_valid {
+                        continue;
+                    }
+                    *multi_bc_packed.last().unwrap_or(&0)
+                } else {
+                    let bc_raw = match seqs.barcodes.first().copied().flatten() {
+                        Some(bc) if !bc.is_empty() => bc,
+                        _ => continue,
+                    };
+                    match normalized_barcode_packed(
+                        bc_raw,
+                        bc_len as usize,
+                        normalization_plan
+                            .bc_needs_padding
+                            .first()
+                            .copied()
+                            .unwrap_or(false),
+                        &mut norm.bc_pad_buf,
+                    ) {
+                        Some(bc) => bc,
+                        None => continue,
+                    }
+                };
+                (umi_packed, bc_packed)
+            } else {
+                // UMI validation (matching C++ umi_kmer.fromChars check)
+                let umi_raw = match seqs.umi {
+                    Some(umi) if !umi.is_empty() => umi,
+                    _ => continue,
+                };
+                if !is_all_acgt(umi_raw) {
+                    continue;
+                }
+                let umi_packed = pack_bases_2bit(umi_raw);
 
-            if is_multi_bc {
-                multi_bc_packed.clear();
-                let mut all_valid = true;
-                for (i, _desc) in bc_descs.iter().enumerate() {
-                    let bc_raw = match seqs.barcodes.get(i) {
-                        Some(Some(bc)) if !bc.is_empty() => *bc,
-                        _ => {
+                let bc_packed = if is_multi_bc {
+                    multi_bc_packed.clear();
+                    let mut all_valid = true;
+                    for (i, _desc) in bc_descs.iter().enumerate() {
+                        let bc_raw = match seqs.barcodes.get(i) {
+                            Some(Some(bc)) if !bc.is_empty() => *bc,
+                            _ => {
+                                all_valid = false;
+                                break;
+                            }
+                        };
+                        let n_count = count_ns(bc_raw);
+                        if n_count > 1 {
                             all_valid = false;
                             break;
                         }
+                        let recovered = if n_count == 1 {
+                            recover_barcode(bc_raw)
+                        } else {
+                            None
+                        };
+                        let bc_to_pack = match &recovered {
+                            Some(r) => {
+                                if !is_all_acgt(r) {
+                                    all_valid = false;
+                                    break;
+                                }
+                                r.as_slice()
+                            }
+                            None => {
+                                if !is_all_acgt(bc_raw) {
+                                    all_valid = false;
+                                    break;
+                                }
+                                bc_raw
+                            }
+                        };
+                        multi_bc_packed.push(pack_bases_2bit(bc_to_pack));
+                    }
+                    if !all_valid {
+                        continue;
+                    }
+                    *multi_bc_packed.last().unwrap_or(&0)
+                } else {
+                    let bc_raw = match seqs.barcodes.first().copied().flatten() {
+                        Some(bc) if !bc.is_empty() => bc,
+                        _ => continue,
                     };
                     let n_count = count_ns(bc_raw);
                     if n_count > 1 {
-                        all_valid = false;
-                        break;
+                        continue;
                     }
-                    let recovered = if n_count == 1 {
+                    let recovered_bc = if n_count == 1 {
                         recover_barcode(bc_raw)
                     } else {
                         None
                     };
-                    let bc_to_pack = match &recovered {
-                        Some(r) => {
-                            if !is_all_acgt(r) {
-                                all_valid = false;
-                                break;
-                            }
-                            r.as_slice()
-                        }
+                    let bc_to_pack = match &recovered_bc {
+                        Some(bc) => bc.as_slice(),
                         None => {
                             if !is_all_acgt(bc_raw) {
-                                all_valid = false;
-                                break;
+                                continue;
                             }
                             bc_raw
                         }
                     };
-                    multi_bc_packed.push(pack_bases_2bit(bc_to_pack));
-                }
-                if !all_valid {
-                    continue;
-                }
-                // For unmapped tracking, use the cell barcode (last level)
-                bc_packed = *multi_bc_packed.last().unwrap_or(&0);
-            } else {
-                // Single-barcode path (unchanged)
-                let bc_raw = match seqs.barcodes.first().copied().flatten() {
-                    Some(bc) if !bc.is_empty() => bc,
-                    _ => continue,
-                };
-                let n_count = count_ns(bc_raw);
-                if n_count > 1 {
-                    continue;
-                }
-                let recovered_bc = if n_count == 1 {
-                    recover_barcode(bc_raw)
-                } else {
-                    None
-                };
-                let bc_to_pack = match &recovered_bc {
-                    Some(bc) => bc.as_slice(),
-                    None => {
-                        if !is_all_acgt(bc_raw) {
-                            continue;
-                        }
-                        bc_raw
+                    if !is_all_acgt(bc_to_pack) {
+                        continue;
                     }
+                    pack_bases_2bit(bc_to_pack)
                 };
-                if !is_all_acgt(bc_to_pack) {
-                    continue;
-                }
-                bc_packed = pack_bases_2bit(bc_to_pack);
-            }
+                (umi_packed, bc_packed)
+            };
 
             match seqs.reads.len() {
                 2 => {
@@ -1246,5 +1405,26 @@ where
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalized_barcode_packing_uses_fixed_width() {
+        let mut pad = PadBuf::new();
+        let raw = normalized_barcode_packed(b"ACGTACGTA", 10, false, &mut pad).unwrap();
+        let padded = normalized_barcode_packed(b"ACGTACGTA", 10, true, &mut pad).unwrap();
+        assert_ne!(raw, padded);
+    }
+
+    #[test]
+    fn normalized_umi_packing_uses_fixed_width() {
+        let mut pad = PadBuf::new();
+        let raw = normalized_umi_packed(b"ACGTACGTAC", 12, false, &mut pad).unwrap();
+        let padded = normalized_umi_packed(b"ACGTACGTAC", 12, true, &mut pad).unwrap();
+        assert_ne!(raw, padded);
     }
 }

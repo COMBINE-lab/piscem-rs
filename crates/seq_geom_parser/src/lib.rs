@@ -98,7 +98,7 @@ pub mod types;
 // Re-export key types at crate root
 pub use extract::{
     BoundaryResolvedExtractor, CompiledGeom, ExtractedSeqs, GeomMeta, InferableExtractor,
-    SimpleExtractor,
+    NormalizationMeta, SimpleExtractor,
 };
 pub use parse::{format_errors, geometry_complexity, parse_geometry, validate_geometry};
 pub use types::*;

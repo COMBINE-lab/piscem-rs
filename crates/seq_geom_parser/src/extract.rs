@@ -16,6 +16,17 @@ use smallvec::{smallvec, SmallVec};
 use crate::parse::geometry_complexity;
 use crate::types::*;
 
+/// Normalization requirements for extracted technical sequences.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizationMeta {
+    /// Whether each barcode level may require padding.
+    pub bc_needs_padding: SmallVec<[bool; MAX_INLINE_BARCODES]>,
+    /// Whether the UMI may require padding.
+    pub umi_needs_padding: bool,
+    /// Whether any barcode level or the UMI may require padding.
+    pub any_normalization: bool,
+}
+
 /// A precomputed extraction plan for one read.
 #[derive(Debug, Clone)]
 struct ReadPlan {
@@ -232,6 +243,8 @@ pub struct GeomMeta {
     pub umi_len: usize,
     /// Whether the biological read is paired.
     pub is_paired_read: bool,
+    /// Whether any barcode/UMI needs padding before downstream fixed-width encoding.
+    pub normalization: NormalizationMeta,
 }
 
 /// Fast extractor for simple single-barcode geometries.
@@ -326,24 +339,41 @@ impl BoundaryResolvedExtractor {
 fn build_geom_meta(
     r1_bc_info: &[usize],
     r2_bc_info: &[usize],
+    r1_bc_padding: &[bool],
+    r2_bc_padding: &[bool],
     r1_umi_len: usize,
     r2_umi_len: usize,
+    r1_umi_needs_padding: bool,
+    r2_umi_needs_padding: bool,
     r1_has_read: bool,
     r2_has_read: bool,
 ) -> GeomMeta {
     let mut bc_lens = SmallVec::new();
+    let mut bc_needs_padding = SmallVec::new();
     let num_bc_levels = r1_bc_info.len().max(r2_bc_info.len());
     for level in 0..num_bc_levels {
         let r1_len = r1_bc_info.get(level).copied().unwrap_or(0);
         let r2_len = r2_bc_info.get(level).copied().unwrap_or(0);
         bc_lens.push(r1_len.max(r2_len));
+
+        let r1_pad = r1_bc_padding.get(level).copied().unwrap_or(false);
+        let r2_pad = r2_bc_padding.get(level).copied().unwrap_or(false);
+        bc_needs_padding.push(r1_pad || r2_pad);
     }
+
+    let umi_needs_padding = r1_umi_needs_padding || r2_umi_needs_padding;
+    let any_normalization = umi_needs_padding || bc_needs_padding.iter().copied().any(|v| v);
 
     GeomMeta {
         num_bc_levels,
         bc_lens,
         umi_len: r1_umi_len.max(r2_umi_len),
         is_paired_read: r1_has_read && r2_has_read,
+        normalization: NormalizationMeta {
+            bc_needs_padding,
+            umi_needs_padding,
+            any_normalization,
+        },
     }
 }
 
@@ -412,16 +442,32 @@ impl CompiledGeom {
         let bc_level_fn = compute_barcode_levels(geom);
         match geometry_complexity(geom) {
             GeometryComplexity::FixedOffsets | GeometryComplexity::InferableVariable => {
-                let (r1_plan, r1_bc_info, r1_umi_len, r1_has_read) =
-                    compile_read_plan_with_levels(&geom.read1, &bc_level_fn)?;
-                let (r2_plan, r2_bc_info, r2_umi_len, r2_has_read) =
-                    compile_read_plan_with_levels(&geom.read2, &bc_level_fn)?;
+                let (
+                    r1_plan,
+                    r1_bc_info,
+                    r1_bc_padding,
+                    r1_umi_len,
+                    r1_umi_needs_padding,
+                    r1_has_read,
+                ) = compile_read_plan_with_levels(&geom.read1, &bc_level_fn)?;
+                let (
+                    r2_plan,
+                    r2_bc_info,
+                    r2_bc_padding,
+                    r2_umi_len,
+                    r2_umi_needs_padding,
+                    r2_has_read,
+                ) = compile_read_plan_with_levels(&geom.read2, &bc_level_fn)?;
 
                 let meta = build_geom_meta(
                     &r1_bc_info,
                     &r2_bc_info,
+                    &r1_bc_padding,
+                    &r2_bc_padding,
                     r1_umi_len,
                     r2_umi_len,
+                    r1_umi_needs_padding,
+                    r2_umi_needs_padding,
                     r1_has_read,
                     r2_has_read,
                 );
@@ -444,16 +490,32 @@ impl CompiledGeom {
                 }
             }
             GeometryComplexity::BoundaryResolved => {
-                let (r1_plan, r1_bc_info, r1_umi_len, r1_has_read) =
-                    compile_boundary_resolved_read_plan(&geom.read1, &bc_level_fn)?;
-                let (r2_plan, r2_bc_info, r2_umi_len, r2_has_read) =
-                    compile_boundary_resolved_read_plan(&geom.read2, &bc_level_fn)?;
+                let (
+                    r1_plan,
+                    r1_bc_info,
+                    r1_bc_padding,
+                    r1_umi_len,
+                    r1_umi_needs_padding,
+                    r1_has_read,
+                ) = compile_boundary_resolved_read_plan(&geom.read1, &bc_level_fn)?;
+                let (
+                    r2_plan,
+                    r2_bc_info,
+                    r2_bc_padding,
+                    r2_umi_len,
+                    r2_umi_needs_padding,
+                    r2_has_read,
+                ) = compile_boundary_resolved_read_plan(&geom.read2, &bc_level_fn)?;
 
                 let meta = build_geom_meta(
                     &r1_bc_info,
                     &r2_bc_info,
+                    &r1_bc_padding,
+                    &r2_bc_padding,
                     r1_umi_len,
                     r2_umi_len,
+                    r1_umi_needs_padding,
+                    r2_umi_needs_padding,
                     r1_has_read,
                     r2_has_read,
                 );
@@ -997,7 +1059,9 @@ fn find_anchor(
                 continue;
             }
             let d = match dist_kind {
-                DistanceKind::Hamming => hamming_distance(&read[pos..pos + anchor_len], anchor),
+                DistanceKind::Hamming => {
+                    hamming_distance_at_most(&read[pos..pos + anchor_len], anchor, max_dist)
+                }
                 DistanceKind::Levenshtein => {
                     // TODO: implement when needed
                     u8::MAX
@@ -1030,7 +1094,9 @@ fn find_anchor_candidates(read: &[u8], anchor: &AnchorPlan) -> Vec<AnchorCandida
     for start in 0..=read.len() - anchor_len {
         let window = &read[start..start + anchor_len];
         let score = match anchor.dist_kind {
-            DistanceKind::Hamming => hamming_distance(window, &anchor.sequence),
+            DistanceKind::Hamming => {
+                hamming_distance_at_most(window, &anchor.sequence, anchor.max_dist)
+            }
             DistanceKind::Levenshtein => u8::MAX,
         };
         if score <= anchor.max_dist {
@@ -1044,14 +1110,18 @@ fn find_anchor_candidates(read: &[u8], anchor: &AnchorPlan) -> Vec<AnchorCandida
     candidates
 }
 
-/// Compute Hamming distance between two equal-length byte slices.
+/// Compute Hamming distance between two equal-length byte slices, but stop
+/// once the mismatch count exceeds `limit`.
 #[inline(always)]
-fn hamming_distance(a: &[u8], b: &[u8]) -> u8 {
+fn hamming_distance_at_most(a: &[u8], b: &[u8], limit: u8) -> u8 {
     debug_assert_eq!(a.len(), b.len());
     let mut dist = 0u8;
     for i in 0..a.len() {
         if a[i] != b[i] {
             dist += 1;
+            if dist > limit {
+                return dist;
+            }
         }
     }
     dist
@@ -1098,11 +1168,23 @@ fn compute_barcode_levels(geom: &FragmentGeom) -> impl Fn(&GeoTagType) -> Option
 fn compile_boundary_resolved_read_plan(
     read_geom: &ReadGeom,
     bc_level_fn: &dyn Fn(&GeoTagType) -> Option<u8>,
-) -> Result<(BoundaryResolvedReadPlan, Vec<usize>, usize, bool), String> {
+) -> Result<
+    (
+        BoundaryResolvedReadPlan,
+        Vec<usize>,
+        Vec<bool>,
+        usize,
+        bool,
+        bool,
+    ),
+    String,
+> {
     let mut anchors = Vec::new();
     let mut segments = Vec::new();
     let mut bc_lens = Vec::new();
+    let mut bc_needs_padding = Vec::new();
     let mut umi_len = 0usize;
+    let mut umi_needs_padding = false;
     let mut has_read = false;
 
     let mut current_parts = Vec::new();
@@ -1136,7 +1218,16 @@ fn compile_boundary_resolved_read_plan(
                 let len = len as usize;
                 current_parts.push(ResolvedSegmentPart::Fixed { len, target });
                 if let Some(target) = target {
-                    record_target_len(target, len, &mut bc_lens, &mut umi_len, &mut has_read);
+                    record_target_info(
+                        target,
+                        len,
+                        false,
+                        &mut bc_lens,
+                        &mut bc_needs_padding,
+                        &mut umi_len,
+                        &mut umi_needs_padding,
+                        &mut has_read,
+                    );
                 }
             }
             GeoLen::Range(min, max) => {
@@ -1146,11 +1237,14 @@ fn compile_boundary_resolved_read_plan(
                     target,
                 });
                 if let Some(target) = target {
-                    record_target_len(
+                    record_target_info(
                         target,
                         max as usize,
+                        min != max,
                         &mut bc_lens,
+                        &mut bc_needs_padding,
                         &mut umi_len,
+                        &mut umi_needs_padding,
                         &mut has_read,
                     );
                 }
@@ -1175,21 +1269,25 @@ fn compile_boundary_resolved_read_plan(
     Ok((
         BoundaryResolvedReadPlan { anchors, segments },
         bc_lens,
+        bc_needs_padding,
         umi_len,
+        umi_needs_padding,
         has_read,
     ))
 }
 
 /// Compile a ReadGeom into a ReadPlan.
-/// Returns (plan, bc_lens_by_level, umi_len, has_read).
+/// Returns (plan, bc_lens_by_level, bc_padding_by_level, umi_len, umi_needs_padding, has_read).
 fn compile_read_plan_with_levels(
     read_geom: &ReadGeom,
     bc_level_fn: &dyn Fn(&GeoTagType) -> Option<u8>,
-) -> Result<(ReadPlan, Vec<usize>, usize, bool), String> {
+) -> Result<(ReadPlan, Vec<usize>, Vec<bool>, usize, bool, bool), String> {
     let mut steps = Vec::new();
     let mut offset = 0usize;
     let mut bc_lens: Vec<usize> = Vec::new();
+    let mut bc_needs_padding: Vec<bool> = Vec::new();
     let mut umi_len = 0usize;
+    let mut umi_needs_padding = false;
     let mut has_read = false;
     let mut has_variable = false;
     let mut i = 0;
@@ -1221,11 +1319,14 @@ fn compile_read_plan_with_levels(
                         max_off += len;
                         if let Some(target) = target {
                             record_target_len(
+                                &mut bc_lens,
+                                &mut bc_needs_padding,
+                                &mut umi_len,
+                                &mut umi_needs_padding,
+                                &mut has_read,
                                 target,
                                 len,
-                                &mut bc_lens,
-                                &mut umi_len,
-                                &mut has_read,
+                                false,
                             );
                         }
                     }
@@ -1239,11 +1340,14 @@ fn compile_read_plan_with_levels(
                         max_off += *max as usize;
                         if let Some(target) = target {
                             record_target_len(
+                                &mut bc_lens,
+                                &mut bc_needs_padding,
+                                &mut umi_len,
+                                &mut umi_needs_padding,
+                                &mut has_read,
                                 target,
                                 *max as usize,
-                                &mut bc_lens,
-                                &mut umi_len,
-                                &mut has_read,
+                                min != max,
                             );
                         }
                     }
@@ -1277,7 +1381,9 @@ fn compile_read_plan_with_levels(
                     &mut post_offset,
                     &mut post_steps,
                     &mut bc_lens,
+                    &mut bc_needs_padding,
                     &mut umi_len,
+                    &mut umi_needs_padding,
                     &mut has_read,
                     bc_level_fn,
                 );
@@ -1307,7 +1413,9 @@ fn compile_read_plan_with_levels(
                     &mut offset,
                     &mut steps,
                     &mut bc_lens,
+                    &mut bc_needs_padding,
                     &mut umi_len,
+                    &mut umi_needs_padding,
                     &mut has_read,
                     bc_level_fn,
                 );
@@ -1323,7 +1431,9 @@ fn compile_read_plan_with_levels(
             has_variable,
         },
         bc_lens,
+        bc_needs_padding,
         umi_len,
+        umi_needs_padding,
         has_read,
     ))
 }
@@ -1334,7 +1444,9 @@ fn compile_part_to_step(
     offset: &mut usize,
     steps: &mut Vec<ExtractionStep>,
     bc_lens: &mut Vec<usize>,
+    bc_needs_padding: &mut Vec<bool>,
     umi_len: &mut usize,
+    umi_needs_padding: &mut bool,
     has_read: &mut bool,
     bc_level_fn: &dyn Fn(&GeoTagType) -> Option<u8>,
 ) {
@@ -1349,7 +1461,16 @@ fn compile_part_to_step(
                     len: l,
                     target: t,
                 });
-                record_target_len(t, l, bc_lens, umi_len, has_read);
+                record_target_info(
+                    t,
+                    l,
+                    false,
+                    bc_lens,
+                    bc_needs_padding,
+                    umi_len,
+                    umi_needs_padding,
+                    has_read,
+                );
             } else {
                 steps.push(ExtractionStep::FixedSkip);
             }
@@ -1365,7 +1486,16 @@ fn compile_part_to_step(
                     len: l,
                     target: t,
                 });
-                record_target_len(t, l, bc_lens, umi_len, has_read);
+                record_target_info(
+                    t,
+                    l,
+                    true,
+                    bc_lens,
+                    bc_needs_padding,
+                    umi_len,
+                    umi_needs_padding,
+                    has_read,
+                );
             }
             // Note: offset advance depends on actual captured length at runtime.
             // For variable-length, this is handled by AnchorSearch in the caller.
@@ -1401,20 +1531,50 @@ fn extract_target_for_part(
 }
 
 fn record_target_len(
+    bc_lens: &mut Vec<usize>,
+    bc_needs_padding: &mut Vec<bool>,
+    umi_len: &mut usize,
+    umi_needs_padding: &mut bool,
+    has_read: &mut bool,
     target: ExtractTarget,
     len: usize,
+    needs_padding: bool,
+) {
+    record_target_info(
+        target,
+        len,
+        needs_padding,
+        bc_lens,
+        bc_needs_padding,
+        umi_len,
+        umi_needs_padding,
+        has_read,
+    );
+}
+
+fn record_target_info(
+    target: ExtractTarget,
+    len: usize,
+    needs_padding: bool,
     bc_lens: &mut Vec<usize>,
+    bc_needs_padding: &mut Vec<bool>,
     umi_len: &mut usize,
+    umi_needs_padding: &mut bool,
     has_read: &mut bool,
 ) {
     match target {
         ExtractTarget::Barcode(level) => {
             while bc_lens.len() <= level as usize {
                 bc_lens.push(0);
+                bc_needs_padding.push(false);
             }
             bc_lens[level as usize] = len;
+            bc_needs_padding[level as usize] |= needs_padding;
         }
-        ExtractTarget::Umi => *umi_len = len,
+        ExtractTarget::Umi => {
+            *umi_len = len;
+            *umi_needs_padding |= needs_padding;
+        }
         ExtractTarget::Read => *has_read = true,
     }
 }
@@ -1560,6 +1720,12 @@ mod tests {
     fn extract_variable_barcode_with_anchor() {
         let geom = parse_geometry("1{b[9-10]u[12]f[ACGT]x:}2{r:}").unwrap();
         let compiled = CompiledGeom::from_fragment_geom(&geom).unwrap();
+        assert!(compiled.meta().normalization.any_normalization);
+        assert_eq!(
+            compiled.meta().normalization.bc_needs_padding.as_slice(),
+            &[true]
+        );
+        assert!(!compiled.meta().normalization.umi_needs_padding);
 
         let bc = b"ACGTACGTA";
         let umi = b"TTTTTTTTTTTT";
@@ -1623,9 +1789,30 @@ mod tests {
 
     #[test]
     fn hamming_distance_test() {
-        assert_eq!(hamming_distance(b"ACGT", b"ACGT"), 0);
-        assert_eq!(hamming_distance(b"ACGT", b"ACGA"), 1);
-        assert_eq!(hamming_distance(b"ACGT", b"TGCA"), 4);
-        assert_eq!(hamming_distance(b"AAAA", b"TTTT"), 4);
+        assert_eq!(hamming_distance_at_most(b"ACGT", b"ACGT", u8::MAX), 0);
+        assert_eq!(hamming_distance_at_most(b"ACGT", b"ACGA", u8::MAX), 1);
+        assert_eq!(hamming_distance_at_most(b"ACGT", b"TGCA", u8::MAX), 4);
+        assert_eq!(hamming_distance_at_most(b"AAAA", b"TTTT", u8::MAX), 4);
+    }
+
+    #[test]
+    fn hamming_distance_short_circuits_past_limit() {
+        assert_eq!(hamming_distance_at_most(b"ACGT", b"TGCA", 1), 2);
+        assert_eq!(hamming_distance_at_most(b"ACGT", b"ACGA", 1), 1);
+        assert_eq!(hamming_distance_at_most(b"ACGT", b"ACGT", 0), 0);
+    }
+
+    #[test]
+    fn variable_umi_sets_normalization_metadata() {
+        let geom = parse_geometry("1{b[16]u[10-12]f[ACGT]x:}2{r:}").unwrap();
+        let compiled = CompiledGeom::from_fragment_geom(&geom).unwrap();
+        assert!(compiled.meta().normalization.any_normalization);
+        assert_eq!(compiled.meta().bc_lens.as_slice(), &[16]);
+        assert_eq!(compiled.meta().umi_len, 12);
+        assert_eq!(
+            compiled.meta().normalization.bc_needs_padding.as_slice(),
+            &[false]
+        );
+        assert!(compiled.meta().normalization.umi_needs_padding);
     }
 }

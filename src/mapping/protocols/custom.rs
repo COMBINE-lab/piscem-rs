@@ -94,6 +94,10 @@ impl Protocol for CustomProtocol {
                 .collect()
         }
     }
+
+    fn normalization_meta(&self) -> Option<&sgp::NormalizationMeta> {
+        Some(&self.compiled.meta().normalization)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +260,24 @@ mod tests {
         assert_eq!(seqs.reads[0], read_prefix.as_slice());
         assert_eq!(seqs.barcodes[0], Some(barcode.as_slice()));
         assert_eq!(seqs.umi, Some(&r2[..12]));
+    }
+
+    #[test]
+    fn normalization_meta_for_variable_barcode_geometry() {
+        let proto = parse_custom_geometry("1{s[7-8]b[16]u[12]f[ACGT]x:}2{r:}").unwrap();
+        let meta = proto.normalization_meta().unwrap();
+        assert!(meta.any_normalization);
+        assert_eq!(meta.bc_needs_padding.as_slice(), &[true, false]);
+        assert!(!meta.umi_needs_padding);
+    }
+
+    #[test]
+    fn normalization_meta_for_variable_umi_geometry() {
+        let proto = parse_custom_geometry("1{b[16]u[10-12]f[ACGT]x:}2{r:}").unwrap();
+        let meta = proto.normalization_meta().unwrap();
+        assert!(meta.any_normalization);
+        assert_eq!(meta.bc_needs_padding.as_slice(), &[false]);
+        assert!(meta.umi_needs_padding);
     }
 
     #[test]

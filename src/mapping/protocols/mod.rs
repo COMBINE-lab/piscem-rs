@@ -6,7 +6,7 @@
 //! variation so protocol-specific logic can be plugged into the generic
 //! mapping pipeline.
 
-pub use seq_geom_parser::ExtractedSeqs;
+pub use seq_geom_parser::{ExtractedSeqs, NormalizationMeta};
 
 pub mod bulk;
 pub mod custom;
@@ -84,6 +84,14 @@ pub trait Protocol: Send + Sync {
             role: BarcodeRole::Cell,
             len: self.barcode_len() as u16,
         }]
+    }
+
+    /// Normalization requirements for extracted barcode/UMI fields.
+    ///
+    /// Fixed-width protocols return `None`, which should be treated as
+    /// "no normalization required".
+    fn normalization_meta(&self) -> Option<&NormalizationMeta> {
+        None
     }
 
     /// Whether this protocol has multiple barcode components.

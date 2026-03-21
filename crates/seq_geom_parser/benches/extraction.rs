@@ -155,6 +155,15 @@ fn bench_extract_anchor(c: &mut Criterion) {
         b.iter(|| compiled_h1.extract(black_box(&r1_mismatch), black_box(&r2)));
     });
 
+    // >1 mismatches near the front should reject quickly.
+    let mut anchor_early_reject = anchor.to_vec();
+    anchor_early_reject[0] = b'C';
+    anchor_early_reject[1] = b'A';
+    let r1_early_reject = make_flex_v2_r1(2, &anchor_early_reject, sample_bc);
+    group.bench_function("hamming1_early_reject", |b| {
+        b.iter(|| compiled_h1.extract(black_box(&r1_early_reject), black_box(&r2)));
+    });
+
     // Anchor not found (worst case: searches all positions)
     let r1_nofind = make_read(80, 99);
     group.bench_function("anchor_not_found", |b| {
