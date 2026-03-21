@@ -13,6 +13,7 @@
 
 use smallvec::{smallvec, SmallVec};
 
+use crate::parse::geometry_complexity;
 use crate::types::*;
 
 /// A precomputed extraction plan for one read.
@@ -22,6 +23,50 @@ struct ReadPlan {
     steps: Vec<ExtractionStep>,
     /// Whether this read contains any variable-length steps (requires search).
     has_variable: bool,
+}
+
+#[derive(Debug, Clone)]
+struct BoundaryResolvedReadPlan {
+    anchors: Vec<AnchorPlan>,
+    segments: Vec<ResolvedSegmentPlan>,
+}
+
+#[derive(Debug, Clone)]
+struct AnchorPlan {
+    sequence: Vec<u8>,
+    max_dist: u8,
+    dist_kind: DistanceKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentBoundaryRef {
+    ReadStart,
+    ReadEnd,
+    AnchorStart(usize),
+    AnchorEnd(usize),
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedSegmentPlan {
+    left: SegmentBoundaryRef,
+    right: SegmentBoundaryRef,
+    parts: Vec<ResolvedSegmentPart>,
+}
+
+#[derive(Debug, Clone)]
+enum ResolvedSegmentPart {
+    Fixed {
+        len: usize,
+        target: Option<ExtractTarget>,
+    },
+    Variable {
+        min_len: usize,
+        max_len: usize,
+        target: Option<ExtractTarget>,
+    },
+    Unbounded {
+        target: Option<ExtractTarget>,
+    },
 }
 
 /// A single extraction step within a read.
@@ -125,7 +170,7 @@ pub struct ExtractedSeqs<'a> {
 //               let seqs = ext.extract(r1, r2); // 3.18 ns, no dispatch
 //           }
 //       }
-//       CompiledGeom::General(ext) => {
+//       CompiledGeom::Inferable(ext) => {
 //           for (r1, r2) in reads {
 //               let seqs = ext.extract(r1, r2); // general path
 //           }
@@ -155,13 +200,25 @@ struct SimpleGeom {
 /// branching. The branch predictor would handle the enum match on `extract()`
 /// perfectly (variant never changes), but callers who want guaranteed zero
 /// overhead can match once and hold the inner type directly.
+///
+/// Variant selection:
+/// - [`CompiledGeom::Simple`] for fixed-offset layouts such as
+///   `1{b[16]u[12]x:}2{r:}`
+/// - [`CompiledGeom::Inferable`] for locally bounded variable-width layouts
+///   such as `1{b[9-10]f[ACGT]u[12]}2{r:}`
+/// - [`CompiledGeom::BoundaryResolved`] for layouts that require anchor
+///   placement before segments can be assigned, such as
+///   `1{r:f[ACAGT]b[9-11]}2{u[12]x:}`
 #[derive(Debug, Clone)]
 pub enum CompiledGeom {
     /// Fast path for simple single-barcode geometries (e.g. Chromium v2/v3).
     /// BC+UMI on one read at fixed offsets, bio read on the other.
     Simple(SimpleExtractor),
-    /// General path for multi-barcode or variable-length geometries.
-    General(GeneralExtractor),
+    /// Inferable path for anchored or otherwise locally bounded variable-width geometries.
+    Inferable(InferableExtractor),
+    /// Boundary-resolved path for geometries that require anchor placement
+    /// before open-ended or variable-width segments can be assigned.
+    BoundaryResolved(BoundaryResolvedExtractor),
 }
 
 /// Metadata common to all extractor variants.
@@ -184,12 +241,28 @@ pub struct SimpleExtractor {
     sg: SimpleGeom,
 }
 
-/// General extractor for complex geometries.
+/// Inferable extractor for anchored variable-width geometries.
+///
+/// This tier assumes a read can still be executed mostly left-to-right once a
+/// single right boundary has been located.
 #[derive(Debug, Clone)]
-pub struct GeneralExtractor {
+pub struct InferableExtractor {
     pub meta: GeomMeta,
     r1_plan: ReadPlan,
     r2_plan: ReadPlan,
+}
+
+/// Extractor for boundary-resolved geometries with interior open-ended spans.
+///
+/// The solver first resolves anchors in read order, choosing the monotone chain
+/// with minimum total distance score. If several chains have the same score, it
+/// chooses the lexicographically leftmost anchor positions. The spans between
+/// those resolved boundaries are then assigned to the segment fields.
+#[derive(Debug, Clone)]
+pub struct BoundaryResolvedExtractor {
+    pub meta: GeomMeta,
+    r1_plan: BoundaryResolvedReadPlan,
+    r2_plan: BoundaryResolvedReadPlan,
 }
 
 impl SimpleExtractor {
@@ -221,7 +294,7 @@ impl SimpleExtractor {
     }
 }
 
-impl GeneralExtractor {
+impl InferableExtractor {
     /// Extract sequences from a read pair using step-based plans.
     #[inline]
     pub fn extract<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> ExtractedSeqs<'a> {
@@ -236,114 +309,161 @@ impl GeneralExtractor {
     }
 }
 
+impl BoundaryResolvedExtractor {
+    #[inline]
+    pub fn extract<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> ExtractedSeqs<'a> {
+        let mut result = ExtractedSeqs {
+            barcodes: SmallVec::from_elem(None, self.meta.num_bc_levels),
+            umi: None,
+            reads: SmallVec::new(),
+        };
+        execute_boundary_resolved_plan(&self.r1_plan, r1, &mut result);
+        execute_boundary_resolved_plan(&self.r2_plan, r2, &mut result);
+        result
+    }
+}
+
+fn build_geom_meta(
+    r1_bc_info: &[usize],
+    r2_bc_info: &[usize],
+    r1_umi_len: usize,
+    r2_umi_len: usize,
+    r1_has_read: bool,
+    r2_has_read: bool,
+) -> GeomMeta {
+    let mut bc_lens = SmallVec::new();
+    let num_bc_levels = r1_bc_info.len().max(r2_bc_info.len());
+    for level in 0..num_bc_levels {
+        let r1_len = r1_bc_info.get(level).copied().unwrap_or(0);
+        let r2_len = r2_bc_info.get(level).copied().unwrap_or(0);
+        bc_lens.push(r1_len.max(r2_len));
+    }
+
+    GeomMeta {
+        num_bc_levels,
+        bc_lens,
+        umi_len: r1_umi_len.max(r2_umi_len),
+        is_paired_read: r1_has_read && r2_has_read,
+    }
+}
+
+fn detect_simple_geom(r1_plan: &ReadPlan, r2_plan: &ReadPlan) -> Option<SimpleGeom> {
+    let mut bc_info = None;
+    let mut umi_info = None;
+    let mut r1_read_offset = None;
+    for step in &r1_plan.steps {
+        match step {
+            ExtractionStep::FixedSlice {
+                offset,
+                len,
+                target: ExtractTarget::Barcode(0),
+            } => bc_info = Some((*offset, *len)),
+            ExtractionStep::FixedSlice {
+                offset,
+                len,
+                target: ExtractTarget::Umi,
+            } => umi_info = Some((*offset, *len)),
+            ExtractionStep::Unbounded {
+                offset,
+                target: ExtractTarget::Read,
+            } => r1_read_offset = Some(*offset),
+            _ => {}
+        }
+    }
+
+    let r2_has_unbounded_read = r2_plan.steps.iter().any(|s| {
+        matches!(
+            s,
+            ExtractionStep::Unbounded {
+                offset: 0,
+                target: ExtractTarget::Read
+            }
+        )
+    });
+
+    match (bc_info, umi_info) {
+        (Some((bc_off, bc_l)), Some((umi_off, umi_l))) if r2_has_unbounded_read => {
+            Some(SimpleGeom {
+                bc_offset: bc_off,
+                bc_len: bc_l,
+                umi_offset: umi_off,
+                umi_len: umi_l,
+                read_on_r2: true,
+                read_offset: 0,
+            })
+        }
+        (Some((bc_off, bc_l)), Some((umi_off, umi_l))) if r1_read_offset.is_some() => {
+            Some(SimpleGeom {
+                bc_offset: bc_off,
+                bc_len: bc_l,
+                umi_offset: umi_off,
+                umi_len: umi_l,
+                read_on_r2: false,
+                read_offset: r1_read_offset.unwrap(),
+            })
+        }
+        _ => None,
+    }
+}
+
 impl CompiledGeom {
     /// Compile a parsed geometry into an extraction plan.
     pub fn from_fragment_geom(geom: &FragmentGeom) -> Result<Self, String> {
         let bc_level_fn = compute_barcode_levels(geom);
-        let (r1_plan, r1_bc_info, r1_umi_len, r1_has_read) =
-            compile_read_plan_with_levels(&geom.read1, &bc_level_fn)?;
-        let (r2_plan, r2_bc_info, r2_umi_len, r2_has_read) =
-            compile_read_plan_with_levels(&geom.read2, &bc_level_fn)?;
+        match geometry_complexity(geom) {
+            GeometryComplexity::FixedOffsets | GeometryComplexity::InferableVariable => {
+                let (r1_plan, r1_bc_info, r1_umi_len, r1_has_read) =
+                    compile_read_plan_with_levels(&geom.read1, &bc_level_fn)?;
+                let (r2_plan, r2_bc_info, r2_umi_len, r2_has_read) =
+                    compile_read_plan_with_levels(&geom.read2, &bc_level_fn)?;
 
-        // Merge barcode info from both reads: take the max length at each level,
-        // since a level may appear on R1, R2, or both (with the other defaulting to 0).
-        let mut bc_lens = SmallVec::new();
-        let num_bc_levels = r1_bc_info.len().max(r2_bc_info.len());
-        for level in 0..num_bc_levels {
-            let r1_len = r1_bc_info.get(level).copied().unwrap_or(0);
-            let r2_len = r2_bc_info.get(level).copied().unwrap_or(0);
-            bc_lens.push(r1_len.max(r2_len));
-        }
+                let meta = build_geom_meta(
+                    &r1_bc_info,
+                    &r2_bc_info,
+                    r1_umi_len,
+                    r2_umi_len,
+                    r1_has_read,
+                    r2_has_read,
+                );
 
-        let umi_len = r1_umi_len.max(r2_umi_len);
+                let simple =
+                    if meta.num_bc_levels == 1 && !r1_plan.has_variable && !r2_plan.has_variable {
+                        detect_simple_geom(&r1_plan, &r2_plan)
+                    } else {
+                        None
+                    };
 
-        let is_paired_read = r1_has_read && r2_has_read;
-
-        // Detect simple geometry: 1 barcode level, no variable steps,
-        // BC+UMI on R1 at fixed offsets, bio read on R2 (unbounded).
-        let simple = if num_bc_levels == 1 && !r1_plan.has_variable && !r2_plan.has_variable {
-            // Look for BC and UMI fixed slices in R1 plan
-            let mut bc_info = None;
-            let mut umi_info = None;
-            let mut r1_read_offset = None;
-            for step in &r1_plan.steps {
-                match step {
-                    ExtractionStep::FixedSlice {
-                        offset,
-                        len,
-                        target: ExtractTarget::Barcode(0),
-                    } => {
-                        bc_info = Some((*offset, *len));
-                    }
-                    ExtractionStep::FixedSlice {
-                        offset,
-                        len,
-                        target: ExtractTarget::Umi,
-                    } => {
-                        umi_info = Some((*offset, *len));
-                    }
-                    ExtractionStep::Unbounded {
-                        offset,
-                        target: ExtractTarget::Read,
-                    } => {
-                        r1_read_offset = Some(*offset);
-                    }
-                    _ => {}
+                if let Some(sg) = simple {
+                    Ok(CompiledGeom::Simple(SimpleExtractor { meta, sg }))
+                } else {
+                    Ok(CompiledGeom::Inferable(InferableExtractor {
+                        meta,
+                        r1_plan,
+                        r2_plan,
+                    }))
                 }
             }
-            // Check if R2 has an unbounded read
-            let r2_has_unbounded_read = r2_plan.steps.iter().any(|s| {
-                matches!(
-                    s,
-                    ExtractionStep::Unbounded {
-                        offset: 0,
-                        target: ExtractTarget::Read
-                    }
-                )
-            });
+            GeometryComplexity::BoundaryResolved => {
+                let (r1_plan, r1_bc_info, r1_umi_len, r1_has_read) =
+                    compile_boundary_resolved_read_plan(&geom.read1, &bc_level_fn)?;
+                let (r2_plan, r2_bc_info, r2_umi_len, r2_has_read) =
+                    compile_boundary_resolved_read_plan(&geom.read2, &bc_level_fn)?;
 
-            match (bc_info, umi_info) {
-                (Some((bc_off, bc_l)), Some((umi_off, umi_l))) if r2_has_unbounded_read => {
-                    Some(SimpleGeom {
-                        bc_offset: bc_off,
-                        bc_len: bc_l,
-                        umi_offset: umi_off,
-                        umi_len: umi_l,
-                        read_on_r2: true,
-                        read_offset: 0,
-                    })
-                }
-                (Some((bc_off, bc_l)), Some((umi_off, umi_l))) if r1_read_offset.is_some() => {
-                    Some(SimpleGeom {
-                        bc_offset: bc_off,
-                        bc_len: bc_l,
-                        umi_offset: umi_off,
-                        umi_len: umi_l,
-                        read_on_r2: false,
-                        read_offset: r1_read_offset.unwrap(),
-                    })
-                }
-                _ => None,
+                let meta = build_geom_meta(
+                    &r1_bc_info,
+                    &r2_bc_info,
+                    r1_umi_len,
+                    r2_umi_len,
+                    r1_has_read,
+                    r2_has_read,
+                );
+
+                Ok(CompiledGeom::BoundaryResolved(BoundaryResolvedExtractor {
+                    meta,
+                    r1_plan,
+                    r2_plan,
+                }))
             }
-        } else {
-            None
-        };
-
-        let meta = GeomMeta {
-            num_bc_levels,
-            bc_lens,
-            umi_len,
-            is_paired_read,
-        };
-
-        if let Some(sg) = simple {
-            Ok(CompiledGeom::Simple(SimpleExtractor { meta, sg }))
-        } else {
-            Ok(CompiledGeom::General(GeneralExtractor {
-                meta,
-                r1_plan,
-                r2_plan,
-            }))
         }
     }
 
@@ -361,7 +481,12 @@ impl CompiledGeom {
     ///             let seqs = ext.extract(r1, r2); // no dispatch
     ///         }
     ///     }
-    ///     CompiledGeom::General(ext) => {
+    ///     CompiledGeom::Inferable(ext) => {
+    ///         for (r1, r2) in reads {
+    ///             let seqs = ext.extract(r1, r2);
+    ///         }
+    ///     }
+    ///     CompiledGeom::BoundaryResolved(ext) => {
     ///         for (r1, r2) in reads {
     ///             let seqs = ext.extract(r1, r2);
     ///         }
@@ -372,7 +497,8 @@ impl CompiledGeom {
     pub fn extract<'a>(&self, r1: &'a [u8], r2: &'a [u8]) -> ExtractedSeqs<'a> {
         match self {
             CompiledGeom::Simple(ext) => ext.extract(r1, r2),
-            CompiledGeom::General(ext) => ext.extract(r1, r2),
+            CompiledGeom::Inferable(ext) => ext.extract(r1, r2),
+            CompiledGeom::BoundaryResolved(ext) => ext.extract(r1, r2),
         }
     }
 
@@ -380,7 +506,8 @@ impl CompiledGeom {
     pub fn meta(&self) -> &GeomMeta {
         match self {
             CompiledGeom::Simple(ext) => &ext.meta,
-            CompiledGeom::General(ext) => &ext.meta,
+            CompiledGeom::Inferable(ext) => &ext.meta,
+            CompiledGeom::BoundaryResolved(ext) => &ext.meta,
         }
     }
 }
@@ -396,6 +523,20 @@ fn execute_plan<'a>(plan: &ReadPlan, read: &'a [u8], result: &mut ExtractedSeqs<
     } else {
         // Slow path: has variable-length steps with anchor search.
         execute_steps_with_search(&plan.steps, read, result);
+    }
+}
+
+fn execute_boundary_resolved_plan<'a>(
+    plan: &BoundaryResolvedReadPlan,
+    read: &'a [u8],
+    result: &mut ExtractedSeqs<'a>,
+) {
+    let Some(anchor_positions) = resolve_anchor_positions(plan, read) else {
+        return;
+    };
+
+    for segment in &plan.segments {
+        execute_resolved_segment(segment, &anchor_positions, read, result);
     }
 }
 
@@ -577,6 +718,235 @@ fn execute_anchored_parts<'a>(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AnchorCandidate {
+    start: usize,
+    end: usize,
+    score: u8,
+}
+
+type AnchorChainState = Option<(u32, Vec<AnchorCandidate>)>;
+
+fn execute_resolved_segment<'a>(
+    segment: &ResolvedSegmentPlan,
+    anchors: &[AnchorCandidate],
+    read: &'a [u8],
+    result: &mut ExtractedSeqs<'a>,
+) {
+    let Some(left) = boundary_position(segment.left, anchors, false, read.len()) else {
+        return;
+    };
+    let Some(right) = boundary_position(segment.right, anchors, true, read.len()) else {
+        return;
+    };
+    if right < left {
+        return;
+    }
+
+    let span = right - left;
+    let fixed_total = segment
+        .parts
+        .iter()
+        .map(|part| match part {
+            ResolvedSegmentPart::Fixed { len, .. } => *len,
+            ResolvedSegmentPart::Variable { .. } | ResolvedSegmentPart::Unbounded { .. } => 0,
+        })
+        .sum::<usize>();
+
+    let flexible = segment.parts.iter().find_map(|part| match part {
+        ResolvedSegmentPart::Fixed { .. } => None,
+        ResolvedSegmentPart::Variable {
+            min_len, max_len, ..
+        } => Some((*min_len, Some(*max_len))),
+        ResolvedSegmentPart::Unbounded { .. } => Some((0usize, None)),
+    });
+
+    let flex_len = if let Some((min_len, max_len)) = flexible {
+        let len = match span.checked_sub(fixed_total) {
+            Some(len) => len,
+            None => return,
+        };
+        if len < min_len {
+            return;
+        }
+        if let Some(max_len) = max_len {
+            if len > max_len {
+                return;
+            }
+        }
+        len
+    } else if span == fixed_total {
+        0
+    } else {
+        return;
+    };
+
+    let mut offset = left;
+    for part in &segment.parts {
+        match part {
+            ResolvedSegmentPart::Fixed { len, target } => {
+                let end = offset + *len;
+                if end > read.len() {
+                    return;
+                }
+                if let Some(target) = target {
+                    assign_target(target, &read[offset..end], result);
+                }
+                offset = end;
+            }
+            ResolvedSegmentPart::Variable { target, .. }
+            | ResolvedSegmentPart::Unbounded { target } => {
+                let end = offset + flex_len;
+                if end > read.len() {
+                    return;
+                }
+                if let Some(target) = target {
+                    assign_target(target, &read[offset..end], result);
+                }
+                offset = end;
+            }
+        }
+    }
+}
+
+fn boundary_position(
+    boundary: SegmentBoundaryRef,
+    anchors: &[AnchorCandidate],
+    _is_right: bool,
+    read_len: usize,
+) -> Option<usize> {
+    match boundary {
+        SegmentBoundaryRef::ReadStart => Some(0),
+        SegmentBoundaryRef::ReadEnd => Some(read_len),
+        SegmentBoundaryRef::AnchorStart(idx) => anchors.get(idx).map(|a| a.start),
+        SegmentBoundaryRef::AnchorEnd(idx) => anchors.get(idx).map(|a| a.end),
+    }
+}
+
+fn resolve_anchor_positions(
+    plan: &BoundaryResolvedReadPlan,
+    read: &[u8],
+) -> Option<Vec<AnchorCandidate>> {
+    if plan.anchors.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let candidates = plan
+        .anchors
+        .iter()
+        .map(|anchor| find_anchor_candidates(read, anchor))
+        .collect::<Vec<_>>();
+    if candidates.iter().any(|c| c.is_empty()) {
+        return None;
+    }
+
+    let seg_bounds = plan
+        .segments
+        .iter()
+        .map(segment_span_bounds)
+        .collect::<Vec<_>>();
+
+    let mut states: Vec<Vec<AnchorChainState>> = vec![Vec::new(); candidates.len()];
+    for (idx, cand) in candidates[0].iter().enumerate() {
+        let prefix_span = cand.start;
+        if span_satisfies(prefix_span, seg_bounds[0]) {
+            states[0].resize(candidates[0].len(), None);
+            states[0][idx] = Some((cand.score as u32, vec![*cand]));
+        }
+    }
+
+    for anchor_idx in 1..candidates.len() {
+        states[anchor_idx].resize(candidates[anchor_idx].len(), None);
+        for (cand_idx, cand) in candidates[anchor_idx].iter().enumerate() {
+            let mut best: Option<(u32, Vec<AnchorCandidate>)> = None;
+            for (prev_idx, prev) in candidates[anchor_idx - 1].iter().enumerate() {
+                let Some((prev_score, prev_chain)) = &states[anchor_idx - 1][prev_idx] else {
+                    continue;
+                };
+                if prev.end > cand.start {
+                    continue;
+                }
+                let span = cand.start - prev.end;
+                if !span_satisfies(span, seg_bounds[anchor_idx]) {
+                    continue;
+                }
+
+                let mut chain = prev_chain.clone();
+                chain.push(*cand);
+                let score = *prev_score + cand.score as u32;
+                if best.as_ref().is_none_or(|(best_score, best_chain)| {
+                    score < *best_score
+                        || (score == *best_score && chain_lex_less(&chain, best_chain))
+                }) {
+                    best = Some((score, chain));
+                }
+            }
+            states[anchor_idx][cand_idx] = best;
+        }
+    }
+
+    let tail_idx = seg_bounds.len() - 1;
+    let mut best_final: Option<(u32, Vec<AnchorCandidate>)> = None;
+    let last_anchor_idx = candidates.len() - 1;
+    for (cand_idx, cand) in candidates[last_anchor_idx].iter().enumerate() {
+        let Some((score, chain)) = &states[last_anchor_idx][cand_idx] else {
+            continue;
+        };
+        let tail_span = read.len().saturating_sub(cand.end);
+        if !span_satisfies(tail_span, seg_bounds[tail_idx]) {
+            continue;
+        }
+        if best_final.as_ref().is_none_or(|(best_score, best_chain)| {
+            *score < *best_score || (*score == *best_score && chain_lex_less(chain, best_chain))
+        }) {
+            best_final = Some((*score, chain.clone()));
+        }
+    }
+
+    best_final.map(|(_, chain)| chain)
+}
+
+fn chain_lex_less(a: &[AnchorCandidate], b: &[AnchorCandidate]) -> bool {
+    a.iter()
+        .zip(b.iter())
+        .find_map(|(a, b)| {
+            if a.start == b.start {
+                None
+            } else {
+                Some(a.start < b.start)
+            }
+        })
+        .unwrap_or(a.len() < b.len())
+}
+
+fn segment_span_bounds(segment: &ResolvedSegmentPlan) -> (usize, Option<usize>) {
+    let fixed_total = segment
+        .parts
+        .iter()
+        .map(|part| match part {
+            ResolvedSegmentPart::Fixed { len, .. } => *len,
+            ResolvedSegmentPart::Variable { .. } | ResolvedSegmentPart::Unbounded { .. } => 0,
+        })
+        .sum::<usize>();
+    let flexible = segment.parts.iter().find_map(|part| match part {
+        ResolvedSegmentPart::Fixed { .. } => None,
+        ResolvedSegmentPart::Variable {
+            min_len, max_len, ..
+        } => Some((*min_len, Some(*max_len))),
+        ResolvedSegmentPart::Unbounded { .. } => Some((0usize, None)),
+    });
+
+    match flexible {
+        Some((min, Some(max))) => (fixed_total + min, Some(fixed_total + max)),
+        Some((min, None)) => (fixed_total + min, None),
+        None => (fixed_total, Some(fixed_total)),
+    }
+}
+
+fn span_satisfies(span: usize, bounds: (usize, Option<usize>)) -> bool {
+    span >= bounds.0 && bounds.1.is_none_or(|max| span <= max)
+}
+
 #[inline(always)]
 fn assign_target<'a>(target: &ExtractTarget, slice: &'a [u8], result: &mut ExtractedSeqs<'a>) {
     match target {
@@ -650,6 +1020,30 @@ fn find_anchor(
     }
 }
 
+fn find_anchor_candidates(read: &[u8], anchor: &AnchorPlan) -> Vec<AnchorCandidate> {
+    let anchor_len = anchor.sequence.len();
+    if anchor_len == 0 || anchor_len > read.len() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    for start in 0..=read.len() - anchor_len {
+        let window = &read[start..start + anchor_len];
+        let score = match anchor.dist_kind {
+            DistanceKind::Hamming => hamming_distance(window, &anchor.sequence),
+            DistanceKind::Levenshtein => u8::MAX,
+        };
+        if score <= anchor.max_dist {
+            candidates.push(AnchorCandidate {
+                start,
+                end: start + anchor_len,
+                score,
+            });
+        }
+    }
+    candidates
+}
+
 /// Compute Hamming distance between two equal-length byte slices.
 #[inline(always)]
 fn hamming_distance(a: &[u8], b: &[u8]) -> u8 {
@@ -699,6 +1093,91 @@ fn compute_barcode_levels(geom: &FragmentGeom) -> impl Fn(&GeoTagType) -> Option
             _ => None,
         }
     }
+}
+
+fn compile_boundary_resolved_read_plan(
+    read_geom: &ReadGeom,
+    bc_level_fn: &dyn Fn(&GeoTagType) -> Option<u8>,
+) -> Result<(BoundaryResolvedReadPlan, Vec<usize>, usize, bool), String> {
+    let mut anchors = Vec::new();
+    let mut segments = Vec::new();
+    let mut bc_lens = Vec::new();
+    let mut umi_len = 0usize;
+    let mut has_read = false;
+
+    let mut current_parts = Vec::new();
+    let mut left_boundary = SegmentBoundaryRef::ReadStart;
+
+    for part in &read_geom.parts {
+        if matches!(part.tag, GeoTagType::Fixed) {
+            let anchor_idx = anchors.len();
+            segments.push(ResolvedSegmentPlan {
+                left: left_boundary,
+                right: SegmentBoundaryRef::AnchorStart(anchor_idx),
+                parts: std::mem::take(&mut current_parts),
+            });
+
+            anchors.push(AnchorPlan {
+                sequence: part.sequence.clone().unwrap_or_default(),
+                max_dist: part.tolerance.as_ref().map(|t| t.max_dist).unwrap_or(0),
+                dist_kind: part
+                    .tolerance
+                    .as_ref()
+                    .map(|t| t.kind)
+                    .unwrap_or(DistanceKind::Hamming),
+            });
+            left_boundary = SegmentBoundaryRef::AnchorEnd(anchor_idx);
+            continue;
+        }
+
+        let target = extract_target_for_part(part, bc_level_fn);
+        match part.len {
+            GeoLen::Fixed(len) => {
+                let len = len as usize;
+                current_parts.push(ResolvedSegmentPart::Fixed { len, target });
+                if let Some(target) = target {
+                    record_target_len(target, len, &mut bc_lens, &mut umi_len, &mut has_read);
+                }
+            }
+            GeoLen::Range(min, max) => {
+                current_parts.push(ResolvedSegmentPart::Variable {
+                    min_len: min as usize,
+                    max_len: max as usize,
+                    target,
+                });
+                if let Some(target) = target {
+                    record_target_len(
+                        target,
+                        max as usize,
+                        &mut bc_lens,
+                        &mut umi_len,
+                        &mut has_read,
+                    );
+                }
+            }
+            GeoLen::Unbounded => {
+                current_parts.push(ResolvedSegmentPart::Unbounded { target });
+                if let Some(target) = target {
+                    if matches!(target, ExtractTarget::Read) {
+                        has_read = true;
+                    }
+                }
+            }
+        }
+    }
+
+    segments.push(ResolvedSegmentPlan {
+        left: left_boundary,
+        right: SegmentBoundaryRef::ReadEnd,
+        parts: current_parts,
+    });
+
+    Ok((
+        BoundaryResolvedReadPlan { anchors, segments },
+        bc_lens,
+        umi_len,
+        has_read,
+    ))
 }
 
 /// Compile a ReadGeom into a ReadPlan.
@@ -1094,6 +1573,39 @@ mod tests {
         let result = compiled.extract(&r1, b"BIO");
         assert_eq!(result.barcodes[0], Some(bc.as_slice()));
         assert_eq!(result.umi, Some(umi.as_slice()));
+    }
+
+    #[test]
+    fn extract_boundary_resolved_prefix_read_and_suffix_barcode() {
+        let geom = parse_geometry("1{r:f[ACAGT]b[9-11]}2{u[12]x:}").unwrap();
+        let compiled = CompiledGeom::from_fragment_geom(&geom).unwrap();
+        assert!(matches!(compiled, CompiledGeom::BoundaryResolved(_)));
+
+        let read_prefix = b"BIOREAD";
+        let anchor = b"ACAGT";
+        let barcode = b"BARCODE09";
+        let mut r1 = Vec::new();
+        r1.extend_from_slice(read_prefix);
+        r1.extend_from_slice(anchor);
+        r1.extend_from_slice(barcode);
+
+        let r2 = b"TTTTTTTTTTTTtail";
+        let result = compiled.extract(&r1, r2);
+        assert_eq!(result.reads[0], read_prefix.as_slice());
+        assert_eq!(result.barcodes[0], Some(barcode.as_slice()));
+        assert_eq!(result.umi, Some(&r2[..12]));
+    }
+
+    #[test]
+    fn boundary_resolved_prefers_leftmost_best_anchor() {
+        let geom = parse_geometry("1{r:f[AC]b[2-7]}2{u[12]x:}").unwrap();
+        let compiled = CompiledGeom::from_fragment_geom(&geom).unwrap();
+
+        let r1 = b"READACXYZACBC";
+        let r2 = b"TTTTTTTTTTTT";
+        let result = compiled.extract(r1, r2);
+        assert_eq!(result.reads[0], b"READ".as_slice());
+        assert_eq!(result.barcodes[0], Some(b"XYZACBC".as_slice()));
     }
 
     #[test]

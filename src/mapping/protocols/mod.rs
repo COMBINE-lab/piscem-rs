@@ -6,8 +6,6 @@
 //! variation so protocol-specific logic can be plugged into the generic
 //! mapping pipeline.
 
-use smallvec::SmallVec;
-
 pub use seq_geom_parser::ExtractedSeqs;
 
 pub mod bulk;

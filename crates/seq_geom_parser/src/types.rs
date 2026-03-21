@@ -78,23 +78,25 @@ pub struct FragmentGeom {
 /// The executor complexity tier required to interpret a geometry.
 ///
 /// This separates geometries that can be handled by the current mostly
-/// left-to-right executor from those that require a more general boundary
-/// solver.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// left-to-right executor from those that require a boundary-resolution pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GeometryComplexity {
     /// Every field has a fixed width and can be extracted by static offsets.
+    ///
+    /// Example: `1{b[16]u[12]x:}2{r:}`.
     FixedOffsets,
     /// Exactly one variable-width region per read, and each such region is
-    /// inferable from a fixed right boundary or the end of the read.
+    /// inferable from a fixed right boundary.
     ///
-    /// This is the tier handled by the current executor.
+    /// Example: `1{b[9-10]f[ACGT]u[12]}2{r:}`.
     InferableVariable,
-    /// A more general boundary-solving geometry, such as an interior `r:` or
-    /// a variable region that must be inferred from both left and right
-    /// boundaries after anchor resolution.
+    /// A geometry that must first resolve anchor boundaries and then assign the
+    /// spans between those boundaries to fields.
     ///
-    /// Example: `1{r:f[ACAGT]b[9-11]}`.
-    BoundarySolved,
+    /// This tier covers interior `r:` or `x:` segments and similar layouts.
+    ///
+    /// Example: `1{r:f[ACAGT]b[9-11]}2{u[12]x:}`.
+    BoundaryResolved,
 }
 
 /// A resolved boundary that can constrain a variable-width region.
@@ -120,6 +122,8 @@ pub struct AnchorConstraint {
 /// This is the natural unit for the current executor tier: once the left and
 /// right boundaries are resolved, the width of the region is uniquely
 /// determined and its inner tags can be sliced directly.
+///
+/// Example: `b[9-10]` in `1{b[9-10]f[ACGT]u[12]}2{r:}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InferableRegion {
     pub left_boundary: BoundaryConstraint,
@@ -127,25 +131,35 @@ pub struct InferableRegion {
     pub parts: Vec<GeoPart>,
 }
 
-/// Sketch of a more general geometry representation for a boundary-solving
-/// executor.
+/// Public semantic description of a boundary-resolved read geometry.
 ///
 /// The intended model is that a read is decomposed into segments separated by
 /// constraints, and extraction becomes a process of resolving boundary
 /// positions and then assigning the spans between them.
+///
+/// This type is descriptive: it documents the boundary-resolved model exposed
+/// by the crate, but it is not the private compiled IR used by
+/// [`crate::extract::CompiledGeom`]. The executor compiles parsed geometries
+/// into a separate internal plan optimized for extraction speed.
+///
+/// Example source geometry: `1{r:f[ACAGT]b[9-11]}2{u[12]x:}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BoundarySolvedReadGeom {
-    pub segments: Vec<BoundarySolvedSegment>,
+pub struct BoundaryResolvedReadGeom {
+    pub segments: Vec<BoundaryResolvedSegment>,
 }
 
-/// One segment in a boundary-solving read geometry.
+/// One segment in the public boundary-resolved geometry model.
+///
+/// Like [`BoundaryResolvedReadGeom`], this enum is semantic/documentation
+/// oriented rather than the executor's concrete runtime plan type.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BoundarySolvedSegment {
+pub enum BoundaryResolvedSegment {
     /// A field or group of fields whose span is determined after solving its
     /// surrounding boundaries.
     Region(InferableRegion),
     /// A field that semantically consumes the maximal interval consistent with
-    /// the remaining constraints, such as an interior `r:`.
+    /// the remaining constraints, such as an interior `r:` in
+    /// `1{r:f[ACAGT]b[9-11]}`.
     OpenEnded {
         tag: GeoTagType,
         left_boundary: BoundaryConstraint,

@@ -38,6 +38,14 @@ fn make_flex_v2_r1(gap_len: usize, anchor: &[u8], sample_bc: &[u8; 10]) -> Vec<u
     r1
 }
 
+/// Build a boundary-resolved R1 read: biological prefix + anchor + variable barcode.
+fn make_boundary_resolved_r1(prefix_len: usize, anchor: &[u8], barcode: &[u8]) -> Vec<u8> {
+    let mut r1 = make_read(prefix_len, 7);
+    r1.extend_from_slice(anchor);
+    r1.extend_from_slice(barcode);
+    r1
+}
+
 fn bench_parse(c: &mut Criterion) {
     let mut group = c.benchmark_group("parse");
 
@@ -151,6 +159,49 @@ fn bench_extract_anchor(c: &mut Criterion) {
     let r1_nofind = make_read(80, 99);
     group.bench_function("anchor_not_found", |b| {
         b.iter(|| compiled.extract(black_box(&r1_nofind), black_box(&r2)));
+    });
+
+    group.finish();
+}
+
+fn bench_extract_boundary_resolved(c: &mut Criterion) {
+    let mut group = c.benchmark_group("extract_boundary_resolved");
+    group.throughput(Throughput::Elements(1));
+
+    let geom = parse_geometry("1{r:f[ACAGT]b[9-11]}2{u[12]x:}").unwrap();
+    let compiled = CompiledGeom::from_fragment_geom(&geom).unwrap();
+    let anchor = b"ACAGT";
+    let umi_r2 = b"TTTTTTTTTTTT";
+
+    for barcode_len in [9usize, 10, 11] {
+        let barcode = &b"BARCODE12345"[..barcode_len];
+        let r1 = make_boundary_resolved_r1(24, anchor, barcode);
+        let mut r2 = Vec::new();
+        r2.extend_from_slice(umi_r2);
+        r2.extend_from_slice(b"tail");
+        group.bench_with_input(
+            BenchmarkId::new("single_anchor_suffix_bc", barcode_len),
+            &(r1, r2),
+            |b, (r1, r2)| {
+                b.iter(|| compiled.extract(black_box(r1), black_box(r2)));
+            },
+        );
+    }
+
+    // Repeated anchors exercise the leftmost-best tie break path.
+    let repeated_anchor_r1 = {
+        let mut r1 = make_read(20, 11);
+        r1.extend_from_slice(anchor);
+        r1.extend_from_slice(b"ACGT");
+        r1.extend_from_slice(anchor);
+        r1.extend_from_slice(b"BARCODE09");
+        r1
+    };
+    let mut r2 = Vec::new();
+    r2.extend_from_slice(umi_r2);
+    r2.extend_from_slice(b"tail");
+    group.bench_function("repeated_anchor_tiebreak", |b| {
+        b.iter(|| compiled.extract(black_box(&repeated_anchor_r1), black_box(&r2)));
     });
 
     group.finish();
@@ -337,6 +388,7 @@ criterion_group!(
     bench_compile,
     bench_extract_fixed,
     bench_extract_anchor,
+    bench_extract_boundary_resolved,
     bench_hardcoded_vs_compiled,
     bench_hardcoded_vs_compiled_batch,
     bench_extract_throughput,

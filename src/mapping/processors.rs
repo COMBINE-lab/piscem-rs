@@ -35,8 +35,8 @@ use crate::mapping::map_fragment::{
 };
 use crate::mapping::merge_pairs::{remove_duplicate_hits_pub, simple_hit_cmp_bins};
 use crate::mapping::overlap::{OverlapType, find_overlap};
-use crate::mapping::protocols::scrna::{barcode_has_n, count_ns, is_all_acgt, recover_barcode};
 use crate::mapping::protocols::Protocol;
+use crate::mapping::protocols::scrna::{barcode_has_n, count_ns, is_all_acgt, recover_barcode};
 use crate::mapping::sketch_hit_simple::SketchHitInfoSimple;
 use crate::mapping::streaming_query::PiscemStreamingQuery;
 use crate::mapping::unitig_end_cache::UnitigEndCache;

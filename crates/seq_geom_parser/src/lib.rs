@@ -35,14 +35,60 @@
 //!
 //! ## Complexity Tiers
 //!
-//! The public types distinguish between two executor tiers:
-//! - [`GeometryComplexity::FixedOffsets`]: fully static offsets
-//! - [`GeometryComplexity::InferableVariable`]: one inferable variable region
-//!   per read, resolved against an anchor or read boundary
+//! The public API distinguishes three extraction tiers:
+//! - [`GeometryComplexity::FixedOffsets`]: every extracted field has a static
+//!   offset. Example: `1{b[16]u[12]x:}2{r:}`.
+//! - [`GeometryComplexity::InferableVariable`]: one variable-width region per
+//!   read, inferred from a fixed right boundary. Example:
+//!   `1{b[9-10]f[ACGT]u[12]}2{r:}`.
+//! - [`GeometryComplexity::BoundaryResolved`]: the read must first be split by
+//!   resolved boundaries such as anchors and read ends. Example:
+//!   `1{r:f[ACAGT]b[9-11]}2{u[12]x:}`.
 //!
-//! The crate also exposes sketch types for a future
-//! [`GeometryComplexity::BoundarySolved`] executor, which would be needed for
-//! broader grammars such as `1{r:f[ACAGT]b[9-11]}`.
+//! ## Boundary Resolution
+//!
+//! For [`GeometryComplexity::BoundaryResolved`] geometries, extraction proceeds
+//! in two phases:
+//! 1. Resolve anchor positions in read order.
+//! 2. Assign the spans between those resolved boundaries to fields.
+//!
+//! If multiple anchor placements satisfy the geometry, the solver chooses the
+//! monotone placement chain with the minimum total distance score. Ties are
+//! broken by choosing the lexicographically leftmost anchor positions.
+//!
+//! ## Public Model vs Compiled Executor
+//!
+//! The boundary-oriented types exposed from [`types`] describe the public
+//! semantic model of a geometry: boundaries, anchors, and segments between
+//! resolved boundaries.
+//!
+//! They are not the same as the extractor's internal compiled representation.
+//! [`CompiledGeom`] compiles parsed geometries into private extraction plans in
+//! [`extract`] that are optimized for the hot path. This split is intentional:
+//! the public types document the model and complexity hierarchy, while the
+//! executor keeps a separate IR that can evolve for performance without
+//! changing the public API.
+//!
+//! ## Examples By Tier
+//!
+//! ```rust
+//! use seq_geom_parser::{geometry_complexity, parse_geometry, GeometryComplexity};
+//!
+//! let simple = parse_geometry("1{b[16]u[12]x:}2{r:}").unwrap();
+//! assert_eq!(geometry_complexity(&simple), GeometryComplexity::FixedOffsets);
+//!
+//! let inferable = parse_geometry("1{b[9-10]f[ACGT]u[12]}2{r:}").unwrap();
+//! assert_eq!(
+//!     geometry_complexity(&inferable),
+//!     GeometryComplexity::InferableVariable
+//! );
+//!
+//! let boundary = parse_geometry("1{r:f[ACAGT]b[9-11]}2{u[12]x:}").unwrap();
+//! assert_eq!(
+//!     geometry_complexity(&boundary),
+//!     GeometryComplexity::BoundaryResolved
+//! );
+//! ```
 
 pub mod extract;
 pub mod normalize;
@@ -50,6 +96,9 @@ pub mod parse;
 pub mod types;
 
 // Re-export key types at crate root
-pub use extract::{CompiledGeom, ExtractedSeqs, GeneralExtractor, GeomMeta, SimpleExtractor};
+pub use extract::{
+    BoundaryResolvedExtractor, CompiledGeom, ExtractedSeqs, GeomMeta, InferableExtractor,
+    SimpleExtractor,
+};
 pub use parse::{format_errors, geometry_complexity, parse_geometry, validate_geometry};
 pub use types::*;

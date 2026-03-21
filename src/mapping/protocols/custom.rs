@@ -5,14 +5,9 @@
 //! adapter — all parsing, validation, and extraction logic lives in
 //! `seq_geom_parser`.
 
-use anyhow::{Result, bail};
-use smallvec::SmallVec;
+use anyhow::Result;
 
-use seq_geom_parser::{
-    self as sgp, CompiledGeom, FragmentGeom, GeomMeta,
-    SimpleExtractor, GeneralExtractor,
-    types::{GeoTagType, BarcodeRole as SgpBarcodeRole},
-};
+use seq_geom_parser::{self as sgp, CompiledGeom};
 
 use super::{BarcodeDesc, BarcodeRole, ExtractedSeqs, Protocol};
 
@@ -27,8 +22,6 @@ use super::{BarcodeDesc, BarcodeRole, ExtractedSeqs, Protocol};
 #[derive(Debug, Clone)]
 pub struct CustomProtocol {
     compiled: CompiledGeom,
-    /// Original geometry string (for display/debugging).
-    geometry_str: String,
 }
 
 impl CustomProtocol {
@@ -130,19 +123,14 @@ pub fn parse_custom_geometry(geom: &str) -> Result<CustomProtocol> {
     })?;
 
     // Validate
-    sgp::validate_geometry(&fragment_geom).map_err(|e| {
-        anyhow::anyhow!("Geometry validation failed for '{}': {}", geom, e)
-    })?;
+    sgp::validate_geometry(&fragment_geom)
+        .map_err(|e| anyhow::anyhow!("Geometry validation failed for '{}': {}", geom, e))?;
 
     // Compile extraction plan
-    let compiled = CompiledGeom::from_fragment_geom(&fragment_geom).map_err(|e| {
-        anyhow::anyhow!("Failed to compile geometry '{}': {}", geom, e)
-    })?;
+    let compiled = CompiledGeom::from_fragment_geom(&fragment_geom)
+        .map_err(|e| anyhow::anyhow!("Failed to compile geometry '{}': {}", geom, e))?;
 
-    Ok(CustomProtocol {
-        compiled,
-        geometry_str: geom.to_string(),
-    })
+    Ok(CustomProtocol { compiled })
 }
 
 // ---------------------------------------------------------------------------
@@ -190,10 +178,8 @@ mod tests {
 
     #[test]
     fn parse_flex_v2() {
-        let proto = parse_custom_geometry(
-            "1{b[16]u[12]x[0-3]f[TTGCTAGGACCG]s[10]x:}2{r:}",
-        )
-        .unwrap();
+        let proto =
+            parse_custom_geometry("1{b[16]u[12]x[0-3]f[TTGCTAGGACCG]s[10]x:}2{r:}").unwrap();
         assert_eq!(proto.num_barcodes(), 2);
         let descs = proto.barcode_descs();
         assert_eq!(descs[0].len, 10); // sample BC
@@ -224,15 +210,13 @@ mod tests {
         let seqs = proto.extract(r1, &r2);
         assert_eq!(seqs.barcodes.len(), 2);
         assert_eq!(seqs.barcodes[0], Some(&r2[68..76])); // sample (b0)
-        assert_eq!(seqs.barcodes[1], Some(&r1[..16]));   // cell (b1)
+        assert_eq!(seqs.barcodes[1], Some(&r1[..16])); // cell (b1)
     }
 
     #[test]
     fn extract_flex_v2_anchor() {
-        let proto = parse_custom_geometry(
-            "1{b[16]u[12]x[0-3]f[TTGCTAGGACCG]s[10]x:}2{r:}",
-        )
-        .unwrap();
+        let proto =
+            parse_custom_geometry("1{b[16]u[12]x[0-3]f[TTGCTAGGACCG]s[10]x:}2{r:}").unwrap();
 
         let bc = b"ACGTACGTACGTACGT";
         let umi = b"AAAAAAAAAAAA";
@@ -251,8 +235,27 @@ mod tests {
 
         let seqs = proto.extract(&r1, r2);
         assert_eq!(seqs.barcodes[0], Some(sample.as_slice())); // sample
-        assert_eq!(seqs.barcodes[1], Some(bc.as_slice()));     // cell
+        assert_eq!(seqs.barcodes[1], Some(bc.as_slice())); // cell
         assert_eq!(seqs.umi, Some(umi.as_slice()));
+    }
+
+    #[test]
+    fn extract_boundary_resolved_geometry() {
+        let proto = parse_custom_geometry("1{r:f[ACAGT]b[9-11]}2{u[12]x:}").unwrap();
+
+        let read_prefix = b"BIOREAD";
+        let anchor = b"ACAGT";
+        let barcode = b"BARCODE09";
+        let mut r1 = Vec::new();
+        r1.extend_from_slice(read_prefix);
+        r1.extend_from_slice(anchor);
+        r1.extend_from_slice(barcode);
+
+        let r2 = b"TTTTTTTTTTTTtail";
+        let seqs = proto.extract(&r1, r2);
+        assert_eq!(seqs.reads[0], read_prefix.as_slice());
+        assert_eq!(seqs.barcodes[0], Some(barcode.as_slice()));
+        assert_eq!(seqs.umi, Some(&r2[..12]));
     }
 
     #[test]

@@ -5,8 +5,8 @@
 //! FragmentGeom := Read1Desc Read2Desc
 //! Read1Desc    := '1{' DescList '}'
 //! Read2Desc    := '2{' DescList '}'
-//! DescList     := (BoundedDesc+ UnboundedDesc?) | UnboundedDesc
-//! BoundedDesc  := TagSpec | DistFunc
+//! DescList     := Desc+
+//! Desc         := TagSpec | DistFunc | UnboundedDesc
 //! TagSpec      := TagChar '[' LenSpec ']'
 //!              |  TagChar '[' Sequence ']'    (* for 'f' tag *)
 //!              |  TagChar Digit '[' LenSpec ']'  (* numbered barcode *)
@@ -74,28 +74,13 @@ fn read_desc_parser<'a>(
 }
 
 fn desc_list_parser<'a>() -> impl Parser<'a, &'a str, Vec<GeoPart>, extra::Err<Rich<'a, char>>> {
-    // A desc list is: one or more bounded descs optionally followed by an unbounded desc,
-    // OR just an unbounded desc.
-    let bounded_then_unbounded = bounded_desc_parser()
-        .repeated()
-        .at_least(1)
-        .collect::<Vec<_>>()
-        .then(unbounded_desc_parser().or_not())
-        .map(|(mut parts, unb)| {
-            if let Some(u) = unb {
-                parts.push(u);
-            }
-            parts
-        });
-
-    let just_unbounded = unbounded_desc_parser().map(|u| vec![u]);
-
-    bounded_then_unbounded.or(just_unbounded)
+    desc_parser().repeated().at_least(1).collect::<Vec<_>>()
 }
 
-fn bounded_desc_parser<'a>() -> impl Parser<'a, &'a str, GeoPart, extra::Err<Rich<'a, char>>> {
-    // Either a distance function wrapper or a plain tag spec
-    dist_func_parser().or(tag_spec_parser())
+fn desc_parser<'a>() -> impl Parser<'a, &'a str, GeoPart, extra::Err<Rich<'a, char>>> {
+    dist_func_parser()
+        .or(tag_spec_parser())
+        .or(unbounded_desc_parser())
 }
 
 fn tag_spec_parser<'a>() -> impl Parser<'a, &'a str, GeoPart, extra::Err<Rich<'a, char>>> {
@@ -258,44 +243,10 @@ pub fn validate_geometry(geom: &FragmentGeom) -> Result<(), String> {
     }
 
     for read in [&geom.read1, &geom.read2] {
-        let Some(first_range_idx) = read
-            .parts
-            .iter()
-            .position(|part| matches!(part.len, GeoLen::Range(_, _)))
-        else {
-            continue;
-        };
-
-        let Some(anchor_rel_idx) = read.parts[(first_range_idx + 1)..]
-            .iter()
-            .position(|part| matches!(part.tag, GeoTagType::Fixed))
-        else {
-            return Err(
-                "variable-length fields must be followed by a fixed anchor (f[SEQ]) so their boundaries can be inferred"
-                    .into(),
-            );
-        };
-
-        let anchor_idx = first_range_idx + 1 + anchor_rel_idx;
-        let variable_count = read.parts[first_range_idx..anchor_idx]
-            .iter()
-            .filter(|part| matches!(part.len, GeoLen::Range(_, _)))
-            .count();
-        if variable_count > 1 {
-            return Err(
-                "at most one variable-length field before a fixed anchor is currently supported"
-                    .into(),
-            );
-        }
-
-        if read.parts[(anchor_idx + 1)..]
-            .iter()
-            .any(|part| matches!(part.len, GeoLen::Range(_, _)))
-        {
-            return Err(
-                "multiple variable-length anchored regions in the same read are not yet supported"
-                    .into(),
-            );
+        match classify_read_complexity(read) {
+            GeometryComplexity::FixedOffsets => {}
+            GeometryComplexity::InferableVariable => validate_inferable_read(read)?,
+            GeometryComplexity::BoundaryResolved => validate_boundary_resolved_read(read)?,
         }
     }
 
@@ -304,24 +255,124 @@ pub fn validate_geometry(geom: &FragmentGeom) -> Result<(), String> {
 
 /// Classify the executor complexity tier required for a geometry.
 ///
-/// With the current grammar, geometries classify as either
-/// [`GeometryComplexity::FixedOffsets`] or
-/// [`GeometryComplexity::InferableVariable`]. The
-/// [`GeometryComplexity::BoundarySolved`] tier is reserved for a broader
-/// grammar with bidirectional anchors and interior unbounded fields.
+/// The classifier chooses the most complex tier required by either read:
+/// - [`GeometryComplexity::FixedOffsets`] for fully static layouts such as
+///   `1{b[16]u[12]x:}2{r:}`
+/// - [`GeometryComplexity::InferableVariable`] for a single right-bounded
+///   variable-width region such as `1{b[9-10]f[ACGT]u[12]}2{r:}`
+/// - [`GeometryComplexity::BoundaryResolved`] for geometries with interior
+///   unbounded segments such as `1{r:f[ACAGT]b[9-11]}2{u[12]x:}`
+///
+/// This is the same tier selection used by [`crate::extract::CompiledGeom`].
 pub fn geometry_complexity(geom: &FragmentGeom) -> GeometryComplexity {
-    let has_variable = geom
-        .read1
+    classify_read_complexity(&geom.read1).max(classify_read_complexity(&geom.read2))
+}
+
+fn classify_read_complexity(read: &ReadGeom) -> GeometryComplexity {
+    let has_non_terminal_unbounded = read
         .parts
         .iter()
-        .chain(geom.read2.parts.iter())
-        .any(|part| matches!(part.len, GeoLen::Range(_, _)));
+        .enumerate()
+        .any(|(i, part)| matches!(part.len, GeoLen::Unbounded) && i + 1 < read.parts.len());
+    if has_non_terminal_unbounded {
+        return GeometryComplexity::BoundaryResolved;
+    }
 
+    let has_variable = read
+        .parts
+        .iter()
+        .any(|part| matches!(part.len, GeoLen::Range(_, _)));
     if has_variable {
         GeometryComplexity::InferableVariable
     } else {
         GeometryComplexity::FixedOffsets
     }
+}
+
+fn validate_inferable_read(read: &ReadGeom) -> Result<(), String> {
+    let Some(first_range_idx) = read
+        .parts
+        .iter()
+        .position(|part| matches!(part.len, GeoLen::Range(_, _)))
+    else {
+        return Ok(());
+    };
+
+    let Some(anchor_rel_idx) = read.parts[(first_range_idx + 1)..]
+        .iter()
+        .position(|part| matches!(part.tag, GeoTagType::Fixed))
+    else {
+        return Err(
+            "variable-length fields must be followed by a fixed anchor (f[SEQ]) so their boundaries can be inferred"
+                .into(),
+        );
+    };
+
+    let anchor_idx = first_range_idx + 1 + anchor_rel_idx;
+    let variable_count = read.parts[first_range_idx..anchor_idx]
+        .iter()
+        .filter(|part| matches!(part.len, GeoLen::Range(_, _)))
+        .count();
+    if variable_count > 1 {
+        return Err(
+            "at most one variable-length field before a fixed anchor is currently supported".into(),
+        );
+    }
+
+    if read.parts[(anchor_idx + 1)..]
+        .iter()
+        .any(|part| matches!(part.len, GeoLen::Range(_, _)))
+    {
+        return Err(
+            "multiple variable-length anchored regions in the same read are not yet supported"
+                .into(),
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_boundary_resolved_read(read: &ReadGeom) -> Result<(), String> {
+    let mut segment_start = 0usize;
+    let mut saw_anchor = false;
+    for (idx, part) in read.parts.iter().enumerate() {
+        if matches!(part.tag, GeoTagType::Fixed) {
+            validate_boundary_segment(&read.parts[segment_start..idx])?;
+            segment_start = idx + 1;
+            saw_anchor = true;
+        }
+    }
+
+    validate_boundary_segment(&read.parts[segment_start..])?;
+
+    let has_non_terminal_unbounded = read
+        .parts
+        .iter()
+        .enumerate()
+        .any(|(i, part)| matches!(part.len, GeoLen::Unbounded) && i + 1 < read.parts.len());
+    if has_non_terminal_unbounded && !saw_anchor {
+        return Err(
+            "non-terminal unbounded fields require at least one fixed anchor (f[SEQ]) to resolve boundaries"
+                .into(),
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_boundary_segment(parts: &[GeoPart]) -> Result<(), String> {
+    let flexible_count = parts
+        .iter()
+        .filter(|part| matches!(part.len, GeoLen::Range(_, _) | GeoLen::Unbounded))
+        .count();
+    if flexible_count > 1 {
+        return Err(
+            "at most one variable-width or unbounded field is supported within each boundary-resolved segment"
+                .into(),
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -398,6 +449,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_boundary_resolved_unbounded() {
+        let geom = parse_geometry("1{r:f[ACAGT]b[9-11]}2{u[12]x:}").unwrap();
+        assert_eq!(geom.read1.parts.len(), 3);
+        assert_eq!(geom.read1.parts[0].len, GeoLen::Unbounded);
+        assert_eq!(geom.read1.parts[1].tag, GeoTagType::Fixed);
+        assert_eq!(geom.read1.parts[2].len, GeoLen::Range(9, 11));
+    }
+
+    #[test]
     fn validate_missing_barcode() {
         let geom = parse_geometry("1{u[12]x:}2{r:}").unwrap();
         assert!(validate_geometry(&geom).is_err());
@@ -444,6 +504,16 @@ mod tests {
     }
 
     #[test]
+    fn validate_boundary_segment_with_two_flexible_fields_rejected() {
+        let geom = parse_geometry("1{r:b[9-11]f[ACAGT]}2{u[12]x:}").unwrap();
+        let err = validate_geometry(&geom);
+        assert!(err.is_err());
+        assert!(err
+            .unwrap_err()
+            .contains("at most one variable-width or unbounded field"));
+    }
+
+    #[test]
     fn error_message_quality() {
         let result = parse_geometry("1{b[16]u[12]z:}2{r:}");
         assert!(result.is_err());
@@ -482,6 +552,12 @@ mod tests {
         assert_eq!(
             geometry_complexity(&variable),
             GeometryComplexity::InferableVariable
+        );
+
+        let boundary = parse_geometry("1{r:f[ACAGT]b[9-11]}2{u[12]x:}").unwrap();
+        assert_eq!(
+            geometry_complexity(&boundary),
+            GeometryComplexity::BoundaryResolved
         );
     }
 }
