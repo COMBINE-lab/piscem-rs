@@ -1,6 +1,6 @@
 [package]
 name = "seq_geom_parser"
-version = "1.0.0"
+version = "0.9.9"
 edition = "2021"
 license = "BSD-3-Clause"
 description = "Parser and extractor for sequencing read geometry descriptions"
