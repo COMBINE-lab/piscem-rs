@@ -89,7 +89,7 @@ pub struct MapScrnaArgs {
     pub quiet: bool,
     /// K-mer dictionary backend: `sshash` (compact, default) or `tiny`
     /// (hashbrown-backed, faster but higher memory).
-    #[arg(long, value_enum, default_value_t = DictKind::Sshash)]
+    #[arg(long, value_enum, default_value_t = DictKind::Auto)]
     pub dict: DictKind,
 }
 
@@ -142,12 +142,13 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
     // --ignore-ambig-hits disables EC table loading
     let check_ambig = !args.ignore_ambig_hits;
 
-    // Load index. When --dict tiny is requested and .tdct/.tct artifacts are
-    // present alongside the prefix, load the Tiny-backed index directly,
-    // skipping the sshash load+convert entirely. Otherwise load the sshash
-    // index; inside the dispatch we optionally convert to Tiny in memory.
+    // Load index. Resolve `--dict auto` against on-disk artifacts. When the
+    // effective dict is tiny and .tdct/.tct exist, load the Tiny-backed index
+    // directly. Otherwise load the sshash index and, if tiny was explicitly
+    // requested without prebuilt artifacts, convert in memory.
+    let effective_dict = args.dict.resolve_for_map(&args.index);
     let load_start = Instant::now();
-    if matches!(args.dict, super::DictKind::Tiny) && tiny_artifacts_exist(&args.index) {
+    if matches!(effective_dict, super::DictKind::Tiny) && tiny_artifacts_exist(&args.index) {
         info!(
             "Loading prebuilt Tiny index artifacts from {}.{{tdct,tct}}",
             args.index.display()
@@ -176,7 +177,7 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
     // If --dict tiny was requested but no prebuilt artifacts exist, convert
     // in memory now and hand off to the same generic runner the on-disk path
     // uses. This keeps the conversion code path alive as a fallback.
-    if matches!(args.dict, super::DictKind::Tiny) {
+    if matches!(effective_dict, super::DictKind::Tiny) {
         info!("Converting sshash index to Tiny (in-memory)");
         let convert_start = Instant::now();
         let k = index.k();

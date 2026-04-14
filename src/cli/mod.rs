@@ -11,16 +11,44 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 /// K-mer dictionary backend to use for mapping.
 ///
-/// `Sshash` (default) uses the compact sshash dictionary loaded from the
-/// index files on disk. `Tiny` converts the loaded sshash dictionary into
-/// a hashbrown-backed `TinyDictionary` in RAM — faster per lookup, but
-/// uses more memory and incurs a conversion cost at startup.
-#[derive(Copy, Clone, Debug, ValueEnum, Default)]
+/// - `Auto` (default): at build time, emit Tiny artifacts iff the
+///   canonical-k-mer count is below `AUTO_TINY_KMER_THRESHOLD`
+///   (≈100 M, ~2 GB hashbrown). At map time, load Tiny when its
+///   artifacts are present on disk, otherwise load sshash.
+/// - `Sshash`: compact sshash dictionary only.
+/// - `Tiny`: Tiny hashbrown-backed dictionary — faster per lookup,
+///   higher RAM. At map time, loads prebuilt Tiny artifacts if present
+///   or converts from sshash on the fly.
+#[derive(Copy, Clone, Debug, ValueEnum, Default, PartialEq, Eq)]
 #[value(rename_all = "lowercase")]
 pub enum DictKind {
     #[default]
+    Auto,
     Sshash,
     Tiny,
+}
+
+/// Canonical-k-mer threshold below which `--dict auto` selects the Tiny
+/// backend at build time. At ~20 bytes/entry, 100 M k-mers ≈ 2 GB RAM.
+pub const AUTO_TINY_KMER_THRESHOLD: u64 = 100_000_000;
+
+impl DictKind {
+    /// Resolve `Auto` for map-time dispatch based on which artifacts exist
+    /// alongside the index prefix. Returns `Tiny` if the `.tdct` + `.tct`
+    /// files are present, otherwise `Sshash`. Non-`Auto` variants pass
+    /// through unchanged.
+    pub fn resolve_for_map(self, index_prefix: &std::path::Path) -> Self {
+        match self {
+            DictKind::Auto => {
+                if crate::index::reference_index::tiny_artifacts_exist(index_prefix) {
+                    DictKind::Tiny
+                } else {
+                    DictKind::Sshash
+                }
+            }
+            other => other,
+        }
+    }
 }
 
 #[derive(Parser, Debug)]

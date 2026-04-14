@@ -43,8 +43,11 @@ pub struct BuildConfig {
     pub seed: u64,
     /// Use a single monolithic MPHF instead of partitioned.
     pub single_mphf: bool,
-    /// Also emit TinyDictionary/TinyContigTable artifacts (`.tdct` + `.tct`).
-    pub emit_tiny: bool,
+    /// Whether to emit TinyDictionary/TinyContigTable artifacts
+    /// (`.tdct` + `.tct`). `Some(true)`/`Some(false)` forces the choice;
+    /// `None` means "auto" — decide based on the canonical-k-mer count
+    /// against [`crate::cli::AUTO_TINY_KMER_THRESHOLD`].
+    pub emit_tiny: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -265,7 +268,24 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
         config.output_prefix.display()
     );
 
-    if config.emit_tiny {
+    let emit_tiny = match config.emit_tiny {
+        Some(v) => v,
+        None => {
+            let dict = index.dict();
+            let total_bases = dict.spss().total_bases();
+            let num_kmers = total_bases.saturating_sub(dict.num_strings() * (k as u64 - 1));
+            let below = num_kmers < crate::cli::AUTO_TINY_KMER_THRESHOLD;
+            info!(
+                "auto dict selection: {} canonical k-mers ({} threshold), \
+                 emitting Tiny artifacts: {}",
+                num_kmers,
+                crate::cli::AUTO_TINY_KMER_THRESHOLD,
+                below
+            );
+            below
+        }
+    };
+    if emit_tiny {
         use sshash_lib::dispatch_on_k;
         info!("Emitting Tiny index artifacts (.tdct + .tct)");
         dispatch_on_k!(k, K => {
@@ -679,7 +699,7 @@ mod tests {
             canonical: false,
             seed: 1,
             single_mphf: false,
-            emit_tiny: false,
+            emit_tiny: Some(false),
         };
 
         build_index(&config).expect("build_index failed");

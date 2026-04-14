@@ -34,10 +34,12 @@ pub struct BuildArgs {
     /// Use a single monolithic MPHF instead of partitioned (disables parallel MPHF build)
     #[arg(long)]
     pub single_mphf: bool,
-    /// Dictionary artifacts to emit. `sshash` (default) writes only `.ssi`/`.ctab`;
-    /// `tiny` additionally writes `.tdct`/`.tct` so `piscem map-* --dict tiny` can
-    /// skip the runtime sshash→tiny conversion.
-    #[arg(long, value_enum, default_value_t = DictKind::Sshash)]
+    /// Dictionary artifacts to emit. `auto` (default) emits Tiny artifacts when
+    /// the canonical-k-mer count is below the auto threshold, else sshash-only.
+    /// `sshash` writes only `.ssi`/`.ctab`; `tiny` additionally writes
+    /// `.tdct`/`.tct` so `piscem map-* --dict tiny` can skip the runtime
+    /// sshash→tiny conversion.
+    #[arg(long, value_enum, default_value_t = DictKind::Auto)]
     pub dict: DictKind,
 }
 
@@ -52,7 +54,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
         canonical: args.canonical,
         seed: args.seed,
         single_mphf: args.single_mphf,
-        emit_tiny: matches!(args.dict, DictKind::Tiny),
+        emit_tiny: match args.dict {
+            DictKind::Tiny => Some(true),
+            DictKind::Sshash => Some(false),
+            DictKind::Auto => None,
+        },
     };
     build_index(&config)
 }

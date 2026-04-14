@@ -123,7 +123,7 @@ pub struct MapScatacArgs {
     pub quiet: bool,
     /// K-mer dictionary backend: `sshash` (compact, default) or `tiny`
     /// (hashbrown-backed, faster but higher memory).
-    #[arg(long, value_enum, default_value_t = DictKind::Sshash)]
+    #[arg(long, value_enum, default_value_t = DictKind::Auto)]
     pub dict: DictKind,
 }
 
@@ -141,8 +141,9 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
 
     let is_paired = !args.read1.is_empty();
 
+    let effective_dict = args.dict.resolve_for_map(&args.index);
     let load_start = Instant::now();
-    if matches!(args.dict, super::DictKind::Tiny) && tiny_artifacts_exist(&args.index) {
+    if matches!(effective_dict, super::DictKind::Tiny) && tiny_artifacts_exist(&args.index) {
         info!(
             "Loading prebuilt Tiny index artifacts from {}.{{tdct,tct}}",
             args.index.display()
@@ -168,7 +169,7 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
         load_start.elapsed().as_secs_f64()
     );
 
-    if matches!(args.dict, super::DictKind::Tiny) {
+    if matches!(effective_dict, super::DictKind::Tiny) {
         info!("Converting sshash index to Tiny (in-memory)");
         let convert_start = Instant::now();
         let k = index.k();

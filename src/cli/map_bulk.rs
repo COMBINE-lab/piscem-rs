@@ -96,7 +96,7 @@ pub struct MapBulkArgs {
     pub quiet: bool,
     /// K-mer dictionary backend: `sshash` (compact, default) or `tiny`
     /// (hashbrown-backed, faster but higher memory).
-    #[arg(long, value_enum, default_value_t = DictKind::Sshash)]
+    #[arg(long, value_enum, default_value_t = DictKind::Auto)]
     pub dict: DictKind,
 }
 
@@ -122,11 +122,12 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
     // --ignore-ambig-hits disables EC table loading
     let check_ambig = !args.ignore_ambig_hits;
 
-    // Load index. When --dict tiny is requested and .tdct/.tct artifacts exist,
-    // load them directly, skipping the sshash load entirely. Otherwise load
-    // sshash; inside the dispatch we optionally convert to Tiny in memory.
+    // Resolve `--dict auto` against on-disk artifacts. When effective dict is
+    // tiny and .tdct/.tct exist, load the Tiny index directly. Otherwise load
+    // sshash and optionally convert to Tiny in memory.
+    let effective_dict = args.dict.resolve_for_map(&args.index);
     let load_start = Instant::now();
-    if matches!(args.dict, super::DictKind::Tiny) && tiny_artifacts_exist(&args.index) {
+    if matches!(effective_dict, super::DictKind::Tiny) && tiny_artifacts_exist(&args.index) {
         info!(
             "Loading prebuilt Tiny index artifacts from {}.{{tdct,tct}}",
             args.index.display()
@@ -154,7 +155,7 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
         load_secs
     );
 
-    if matches!(args.dict, super::DictKind::Tiny) {
+    if matches!(effective_dict, super::DictKind::Tiny) {
         info!("Converting sshash index to Tiny (in-memory)");
         let convert_start = Instant::now();
         let k = index.k();
