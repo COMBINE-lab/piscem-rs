@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Args;
 use std::path::PathBuf;
 
+use super::DictKind;
 use crate::index::build::{BuildConfig, build_index};
 
 #[derive(Args, Debug)]
@@ -33,6 +34,11 @@ pub struct BuildArgs {
     /// Use a single monolithic MPHF instead of partitioned (disables parallel MPHF build)
     #[arg(long)]
     pub single_mphf: bool,
+    /// Dictionary artifacts to emit. `sshash` (default) writes only `.ssi`/`.ctab`;
+    /// `tiny` additionally writes `.tdct`/`.tct` so `piscem map-* --dict tiny` can
+    /// skip the runtime sshash→tiny conversion.
+    #[arg(long, value_enum, default_value_t = DictKind::Sshash)]
+    pub dict: DictKind,
 }
 
 pub fn run(args: BuildArgs) -> Result<()> {
@@ -46,6 +52,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         canonical: args.canonical,
         seed: args.seed,
         single_mphf: args.single_mphf,
+        emit_tiny: matches!(args.dict, DictKind::Tiny),
     };
     build_index(&config)
 }

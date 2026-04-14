@@ -831,6 +831,89 @@ impl ContigTableLike for TinyContigTable {
     }
 }
 
+const TINY_CTAB_MAGIC: &[u8; 8] = b"PTCT01\0\0";
+
+impl TinyContigTable {
+    /// Serialize to a `.tct` file writer.
+    ///
+    /// Format (all little-endian):
+    /// ```text
+    /// [magic: 8 bytes "PTCT01\0\0"]
+    /// [ref_len_bits: u64]
+    /// [num_ref_bits: u64]
+    /// [num_unitigs: u64]
+    /// [unitig_ref_info: u64 × num_unitigs]
+    /// [num_overflow: u64]
+    /// for each overflow list:
+    ///   [len: u64]
+    ///   [entries: u64 × len]
+    /// ```
+    pub fn save<W: Write>(&self, writer: &mut W) -> Result<()> {
+        writer.write_all(TINY_CTAB_MAGIC)?;
+        writer.write_all(&self.encoding.ref_len_bits.to_le_bytes())?;
+        writer.write_all(&self.encoding.num_ref_bits.to_le_bytes())?;
+        writer.write_all(&(self.unitig_ref_info.len() as u64).to_le_bytes())?;
+        for &v in &self.unitig_ref_info {
+            writer.write_all(&v.to_le_bytes())?;
+        }
+        writer.write_all(&(self.overflow.len() as u64).to_le_bytes())?;
+        for list in &self.overflow {
+            writer.write_all(&(list.len() as u64).to_le_bytes())?;
+            for &e in list {
+                writer.write_all(&e.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Deserialize from a `.tct` file reader.
+    pub fn load<R: Read>(reader: &mut R) -> Result<Self> {
+        let mut magic = [0u8; 8];
+        reader
+            .read_exact(&mut magic)
+            .context("failed to read tiny contig table magic")?;
+        if magic != *TINY_CTAB_MAGIC {
+            bail!(
+                "invalid tiny contig table magic: expected {:?}, got {:?}",
+                TINY_CTAB_MAGIC,
+                magic
+            );
+        }
+        let ref_len_bits = read_u64_le(reader).context("failed to read ref_len_bits")?;
+        let num_ref_bits = read_u64_le(reader).context("failed to read num_ref_bits")?;
+        let encoding = EntryEncoding::new(ref_len_bits, num_ref_bits);
+        if encoding.entry_width > 63 {
+            bail!(
+                "tiny contig table entry_width {} exceeds 63-bit budget",
+                encoding.entry_width
+            );
+        }
+
+        let n = read_u64_le(reader).context("failed to read num_unitigs")? as usize;
+        let mut unitig_ref_info = Vec::with_capacity(n);
+        for _ in 0..n {
+            unitig_ref_info.push(read_u64_le(reader)?);
+        }
+
+        let nover = read_u64_le(reader).context("failed to read num_overflow")? as usize;
+        let mut overflow: Vec<Vec<u64>> = Vec::with_capacity(nover);
+        for _ in 0..nover {
+            let m = read_u64_le(reader)? as usize;
+            let mut list = Vec::with_capacity(m);
+            for _ in 0..m {
+                list.push(read_u64_le(reader)?);
+            }
+            overflow.push(list);
+        }
+
+        Ok(Self {
+            encoding,
+            unitig_ref_info,
+            overflow,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -993,6 +1076,46 @@ mod tests {
                 assert_eq!(enc.transcript_id(a), enc.transcript_id(b));
                 assert_eq!(enc.pos(a), enc.pos(b));
                 assert_eq!(enc.orientation(a), enc.orientation(b));
+            }
+        }
+    }
+
+    #[test]
+    fn test_tiny_contig_table_roundtrip() {
+        let mut builder = ContigTableBuilder::new(5, 10_000, 50);
+        // Unitig 0: 2 refs (multi-ref → overflow)
+        builder.add_occurrence(0, 0, 100, true);
+        builder.add_occurrence(0, 1, 200, false);
+        // Unitig 1: single ref (inline)
+        builder.add_occurrence(1, 0, 500, true);
+        // Unitig 2: empty
+        // Unitig 3: single ref
+        builder.add_occurrence(3, 7, 42, false);
+        // Unitig 4: 3 refs (overflow)
+        builder.add_occurrence(4, 0, 0, true);
+        builder.add_occurrence(4, 49, 9999, false);
+        builder.add_occurrence(4, 12, 1234, true);
+        let ct = builder.build();
+        let tiny = TinyContigTable::from_contig_table(&ct);
+
+        let mut buf = Vec::new();
+        tiny.save(&mut buf).unwrap();
+        let loaded = TinyContigTable::load(&mut &buf[..]).unwrap();
+
+        assert_eq!(loaded.num_contigs(), tiny.num_contigs());
+        assert_eq!(loaded.num_entries(), tiny.num_entries());
+        assert_eq!(loaded.ref_len_bits(), tiny.ref_len_bits());
+        assert_eq!(loaded.num_ref_bits(), tiny.num_ref_bits());
+
+        let enc = loaded.encoding();
+        for cid in 0..5u64 {
+            let a: Vec<u64> = tiny.contig_entries(cid).iter().collect();
+            let b: Vec<u64> = loaded.contig_entries(cid).iter().collect();
+            assert_eq!(a.len(), b.len(), "contig {cid} length");
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert_eq!(enc.transcript_id(*x), enc.transcript_id(*y));
+                assert_eq!(enc.pos(*x), enc.pos(*y));
+                assert_eq!(enc.orientation(*x), enc.orientation(*y));
             }
         }
     }

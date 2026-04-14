@@ -98,6 +98,10 @@ impl RefSigInfo {
 const DICT_EXT: &str = "ssi";
 /// File extension for the contig table.
 const CTAB_EXT: &str = "ctab";
+/// File extension for the Tiny dictionary (serialized `TinyDictionary`).
+const TDCT_EXT: &str = "tdct";
+/// File extension for the Tiny contig table (serialized `TinyContigTable`).
+const TCT_EXT: &str = "tct";
 /// File extension for reference info.
 const REFINFO_EXT: &str = "refinfo";
 /// File extension for the equivalence class table (optional).
@@ -111,6 +115,11 @@ fn with_ext(prefix: &Path, ext: &str) -> PathBuf {
     let mut p = prefix.to_path_buf();
     p.set_extension(ext);
     p
+}
+
+/// Whether both `.tdct` and `.tct` files exist alongside the index prefix.
+pub fn tiny_artifacts_exist(prefix: &Path) -> bool {
+    with_ext(prefix, TDCT_EXT).exists() && with_ext(prefix, TCT_EXT).exists()
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +401,36 @@ impl ReferenceIndex<Dictionary, ContigTable> {
         }
     }
 
+    /// Serialize Tiny artifacts (`.tdct` + `.tct`) alongside the existing
+    /// sshash `.ssi` / `.ctab` files for this index prefix.
+    ///
+    /// Converts the loaded sshash dictionary and contig table into their Tiny
+    /// counterparts and writes them under `{prefix}.tdct` and `{prefix}.tct`.
+    /// The sshash artifacts are untouched; load-time code selects the backend
+    /// based on the `--dict` flag.
+    pub fn save_tiny_artifacts<const K: usize>(&self, prefix: &Path) -> Result<()>
+    where
+        Kmer<K>: KmerBits,
+    {
+        let tdct_path = with_ext(prefix, TDCT_EXT);
+        info!("Building and saving TinyDictionary to {}", tdct_path.display());
+        let tiny_dict = TinyDictionary::from_sshash::<K>(&self.dict);
+        tiny_dict
+            .save(&tdct_path)
+            .map_err(|e| anyhow::anyhow!("failed to save {}: {e}", tdct_path.display()))?;
+
+        let tct_path = with_ext(prefix, TCT_EXT);
+        info!("Building and saving TinyContigTable to {}", tct_path.display());
+        let tiny_ctab = TinyContigTable::from_contig_table(&self.contig_table);
+        let tct_file = std::fs::File::create(&tct_path)
+            .with_context(|| format!("failed to create {}", tct_path.display()))?;
+        let mut tct_writer = std::io::BufWriter::new(tct_file);
+        tiny_ctab
+            .save(&mut tct_writer)
+            .with_context(|| format!("failed to save {}", tct_path.display()))?;
+        Ok(())
+    }
+
     /// Convert to a fully Tiny-backed index: TinyDictionary + TinyContigTable.
     ///
     /// Builds a `TinyDictionary` from the loaded sshash dictionary and a
@@ -412,6 +451,101 @@ impl ReferenceIndex<Dictionary, ContigTable> {
             poison_table: self.poison_table,
             sig_info: self.sig_info,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tiny-backed load path: reads `.tdct` + `.tct` directly, sharing refinfo /
+// ectab / poison / sigs with the sshash layout.
+// ---------------------------------------------------------------------------
+impl ReferenceIndex<TinyDictionary, TinyContigTable> {
+    /// Load a Tiny-backed index directly from `.tdct` + `.tct` files.
+    ///
+    /// Expects the same companion files as the sshash loader
+    /// (`.refinfo`, optional `.ectab`, `.poison`, `.sigs.json`).
+    pub fn load_tiny(prefix: &Path, load_ec: bool, load_poison: bool) -> Result<Self> {
+        // 1. TinyDictionary
+        let tdct_path = with_ext(prefix, TDCT_EXT);
+        info!("Loading TinyDictionary from {}", tdct_path.display());
+        let dict = TinyDictionary::load(&tdct_path)
+            .map_err(|e| anyhow::anyhow!("failed to load {}: {e}", tdct_path.display()))?;
+        info!(
+            "  k={}, {} strings, canonical={}",
+            dict.k(),
+            dict.num_strings(),
+            dict.canonical()
+        );
+
+        // 2. TinyContigTable
+        let tct_path = with_ext(prefix, TCT_EXT);
+        info!("Loading TinyContigTable from {}", tct_path.display());
+        let tct_file = std::fs::File::open(&tct_path)
+            .with_context(|| format!("failed to open {}", tct_path.display()))?;
+        let mut tct_reader = std::io::BufReader::new(tct_file);
+        let contig_table = TinyContigTable::load(&mut tct_reader)
+            .with_context(|| format!("failed to load {}", tct_path.display()))?;
+        info!(
+            "  {} contigs, inline-single-ref fraction = {:.2}%",
+            contig_table.num_contigs(),
+            contig_table.inline_fraction() * 100.0,
+        );
+
+        // 3. Reference info
+        let refinfo_path = with_ext(prefix, REFINFO_EXT);
+        let refinfo_file = std::fs::File::open(&refinfo_path)
+            .with_context(|| format!("failed to open {}", refinfo_path.display()))?;
+        let mut refinfo_reader = std::io::BufReader::new(refinfo_file);
+        let ref_info = RefInfo::load(&mut refinfo_reader)
+            .with_context(|| format!("failed to load {}", refinfo_path.display()))?;
+
+        // 4. EC table
+        let ec_table = if load_ec {
+            let ectab_path = with_ext(prefix, ECTAB_EXT);
+            if ectab_path.exists() {
+                let ectab_file = std::fs::File::open(&ectab_path)
+                    .with_context(|| format!("failed to open {}", ectab_path.display()))?;
+                let mut ectab_reader = std::io::BufReader::new(ectab_file);
+                Some(
+                    EqClassMap::load(&mut ectab_reader)
+                        .with_context(|| format!("failed to load {}", ectab_path.display()))?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // 5. Poison table
+        let poison_table = if load_poison {
+            let poison_path = with_ext(prefix, POISON_EXT);
+            if poison_path.exists() {
+                let poison_file = std::fs::File::open(&poison_path)
+                    .with_context(|| format!("failed to open {}", poison_path.display()))?;
+                let mut poison_reader = std::io::BufReader::new(poison_file);
+                Some(
+                    PoisonTable::load(&mut poison_reader)
+                        .with_context(|| format!("failed to load {}", poison_path.display()))?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let sig_info = RefSigInfo::try_load(prefix);
+        let encoding = contig_table.encoding();
+
+        Ok(Self {
+            dict,
+            contig_table,
+            ref_info,
+            encoding,
+            ec_table,
+            poison_table,
+            sig_info,
+        })
     }
 }
 

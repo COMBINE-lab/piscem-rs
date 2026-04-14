@@ -24,7 +24,7 @@ use sshash_lib::{Kmer, KmerBits, KmerDictionary, dispatch_on_k};
 use crate::index::contig_table::ContigTableLike;
 
 use super::DictKind;
-use crate::index::reference_index::ReferenceIndex;
+use crate::index::reference_index::{ReferenceIndex, tiny_artifacts_exist};
 use crate::io::fastx::{Collection, CollectionType, open_with_decompression, reader_with_batch_size};
 use crate::io::map_info::{MapInfoParams, write_map_info};
 use crate::io::rad::write_rad_header_atac;
@@ -141,12 +141,61 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
 
     let is_paired = !args.read1.is_empty();
 
-    // Load index
+    let load_start = Instant::now();
+    if matches!(args.dict, super::DictKind::Tiny) && tiny_artifacts_exist(&args.index) {
+        info!(
+            "Loading prebuilt Tiny index artifacts from {}.{{tdct,tct}}",
+            args.index.display()
+        );
+        let index = crate::index::reference_index::ReferenceIndex::<
+            tiny_dict::TinyDictionary,
+            crate::index::contig_table::TinyContigTable,
+        >::load_tiny(&args.index, args.check_ambig_hits, !args.no_poison)?;
+        info!(
+            "Index loaded: k={}, {} refs ({:.2}s)",
+            index.k(),
+            index.num_refs(),
+            load_start.elapsed().as_secs_f64()
+        );
+        return run_scatac_with_index(args, &index, start, is_paired);
+    }
     info!("Loading index from {}", args.index.display());
-    // C++ ATAC: check_ambig_hits defaults to false, so EC table is NOT loaded
     let index = ReferenceIndex::load(&args.index, args.check_ambig_hits, !args.no_poison)?;
-    info!("Index loaded: k={}, {} refs", index.k(), index.num_refs());
+    info!(
+        "Index loaded: k={}, {} refs ({:.2}s)",
+        index.k(),
+        index.num_refs(),
+        load_start.elapsed().as_secs_f64()
+    );
 
+    if matches!(args.dict, super::DictKind::Tiny) {
+        info!("Converting sshash index to Tiny (in-memory)");
+        let convert_start = Instant::now();
+        let k = index.k();
+        let tiny_index = sshash_lib::dispatch_on_k!(k, K => index.into_tiny_full::<K>());
+        let inline_frac = tiny_index.contig_table().inline_fraction();
+        info!(
+            "Tiny index ready ({:.2}s); single-ref inline fraction = {:.2}%",
+            convert_start.elapsed().as_secs_f64(),
+            inline_frac * 100.0,
+        );
+        return run_scatac_with_index(args, &tiny_index, start, is_paired);
+    }
+
+    run_scatac_with_index(args, &index, start, is_paired)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_scatac_with_index<D, C>(
+    args: MapScatacArgs,
+    index: &ReferenceIndex<D, C>,
+    start: Instant,
+    is_paired: bool,
+) -> Result<()>
+where
+    D: KmerDictionary + Sync,
+    C: ContigTableLike + Sync,
+{
     // Create output directory and RAD file
     let out_dir = args.output.clone();
     std::fs::create_dir_all(&out_dir)
@@ -207,54 +256,24 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
         max_ec_card: args.max_ec_card,
     };
 
-    let dict_kind = args.dict;
-
-    // Capture values needed post-dispatch before `index` may be consumed
-    // by an `into_tiny` conversion.
     let index_k = index.k();
     let index_m = index.m();
     let index_num_refs = index.num_refs();
     let sig_info_owned = index.ref_sig_info().cloned();
 
-    // Dispatch on K and run the pipeline via paraseq multi-reader
     dispatch_on_k!(k, K => {
         let (bio_paths, r2_paths) = if is_paired {
             (args.read1.as_slice(), args.read2.as_slice())
         } else {
             (args.reads.as_slice(), [].as_slice())
         };
-        match dict_kind {
-            DictKind::Sshash => {
-                run_atac_pipeline::<K, _, _>(
-                    bio_paths, &args.barcode, r2_paths,
-                    &output_info, &stats,
-                    &index, &binning, bc_len, tn5_shift, min_overlap, Some(&end_cache),
-                    is_paired, opts,
-                    num_threads, &progress,
-                )?;
-            }
-            DictKind::Tiny => {
-                info!("Converting index into TinyDictionary + TinyContigTable (in-memory)");
-                let convert_start = Instant::now();
-                let tiny_index = index.into_tiny_full::<K>();
-                let inline_frac = tiny_index.contig_table().inline_fraction();
-                info!(
-                    "Tiny index ready ({:.2}s); single-ref inline fraction = {:.2}%",
-                    convert_start.elapsed().as_secs_f64(),
-                    inline_frac * 100.0,
-                );
-                // Rebuild binning for the tiny-backed index (shares the same
-                // ref metadata, just a different generic instantiation).
-                let tiny_binning = BinPos::new(&tiny_index, args.bin_size, args.bin_overlap, args.thr);
-                run_atac_pipeline::<K, _, _>(
-                    bio_paths, &args.barcode, r2_paths,
-                    &output_info, &stats,
-                    &tiny_index, &tiny_binning, bc_len, tn5_shift, min_overlap, Some(&end_cache),
-                    is_paired, opts,
-                    num_threads, &progress,
-                )?;
-            }
-        }
+        run_atac_pipeline::<K, _, _>(
+            bio_paths, &args.barcode, r2_paths,
+            &output_info, &stats,
+            index, &binning, bc_len, tn5_shift, min_overlap, Some(&end_cache),
+            is_paired, opts,
+            num_threads, &progress,
+        )?;
     });
 
     progress.finish_and_clear();

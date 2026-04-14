@@ -15,7 +15,7 @@ use sshash_lib::{Kmer, KmerBits, KmerDictionary, dispatch_on_k};
 use crate::index::contig_table::ContigTableLike;
 
 use super::DictKind;
-use crate::index::reference_index::ReferenceIndex;
+use crate::index::reference_index::{ReferenceIndex, tiny_artifacts_exist};
 use crate::io::fastx::{
     Collection, CollectionType, open_with_decompression, reader_with_batch_size,
 };
@@ -96,9 +96,9 @@ pub struct MapScrnaArgs {
 pub fn run(args: MapScrnaArgs) -> Result<()> {
     let start = Instant::now();
 
-    let strat = match args.skipping_strategy.to_lowercase().as_str() {
-        "permissive" => SkippingStrategy::Permissive,
-        "strict" => SkippingStrategy::Strict,
+    // Validate skipping strategy early; full parse happens inside the generic runner.
+    match args.skipping_strategy.to_lowercase().as_str() {
+        "permissive" | "strict" => {}
         other => anyhow::bail!("unknown skipping strategy: {}", other),
     };
 
@@ -142,10 +142,73 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
     // --ignore-ambig-hits disables EC table loading
     let check_ambig = !args.ignore_ambig_hits;
 
-    // Load index
+    // Load index. When --dict tiny is requested and .tdct/.tct artifacts are
+    // present alongside the prefix, load the Tiny-backed index directly,
+    // skipping the sshash load+convert entirely. Otherwise load the sshash
+    // index; inside the dispatch we optionally convert to Tiny in memory.
+    let load_start = Instant::now();
+    if matches!(args.dict, super::DictKind::Tiny) && tiny_artifacts_exist(&args.index) {
+        info!(
+            "Loading prebuilt Tiny index artifacts from {}.{{tdct,tct}}",
+            args.index.display()
+        );
+        let index = crate::index::reference_index::ReferenceIndex::<
+            tiny_dict::TinyDictionary,
+            crate::index::contig_table::TinyContigTable,
+        >::load_tiny(&args.index, check_ambig, !args.no_poison)?;
+        info!(
+            "Index loaded: k={}, {} refs ({:.2}s)",
+            index.k(),
+            index.num_refs(),
+            load_start.elapsed().as_secs_f64()
+        );
+        return run_scrna_with_index(args, &index, start, protocol.as_ref());
+    }
     info!("Loading index from {}", args.index.display());
     let index = ReferenceIndex::load(&args.index, check_ambig, !args.no_poison)?;
-    info!("Index loaded: k={}, {} refs", index.k(), index.num_refs());
+    info!(
+        "Index loaded: k={}, {} refs ({:.2}s)",
+        index.k(),
+        index.num_refs(),
+        load_start.elapsed().as_secs_f64()
+    );
+
+    // If --dict tiny was requested but no prebuilt artifacts exist, convert
+    // in memory now and hand off to the same generic runner the on-disk path
+    // uses. This keeps the conversion code path alive as a fallback.
+    if matches!(args.dict, super::DictKind::Tiny) {
+        info!("Converting sshash index to Tiny (in-memory)");
+        let convert_start = Instant::now();
+        let k = index.k();
+        let tiny_index = sshash_lib::dispatch_on_k!(k, K => index.into_tiny_full::<K>());
+        let inline_frac = tiny_index.contig_table().inline_fraction();
+        info!(
+            "Tiny index ready ({:.2}s); single-ref inline fraction = {:.2}%",
+            convert_start.elapsed().as_secs_f64(),
+            inline_frac * 100.0,
+        );
+        return run_scrna_with_index(args, &tiny_index, start, protocol.as_ref());
+    }
+
+    run_scrna_with_index(args, &index, start, protocol.as_ref())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_scrna_with_index<D, C>(
+    args: MapScrnaArgs,
+    index: &ReferenceIndex<D, C>,
+    start: Instant,
+    protocol: &dyn Protocol,
+) -> Result<()>
+where
+    D: KmerDictionary + Sync,
+    C: ContigTableLike + Sync,
+{
+    let strat = match args.skipping_strategy.to_lowercase().as_str() {
+        "permissive" => SkippingStrategy::Permissive,
+        "strict" => SkippingStrategy::Strict,
+        other => anyhow::bail!("unknown skipping strategy: {}", other),
+    };
 
     // Create output directory and RAD file
     let out_dir = args.output.clone();
@@ -250,10 +313,8 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
         },
     };
     let struct_constraints = args.struct_constraints;
-    let dict_kind = args.dict;
 
-    // Capture values needed post-dispatch before `index` may be consumed
-    // by an `into_tiny` conversion.
+    // Capture values needed post-dispatch.
     let index_k = index.k();
     let index_m = index.m();
     let index_num_refs = index.num_refs();
@@ -261,54 +322,22 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
 
     // Dispatch on K and hit-info type, then run the pipeline via paraseq
     dispatch_on_k!(k, K => {
-        match dict_kind {
-            DictKind::Sshash => {
-                if struct_constraints {
-                    run_scrna_pipeline::<K, SketchHitInfoChained, _, _>(
-                        &args.read1, &args.read2,
-                        &output_info, &stats,
-                        &index, strat, opts, protocol.as_ref(), bc_len, umi_len,
-                        with_position, &read_length_samples,
-                        num_threads, &progress,
-                    )?;
-                } else {
-                    run_scrna_pipeline::<K, SketchHitInfoSimple, _, _>(
-                        &args.read1, &args.read2,
-                        &output_info, &stats,
-                        &index, strat, opts, protocol.as_ref(), bc_len, umi_len,
-                        with_position, &read_length_samples,
-                        num_threads, &progress,
-                    )?;
-                }
-            }
-            DictKind::Tiny => {
-                info!("Converting index into TinyDictionary + TinyContigTable (in-memory)");
-                let convert_start = Instant::now();
-                let tiny_index = index.into_tiny_full::<K>();
-                let inline_frac = tiny_index.contig_table().inline_fraction();
-                info!(
-                    "Tiny index ready ({:.2}s); single-ref inline fraction = {:.2}%",
-                    convert_start.elapsed().as_secs_f64(),
-                    inline_frac * 100.0,
-                );
-                if struct_constraints {
-                    run_scrna_pipeline::<K, SketchHitInfoChained, _, _>(
-                        &args.read1, &args.read2,
-                        &output_info, &stats,
-                        &tiny_index, strat, opts, protocol.as_ref(), bc_len, umi_len,
-                        with_position, &read_length_samples,
-                        num_threads, &progress,
-                    )?;
-                } else {
-                    run_scrna_pipeline::<K, SketchHitInfoSimple, _, _>(
-                        &args.read1, &args.read2,
-                        &output_info, &stats,
-                        &tiny_index, strat, opts, protocol.as_ref(), bc_len, umi_len,
-                        with_position, &read_length_samples,
-                        num_threads, &progress,
-                    )?;
-                }
-            }
+        if struct_constraints {
+            run_scrna_pipeline::<K, SketchHitInfoChained, _, _>(
+                &args.read1, &args.read2,
+                &output_info, &stats,
+                index, strat, opts, protocol, bc_len, umi_len,
+                with_position, &read_length_samples,
+                num_threads, &progress,
+            )?;
+        } else {
+            run_scrna_pipeline::<K, SketchHitInfoSimple, _, _>(
+                &args.read1, &args.read2,
+                &output_info, &stats,
+                index, strat, opts, protocol, bc_len, umi_len,
+                with_position, &read_length_samples,
+                num_threads, &progress,
+            )?;
         }
     });
 

@@ -43,6 +43,8 @@ pub struct BuildConfig {
     pub seed: u64,
     /// Use a single monolithic MPHF instead of partitioned.
     pub single_mphf: bool,
+    /// Also emit TinyDictionary/TinyContigTable artifacts (`.tdct` + `.tct`).
+    pub emit_tiny: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +264,14 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
         "Index built and saved to {}",
         config.output_prefix.display()
     );
+
+    if config.emit_tiny {
+        use sshash_lib::dispatch_on_k;
+        info!("Emitting Tiny index artifacts (.tdct + .tct)");
+        dispatch_on_k!(k, K => {
+            index.save_tiny_artifacts::<K>(&config.output_prefix)?;
+        });
+    }
     Ok(())
 }
 
@@ -669,6 +679,7 @@ mod tests {
             canonical: false,
             seed: 1,
             single_mphf: false,
+            emit_tiny: false,
         };
 
         build_index(&config).expect("build_index failed");
