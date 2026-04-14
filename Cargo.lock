@@ -1767,6 +1767,7 @@ dependencies = [
  "sshash-lib",
  "sux",
  "tempfile",
+ "tiny-dict",
  "tracing",
  "tracing-subscriber",
  "value-traits",
@@ -2488,6 +2489,17 @@ checksum = "965fe0c26be5c56c94e38ba547249074803efd52adfb66de62107d95aab3eaca"
 dependencies = [
  "libc",
  "tikv-jemalloc-sys",
+]
+
+[[package]]
+name = "tiny-dict"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "hashbrown 0.15.5",
+ "rapidhash 4.4.1",
+ "sshash-lib",
+ "tracing",
 ]
 
 [[package]]

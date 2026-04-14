@@ -13,9 +13,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use crossbeam::channel;
-use sshash_lib::{Kmer, KmerBits};
+use sshash_lib::{Kmer, KmerBits, KmerDictionary};
 use tracing::info;
 
+use super::contig_table::ContigTableLike;
 use super::poison_table::{LabeledPoisonOcc, PoisonTable};
 use super::reference_index::ReferenceIndex;
 use crate::mapping::kmer_value::CanonicalKmer;
@@ -147,10 +148,10 @@ impl<'a> PoisonKmerState<'a> {
 // ---------------------------------------------------------------------------
 
 /// Scan a single decoy sequence for poison k-mers.
-fn scan_sequence_for_poison<'a, const K: usize>(
+fn scan_sequence_for_poison<'a, const K: usize, D: KmerDictionary, C: ContigTableLike>(
     seq: &[u8],
-    index: &'a ReferenceIndex,
-    query: &mut PiscemStreamingQuery<'a, K>,
+    index: &'a ReferenceIndex<D, C>,
+    query: &mut PiscemStreamingQuery<'a, K, D>,
     state: &mut PoisonKmerState<'a>,
     occs: &mut Vec<LabeledPoisonOcc>,
 ) where
@@ -212,8 +213,8 @@ fn scan_sequence_for_poison<'a, const K: usize>(
 // ---------------------------------------------------------------------------
 
 /// Build a poison table by scanning decoy FASTA files.
-pub fn build_poison_table<const K: usize>(
-    index: &ReferenceIndex,
+pub fn build_poison_table<const K: usize, D: KmerDictionary + Sync, C: ContigTableLike + Sync>(
+    index: &ReferenceIndex<D, C>,
     decoy_paths: &[PathBuf],
     threads: usize,
 ) -> Result<PoisonTable>
@@ -270,12 +271,12 @@ where
         for _ in 0..threads {
             s.spawn(move |_| {
                 let recv = recv_ref.clone();
-                let mut query = PiscemStreamingQuery::<K>::new(index.dict());
+                let mut query = PiscemStreamingQuery::<K, D>::new(index.dict());
                 let mut state = PoisonKmerState::new();
                 let mut local_occs: Vec<LabeledPoisonOcc> = Vec::new();
 
                 for record in recv {
-                    scan_sequence_for_poison::<K>(
+                    scan_sequence_for_poison::<K, D, C>(
                         &record.seq,
                         index,
                         &mut query,
@@ -314,7 +315,10 @@ where
 /// Verify that no poison k-mers are present in the reference dictionary.
 ///
 /// Returns the number of poison k-mers found in the dictionary (should be 0).
-pub fn verify_poison_table<const K: usize>(table: &PoisonTable, index: &ReferenceIndex) -> usize
+pub fn verify_poison_table<const K: usize, D: KmerDictionary, C: ContigTableLike>(
+    table: &PoisonTable,
+    index: &ReferenceIndex<D, C>,
+) -> usize
 where
     Kmer<K>: KmerBits,
 {
@@ -338,7 +342,7 @@ where
         }
 
         // Look up in dictionary via streaming query (single lookup, reset each time)
-        let mut query = PiscemStreamingQuery::<K>::new(index.dict());
+        let mut query = PiscemStreamingQuery::<K, D>::new(index.dict());
         let result = query.lookup_at(&s, 0);
         let phits = index.resolve_lookup(&result);
         let present = phits.as_ref().is_some_and(|ph| !ph.is_empty());

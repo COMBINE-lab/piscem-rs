@@ -19,10 +19,13 @@ use anyhow::{Context, Result};
 use clap::Args;
 use tracing::info;
 
-use sshash_lib::{Kmer, KmerBits, dispatch_on_k};
+use sshash_lib::{Kmer, KmerBits, KmerDictionary, dispatch_on_k};
 
+use crate::index::contig_table::ContigTableLike;
+
+use super::DictKind;
 use crate::index::reference_index::ReferenceIndex;
-use crate::io::fastx::{Collection, CollectionType, open_with_decompression};
+use crate::io::fastx::{Collection, CollectionType, open_with_decompression, reader_with_batch_size};
 use crate::io::map_info::{MapInfoParams, write_map_info};
 use crate::io::rad::write_rad_header_atac;
 use crate::io::threads::{MappingStats, OutputInfo};
@@ -118,6 +121,10 @@ pub struct MapScatacArgs {
     /// Suppress progress output
     #[arg(short = 'q', long)]
     pub quiet: bool,
+    /// K-mer dictionary backend: `sshash` (compact, default) or `tiny`
+    /// (hashbrown-backed, faster but higher memory).
+    #[arg(long, value_enum, default_value_t = DictKind::Sshash)]
+    pub dict: DictKind,
 }
 
 pub fn run(args: MapScatacArgs) -> Result<()> {
@@ -200,6 +207,15 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
         max_ec_card: args.max_ec_card,
     };
 
+    let dict_kind = args.dict;
+
+    // Capture values needed post-dispatch before `index` may be consumed
+    // by an `into_tiny` conversion.
+    let index_k = index.k();
+    let index_m = index.m();
+    let index_num_refs = index.num_refs();
+    let sig_info_owned = index.ref_sig_info().cloned();
+
     // Dispatch on K and run the pipeline via paraseq multi-reader
     dispatch_on_k!(k, K => {
         let (bio_paths, r2_paths) = if is_paired {
@@ -207,13 +223,38 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
         } else {
             (args.reads.as_slice(), [].as_slice())
         };
-        run_atac_pipeline::<K>(
-            bio_paths, &args.barcode, r2_paths,
-            &output_info, &stats,
-            &index, &binning, bc_len, tn5_shift, min_overlap, Some(&end_cache),
-            is_paired, opts,
-            num_threads, &progress,
-        )?;
+        match dict_kind {
+            DictKind::Sshash => {
+                run_atac_pipeline::<K, _, _>(
+                    bio_paths, &args.barcode, r2_paths,
+                    &output_info, &stats,
+                    &index, &binning, bc_len, tn5_shift, min_overlap, Some(&end_cache),
+                    is_paired, opts,
+                    num_threads, &progress,
+                )?;
+            }
+            DictKind::Tiny => {
+                info!("Converting index into TinyDictionary + TinyContigTable (in-memory)");
+                let convert_start = Instant::now();
+                let tiny_index = index.into_tiny_full::<K>();
+                let inline_frac = tiny_index.contig_table().inline_fraction();
+                info!(
+                    "Tiny index ready ({:.2}s); single-ref inline fraction = {:.2}%",
+                    convert_start.elapsed().as_secs_f64(),
+                    inline_frac * 100.0,
+                );
+                // Rebuild binning for the tiny-backed index (shares the same
+                // ref metadata, just a different generic instantiation).
+                let tiny_binning = BinPos::new(&tiny_index, args.bin_size, args.bin_overlap, args.thr);
+                run_atac_pipeline::<K, _, _>(
+                    bio_paths, &args.barcode, r2_paths,
+                    &output_info, &stats,
+                    &tiny_index, &tiny_binning, bc_len, tn5_shift, min_overlap, Some(&end_cache),
+                    is_paired, opts,
+                    num_threads, &progress,
+                )?;
+            }
+        }
     });
 
     progress.finish_and_clear();
@@ -249,13 +290,13 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
         num_mapped,
         num_poisoned,
         elapsed_secs: elapsed,
-        sig_info: index.ref_sig_info(),
+        sig_info: sig_info_owned.as_ref(),
         piscem_rs_version: crate::VERSION,
         num_threads,
         index_path: &args.index,
-        k: index.k(),
-        m: index.m(),
-        num_refs: index.num_refs(),
+        k: index_k,
+        m: index_m,
+        num_refs: index_num_refs,
         skipping_strategy: "every-kmer",
     })?;
 
@@ -263,13 +304,13 @@ pub fn run(args: MapScatacArgs) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_atac_pipeline<const K: usize>(
+fn run_atac_pipeline<const K: usize, D: KmerDictionary + Sync, C: ContigTableLike + Sync>(
     bio_paths: &[PathBuf],
     barcode_paths: &[PathBuf],
     read2_paths: &[PathBuf],
     output: &OutputInfo,
     stats: &MappingStats,
-    index: &ReferenceIndex,
+    index: &ReferenceIndex<D, C>,
     binning: &BinPos,
     bc_len: u16,
     tn5_shift: bool,
@@ -283,7 +324,7 @@ fn run_atac_pipeline<const K: usize>(
 where
     Kmer<K>: KmerBits,
 {
-    let mut processor = ScatacProcessor::<K>::new(
+    let mut processor = ScatacProcessor::<K, D, C>::new(
         index,
         end_cache,
         output,
@@ -300,17 +341,17 @@ where
     let mut readers = Vec::with_capacity(bio_paths.len() * if is_paired { 3 } else { 2 });
     for i in 0..bio_paths.len() {
         readers.push(
-            paraseq::fastx::Reader::new(open_with_decompression(&bio_paths[i])?)
+            reader_with_batch_size(open_with_decompression(&bio_paths[i])?)
                 .map_err(|e| anyhow::anyhow!("failed to open {}: {}", bio_paths[i].display(), e))?,
         );
         readers.push(
-            paraseq::fastx::Reader::new(open_with_decompression(&barcode_paths[i])?).map_err(
+            reader_with_batch_size(open_with_decompression(&barcode_paths[i])?).map_err(
                 |e| anyhow::anyhow!("failed to open {}: {}", barcode_paths[i].display(), e),
             )?,
         );
         if is_paired {
             readers.push(
-                paraseq::fastx::Reader::new(open_with_decompression(&read2_paths[i])?).map_err(
+                reader_with_batch_size(open_with_decompression(&read2_paths[i])?).map_err(
                     |e| anyhow::anyhow!("failed to open {}: {}", read2_paths[i].display(), e),
                 )?,
             );

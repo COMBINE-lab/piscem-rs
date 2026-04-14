@@ -10,10 +10,15 @@ use anyhow::{Context, Result};
 use clap::Args;
 use tracing::info;
 
-use sshash_lib::{Kmer, KmerBits, dispatch_on_k};
+use sshash_lib::{Kmer, KmerBits, KmerDictionary, dispatch_on_k};
 
+use crate::index::contig_table::ContigTableLike;
+
+use super::DictKind;
 use crate::index::reference_index::ReferenceIndex;
-use crate::io::fastx::{Collection, CollectionType, open_with_decompression};
+use crate::io::fastx::{
+    Collection, CollectionType, open_with_decompression, reader_with_batch_size,
+};
 use crate::io::map_info::{MapInfoParams, write_map_info};
 use crate::io::rad::{write_rad_header_sc, write_rad_header_sc_multi_bc};
 use crate::io::threads::{MappingStats, OutputInfo};
@@ -82,6 +87,10 @@ pub struct MapScrnaArgs {
     /// Suppress progress output
     #[arg(short = 'q', long)]
     pub quiet: bool,
+    /// K-mer dictionary backend: `sshash` (compact, default) or `tiny`
+    /// (hashbrown-backed, faster but higher memory).
+    #[arg(long, value_enum, default_value_t = DictKind::Sshash)]
+    pub dict: DictKind,
 }
 
 pub fn run(args: MapScrnaArgs) -> Result<()> {
@@ -241,25 +250,65 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
         },
     };
     let struct_constraints = args.struct_constraints;
+    let dict_kind = args.dict;
+
+    // Capture values needed post-dispatch before `index` may be consumed
+    // by an `into_tiny` conversion.
+    let index_k = index.k();
+    let index_m = index.m();
+    let index_num_refs = index.num_refs();
+    let sig_info_owned = index.ref_sig_info().cloned();
 
     // Dispatch on K and hit-info type, then run the pipeline via paraseq
     dispatch_on_k!(k, K => {
-        if struct_constraints {
-            run_scrna_pipeline::<K, SketchHitInfoChained>(
-                &args.read1, &args.read2,
-                &output_info, &stats,
-                &index, strat, opts, protocol.as_ref(), bc_len, umi_len,
-                with_position, &read_length_samples,
-                num_threads, &progress,
-            )?;
-        } else {
-            run_scrna_pipeline::<K, SketchHitInfoSimple>(
-                &args.read1, &args.read2,
-                &output_info, &stats,
-                &index, strat, opts, protocol.as_ref(), bc_len, umi_len,
-                with_position, &read_length_samples,
-                num_threads, &progress,
-            )?;
+        match dict_kind {
+            DictKind::Sshash => {
+                if struct_constraints {
+                    run_scrna_pipeline::<K, SketchHitInfoChained, _, _>(
+                        &args.read1, &args.read2,
+                        &output_info, &stats,
+                        &index, strat, opts, protocol.as_ref(), bc_len, umi_len,
+                        with_position, &read_length_samples,
+                        num_threads, &progress,
+                    )?;
+                } else {
+                    run_scrna_pipeline::<K, SketchHitInfoSimple, _, _>(
+                        &args.read1, &args.read2,
+                        &output_info, &stats,
+                        &index, strat, opts, protocol.as_ref(), bc_len, umi_len,
+                        with_position, &read_length_samples,
+                        num_threads, &progress,
+                    )?;
+                }
+            }
+            DictKind::Tiny => {
+                info!("Converting index into TinyDictionary + TinyContigTable (in-memory)");
+                let convert_start = Instant::now();
+                let tiny_index = index.into_tiny_full::<K>();
+                let inline_frac = tiny_index.contig_table().inline_fraction();
+                info!(
+                    "Tiny index ready ({:.2}s); single-ref inline fraction = {:.2}%",
+                    convert_start.elapsed().as_secs_f64(),
+                    inline_frac * 100.0,
+                );
+                if struct_constraints {
+                    run_scrna_pipeline::<K, SketchHitInfoChained, _, _>(
+                        &args.read1, &args.read2,
+                        &output_info, &stats,
+                        &tiny_index, strat, opts, protocol.as_ref(), bc_len, umi_len,
+                        with_position, &read_length_samples,
+                        num_threads, &progress,
+                    )?;
+                } else {
+                    run_scrna_pipeline::<K, SketchHitInfoSimple, _, _>(
+                        &args.read1, &args.read2,
+                        &output_info, &stats,
+                        &tiny_index, strat, opts, protocol.as_ref(), bc_len, umi_len,
+                        with_position, &read_length_samples,
+                        num_threads, &progress,
+                    )?;
+                }
+            }
         }
     });
 
@@ -319,13 +368,13 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
         num_mapped,
         num_poisoned,
         elapsed_secs: elapsed,
-        sig_info: index.ref_sig_info(),
+        sig_info: sig_info_owned.as_ref(),
         piscem_rs_version: crate::VERSION,
         num_threads,
         index_path: &args.index,
-        k: index.k(),
-        m: index.m(),
-        num_refs: index.num_refs(),
+        k: index_k,
+        m: index_m,
+        num_refs: index_num_refs,
         skipping_strategy: &args.skipping_strategy,
     })?;
 
@@ -333,12 +382,17 @@ pub fn run(args: MapScrnaArgs) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_scrna_pipeline<const K: usize, S: SketchHitInfo + Send + 'static>(
+fn run_scrna_pipeline<
+    const K: usize,
+    S: SketchHitInfo + Send + 'static,
+    D: KmerDictionary + Sync,
+    C: ContigTableLike + Sync,
+>(
     read1_paths: &[PathBuf],
     read2_paths: &[PathBuf],
     output: &OutputInfo,
     stats: &MappingStats,
-    index: &ReferenceIndex,
+    index: &ReferenceIndex<D, C>,
     strat: SkippingStrategy,
     opts: MappingOpts,
     protocol: &dyn Protocol,
@@ -352,7 +406,7 @@ fn run_scrna_pipeline<const K: usize, S: SketchHitInfo + Send + 'static>(
 where
     Kmer<K>: KmerBits,
 {
-    let mut processor = ScrnaProcessor::<K, S>::new(
+    let mut processor = ScrnaProcessor::<K, S, D, C>::new(
         index,
         None,
         output,
@@ -367,16 +421,19 @@ where
         progress,
     );
 
-    let mut readers = Vec::with_capacity(read1_paths.len() * 2);
+    let mut pairs = Vec::with_capacity(read1_paths.len());
     for (r1_path, r2_path) in read1_paths.iter().zip(read2_paths.iter()) {
-        readers.push(
-            paraseq::fastx::Reader::new(open_with_decompression(r1_path)?)
-                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r1_path.display(), e))?,
-        );
-        readers.push(
-            paraseq::fastx::Reader::new(open_with_decompression(r2_path)?)
-                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r2_path.display(), e))?,
-        );
+        let r1 = reader_with_batch_size(open_with_decompression(r1_path)?)
+            .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r1_path.display(), e))?;
+        let r2 = reader_with_batch_size(open_with_decompression(r2_path)?)
+            .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r2_path.display(), e))?;
+        pairs.push((r1, r2));
+    }
+
+    let mut readers = Vec::with_capacity(pairs.len() * 2);
+    for (r1, r2) in pairs {
+        readers.push(r1);
+        readers.push(r2);
     }
     let collection = Collection::new(readers, CollectionType::Paired)
         .map_err(|e| anyhow::anyhow!("failed to create collection: {}", e))?;

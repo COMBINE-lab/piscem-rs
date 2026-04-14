@@ -6,8 +6,7 @@
 //!
 //! Corresponds to the C++ `piscem::streaming_query`.
 
-use sshash_lib::streaming_query::StreamingQueryEngine;
-use sshash_lib::{Dictionary, Kmer, KmerBits, LookupResult};
+use sshash_lib::{Dictionary, Kmer, KmerBits, KmerDictionary, KmerStreamingQuery, LookupResult};
 
 use crate::mapping::kmer_value::CanonicalKmer;
 use crate::mapping::unitig_end_cache::UnitigEndCache;
@@ -20,11 +19,11 @@ use crate::mapping::unitig_end_cache::UnitigEndCache;
 ///
 /// Optionally integrates with a shared `UnitigEndCache` to avoid
 /// redundant lookups at unitig boundaries.
-pub struct PiscemStreamingQuery<'a, const K: usize>
+pub struct PiscemStreamingQuery<'a, const K: usize, D: KmerDictionary + 'a = Dictionary>
 where
     Kmer<K>: KmerBits,
 {
-    engine: StreamingQueryEngine<'a, K>,
+    engine: D::Query<'a, K>,
     k: usize,
     /// Set to `true` when we reach a unitig boundary, triggering
     /// cache lookup/insert on the next query.
@@ -41,12 +40,12 @@ where
     prev_query_pos: i32,
 }
 
-impl<'a, const K: usize> PiscemStreamingQuery<'a, K>
+impl<'a, const K: usize, D: KmerDictionary + 'a> PiscemStreamingQuery<'a, K, D>
 where
     Kmer<K>: KmerBits,
 {
     /// Create a new streaming query engine from a dictionary.
-    pub fn new(dict: &'a Dictionary) -> Self {
+    pub fn new(dict: &'a D) -> Self {
         Self {
             k: dict.k(),
             engine: dict.create_streaming_query::<K>(),
@@ -58,7 +57,7 @@ where
     }
 
     /// Create a new streaming query engine with a shared unitig-end cache.
-    pub fn with_cache(dict: &'a Dictionary, cache: &'a UnitigEndCache) -> Self {
+    pub fn with_cache(dict: &'a D, cache: &'a UnitigEndCache) -> Self {
         Self {
             k: dict.k(),
             engine: dict.create_streaming_query::<K>(),

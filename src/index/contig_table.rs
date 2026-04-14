@@ -120,41 +120,93 @@ pub(crate) fn ceil_log2(n: u64) -> u64 {
 
 /// A view over the reference occurrences of a single contig.
 ///
-/// Provides iteration over the packed entries. Equivalent to the C++
-/// `sshash::util::contig_span`.
+/// Each variant yields the same u64 packed-entry shape (see [`EntryEncoding`])
+/// via [`ContigSpan::get`] and [`ContigSpan::iter`]. The variants trade
+/// different storage strategies:
+///
+/// - `Packed`: slice of entries inside a shared [`BitFieldVec`] — how
+///   [`ContigTable`] stores everything.
+/// - `Inline`: a single encoded entry held inline. Used by `TinyContigTable`
+///   for the common case of single-ref unitigs (no indirection, no hash).
+/// - `Flat`: a slice of already-unpacked u64 entries. Used by
+///   `TinyContigTable` for multi-ref (or empty) unitigs, where the entries
+///   live in an owned `Vec<u64>`.
 #[derive(Clone)]
-pub struct ContigSpan<'a> {
-    entries: &'a BitFieldVec<usize>,
-    start: usize,
-    len: usize,
+pub enum ContigSpan<'a> {
+    Packed {
+        entries: &'a BitFieldVec<usize>,
+        start: usize,
+        len: usize,
+    },
+    Inline(u64),
+    Flat(&'a [u64]),
 }
 
 impl<'a> ContigSpan<'a> {
+    /// Construct a `Packed` span (the common [`ContigTable`] case).
+    #[inline]
+    pub(crate) fn packed(entries: &'a BitFieldVec<usize>, start: usize, len: usize) -> Self {
+        ContigSpan::Packed {
+            entries,
+            start,
+            len,
+        }
+    }
+
     /// Number of reference occurrences for this contig.
     #[inline]
     pub fn len(&self) -> usize {
-        self.len
+        match self {
+            ContigSpan::Packed { len, .. } => *len,
+            ContigSpan::Inline(_) => 1,
+            ContigSpan::Flat(s) => <[u64]>::len(s),
+        }
     }
 
     /// Whether this contig has no reference occurrences.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        match self {
+            ContigSpan::Packed { len, .. } => *len == 0,
+            ContigSpan::Inline(_) => false,
+            ContigSpan::Flat(s) => <[u64]>::is_empty(s),
+        }
     }
 
     /// Get the raw packed entry at position `i` within this span.
     #[inline]
     pub fn get(&self, i: usize) -> u64 {
-        debug_assert!(i < self.len);
-        self.entries.index_value(self.start + i) as u64
+        match self {
+            ContigSpan::Packed {
+                entries,
+                start,
+                len,
+            } => {
+                debug_assert!(i < *len);
+                entries.index_value(*start + i) as u64
+            }
+            ContigSpan::Inline(v) => {
+                debug_assert_eq!(i, 0);
+                *v
+            }
+            ContigSpan::Flat(s) => s[i],
+        }
     }
 
     /// Iterate over the raw packed entries.
     pub fn iter(&self) -> ContigSpanIter<'a> {
-        ContigSpanIter {
-            entries: self.entries,
-            pos: self.start,
-            end: self.start + self.len,
+        match *self {
+            ContigSpan::Packed {
+                entries,
+                start,
+                len,
+            } => ContigSpanIter::Packed {
+                entries,
+                pos: start,
+                end: start + len,
+            },
+            ContigSpan::Inline(v) => ContigSpanIter::Inline(Some(v)),
+            ContigSpan::Flat(s) => ContigSpanIter::Flat(s.iter()),
         }
     }
 }
@@ -169,10 +221,14 @@ impl<'a> IntoIterator for &'a ContigSpan<'a> {
 }
 
 /// Iterator over packed entries in a contig span.
-pub struct ContigSpanIter<'a> {
-    entries: &'a BitFieldVec<usize>,
-    pos: usize,
-    end: usize,
+pub enum ContigSpanIter<'a> {
+    Packed {
+        entries: &'a BitFieldVec<usize>,
+        pos: usize,
+        end: usize,
+    },
+    Inline(Option<u64>),
+    Flat(std::slice::Iter<'a, u64>),
 }
 
 impl Iterator for ContigSpanIter<'_> {
@@ -180,19 +236,34 @@ impl Iterator for ContigSpanIter<'_> {
 
     #[inline]
     fn next(&mut self) -> Option<u64> {
-        if self.pos < self.end {
-            let v = self.entries.index_value(self.pos) as u64;
-            self.pos += 1;
-            Some(v)
-        } else {
-            None
+        match self {
+            ContigSpanIter::Packed { entries, pos, end } => {
+                if *pos < *end {
+                    let v = entries.index_value(*pos) as u64;
+                    *pos += 1;
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+            ContigSpanIter::Inline(slot) => slot.take(),
+            ContigSpanIter::Flat(it) => it.next().copied(),
         }
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.end - self.pos;
-        (remaining, Some(remaining))
+        match self {
+            ContigSpanIter::Packed { pos, end, .. } => {
+                let r = end - pos;
+                (r, Some(r))
+            }
+            ContigSpanIter::Inline(slot) => {
+                let r = if slot.is_some() { 1 } else { 0 };
+                (r, Some(r))
+            }
+            ContigSpanIter::Flat(it) => it.size_hint(),
+        }
     }
 }
 
@@ -253,11 +324,7 @@ impl ContigTable {
     pub fn contig_entries(&self, contig_id: u64) -> ContigSpan<'_> {
         let start = unsafe { self.ctg_offsets.get_unchecked(contig_id as usize) };
         let end = unsafe { self.ctg_offsets.get_unchecked(contig_id as usize + 1) };
-        ContigSpan {
-            entries: &self.ctg_entries,
-            start,
-            len: end - start,
-        }
+        ContigSpan::packed(&self.ctg_entries, start, end - start)
     }
 
     /// Approximate size in bytes of the in-memory representation.
@@ -345,6 +412,80 @@ fn read_u64_le<R: Read>(reader: &mut R) -> std::io::Result<u64> {
     let mut buf = [0u8; 8];
     reader.read_exact(&mut buf)?;
     Ok(u64::from_le_bytes(buf))
+}
+
+// ---------------------------------------------------------------------------
+// ContigTableLike trait
+// ---------------------------------------------------------------------------
+
+/// Abstracts the unitig → reference-occurrence side of the index.
+///
+/// Exists so the mapping pipeline can be generic over the concrete contig
+/// table representation (the default [`ContigTable`] here, and later a
+/// `TinyContigTable` optimized for small references). The trait captures the
+/// call surface that `hit_searcher`, `engine`, and `reference_index` use.
+///
+/// For now all implementations return the concrete [`ContigSpan<'_>`]; a
+/// future revision may introduce a GAT for the span type if the tiny variant
+/// needs a different representation.
+pub trait ContigTableLike {
+    /// Number of contigs (unitigs) in the table.
+    fn num_contigs(&self) -> usize;
+
+    /// Total number of occurrence entries across all contigs.
+    fn num_entries(&self) -> usize;
+
+    /// Entry-encoding parameters (bit widths, shifts, masks).
+    fn encoding(&self) -> EntryEncoding;
+
+    /// Number of bits used to encode reference positions.
+    fn ref_len_bits(&self) -> u64;
+
+    /// Number of bits used to encode reference IDs.
+    fn num_ref_bits(&self) -> u64;
+
+    /// Posting list of reference occurrences for a given contig. Hot path.
+    fn contig_entries(&self, contig_id: u64) -> ContigSpan<'_>;
+
+    /// Approximate size in bytes of the in-memory representation.
+    fn size_bytes(&self) -> usize;
+}
+
+impl ContigTableLike for ContigTable {
+    #[inline]
+    fn num_contigs(&self) -> usize {
+        ContigTable::num_contigs(self)
+    }
+
+    #[inline]
+    fn num_entries(&self) -> usize {
+        ContigTable::num_entries(self)
+    }
+
+    #[inline]
+    fn encoding(&self) -> EntryEncoding {
+        ContigTable::encoding(self)
+    }
+
+    #[inline]
+    fn ref_len_bits(&self) -> u64 {
+        ContigTable::ref_len_bits(self)
+    }
+
+    #[inline]
+    fn num_ref_bits(&self) -> u64 {
+        ContigTable::num_ref_bits(self)
+    }
+
+    #[inline]
+    fn contig_entries(&self, contig_id: u64) -> ContigSpan<'_> {
+        ContigTable::contig_entries(self, contig_id)
+    }
+
+    #[inline]
+    fn size_bytes(&self) -> usize {
+        ContigTable::size_bytes(self)
+    }
 }
 
 impl std::fmt::Debug for ContigTable {
@@ -541,6 +682,152 @@ impl ContigTableDirectBuilder {
             ctg_offsets: self.ctg_offsets,
             ctg_entries: self.ctg_entries,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TinyContigTable — inline-single-ref fast-path variant
+// ---------------------------------------------------------------------------
+
+/// Compact contig table optimized for small references where most unitigs
+/// have a single reference occurrence (typical of probe sets).
+///
+/// Layout: one u64 per unitig in `unitig_ref_info`, tagged by bit 63:
+/// - `bit 63 = 0`: the low bits hold the single-ref packed entry inline
+///   (same bit layout as [`EntryEncoding::encode`] so decoding is identical).
+///   Requires `entry_width ≤ 63`.
+/// - `bit 63 = 1`: the low 63 bits are an index into `overflow`, which owns
+///   the entry list for empty and multi-ref unitigs. Indexing into
+///   `overflow` is a single cache miss vs. the two Elias-Fano lookups plus
+///   BitFieldVec bit-unpacking that the default [`ContigTable`] would do.
+pub struct TinyContigTable {
+    encoding: EntryEncoding,
+    /// One u64 per unitig, tagged as described above.
+    unitig_ref_info: Vec<u64>,
+    /// Owned entry lists for empty and multi-ref unitigs.
+    overflow: Vec<Vec<u64>>,
+}
+
+const TINY_OVERFLOW_TAG: u64 = 1u64 << 63;
+const TINY_INLINE_MASK: u64 = (1u64 << 63) - 1;
+
+impl TinyContigTable {
+    /// Convert an existing [`ContigTable`] into the inline-optimized form.
+    ///
+    /// Panics if `encoding.entry_width > 63` (references too large — caller
+    /// must fall back to [`ContigTable`]).
+    pub fn from_contig_table(ct: &ContigTable) -> Self {
+        let encoding = ct.encoding();
+        assert!(
+            encoding.entry_width <= 63,
+            "TinyContigTable requires entry_width <= 63 (got {}); references too large",
+            encoding.entry_width
+        );
+
+        let num_contigs = ct.num_contigs();
+        let mut unitig_ref_info = Vec::with_capacity(num_contigs);
+        let mut overflow: Vec<Vec<u64>> = Vec::new();
+
+        for cid in 0..num_contigs {
+            let span = ct.contig_entries(cid as u64);
+            let n = span.len();
+            if n == 1 {
+                let e = span.get(0);
+                debug_assert!(e & TINY_OVERFLOW_TAG == 0);
+                unitig_ref_info.push(e);
+            } else {
+                let idx = overflow.len() as u64;
+                let entries: Vec<u64> = span.iter().collect();
+                overflow.push(entries);
+                unitig_ref_info.push(TINY_OVERFLOW_TAG | idx);
+            }
+        }
+
+        Self {
+            encoding,
+            unitig_ref_info,
+            overflow,
+        }
+    }
+
+    /// Fraction of unitigs that are stored inline (single-ref).
+    pub fn inline_fraction(&self) -> f64 {
+        if self.unitig_ref_info.is_empty() {
+            return 0.0;
+        }
+        let inline = self
+            .unitig_ref_info
+            .iter()
+            .filter(|&&v| v & TINY_OVERFLOW_TAG == 0)
+            .count();
+        inline as f64 / self.unitig_ref_info.len() as f64
+    }
+
+    #[inline]
+    fn span_for(&self, contig_id: u64) -> ContigSpan<'_> {
+        let slice: &[u64] = self.unitig_ref_info.as_slice();
+        let v = unsafe { *slice.get_unchecked(contig_id as usize) };
+        if v & TINY_OVERFLOW_TAG == 0 {
+            ContigSpan::Inline(v)
+        } else {
+            let idx = (v & TINY_INLINE_MASK) as usize;
+            let entries = unsafe { self.overflow.get_unchecked(idx) };
+            ContigSpan::Flat(entries.as_slice())
+        }
+    }
+}
+
+impl ContigTableLike for TinyContigTable {
+    #[inline]
+    fn num_contigs(&self) -> usize {
+        self.unitig_ref_info.len()
+    }
+
+    #[inline]
+    fn num_entries(&self) -> usize {
+        let mut total = 0usize;
+        for &v in &self.unitig_ref_info {
+            if v & TINY_OVERFLOW_TAG == 0 {
+                total += 1;
+            } else {
+                let idx = (v & TINY_INLINE_MASK) as usize;
+                total += self.overflow[idx].len();
+            }
+        }
+        total
+    }
+
+    #[inline]
+    fn encoding(&self) -> EntryEncoding {
+        self.encoding
+    }
+
+    #[inline]
+    fn ref_len_bits(&self) -> u64 {
+        self.encoding.ref_len_bits
+    }
+
+    #[inline]
+    fn num_ref_bits(&self) -> u64 {
+        self.encoding.num_ref_bits
+    }
+
+    #[inline]
+    fn contig_entries(&self, contig_id: u64) -> ContigSpan<'_> {
+        self.span_for(contig_id)
+    }
+
+    #[inline]
+    fn size_bytes(&self) -> usize {
+        let info = self.unitig_ref_info.len() * std::mem::size_of::<u64>();
+        let overflow_slots =
+            self.overflow.len() * std::mem::size_of::<Vec<u64>>();
+        let overflow_entries: usize = self
+            .overflow
+            .iter()
+            .map(|v| v.len() * std::mem::size_of::<u64>())
+            .sum();
+        info + overflow_slots + overflow_entries + std::mem::size_of::<Self>()
     }
 }
 

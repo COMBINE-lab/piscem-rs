@@ -6,8 +6,9 @@
 //! Port of C++ `map_se_fragment` / `map_pe_fragment` from
 //! `piscem-cpp/src/pesc_sc.cpp`.
 
-use sshash_lib::{Kmer, KmerBits};
+use sshash_lib::{Kmer, KmerBits, KmerDictionary};
 
+use crate::index::contig_table::ContigTableLike;
 use crate::index::reference_index::ReferenceIndex;
 use crate::mapping::binning::BinPos;
 use crate::mapping::cache::MappingCache;
@@ -22,12 +23,12 @@ use crate::mapping::streaming_query::PiscemStreamingQuery;
 /// Map a single-end read fragment.
 ///
 /// Returns `true` for early stop.
-pub fn map_se_fragment<const K: usize, S: SketchHitInfo>(
+pub fn map_se_fragment<const K: usize, S: SketchHitInfo, D: KmerDictionary, C: ContigTableLike>(
     seq: &[u8],
-    hs: &mut HitSearcher<'_>,
-    query: &mut PiscemStreamingQuery<'_, K>,
+    hs: &mut HitSearcher<'_, D, C>,
+    query: &mut PiscemStreamingQuery<'_, K, D>,
     cache_out: &mut MappingCache<S>,
-    index: &ReferenceIndex,
+    index: &ReferenceIndex<D, C>,
     poison_state: &mut PoisonState<'_>,
     strat: SkippingStrategy,
 ) -> bool
@@ -35,7 +36,7 @@ where
     Kmer<K>: KmerBits,
 {
     poison_state.clear();
-    map_read::<K, S>(seq, cache_out, hs, query, index, poison_state, strat)
+    map_read(seq, cache_out, hs, query, index, poison_state, strat)
 }
 
 /// Map a paired-end read fragment.
@@ -43,15 +44,15 @@ where
 /// Maps both ends independently, then merges results.
 /// Returns `true` for early stop.
 #[allow(clippy::too_many_arguments)]
-pub fn map_pe_fragment<const K: usize, S: SketchHitInfo>(
+pub fn map_pe_fragment<const K: usize, S: SketchHitInfo, D: KmerDictionary, C: ContigTableLike>(
     seq1: &[u8],
     seq2: &[u8],
-    hs: &mut HitSearcher<'_>,
-    query: &mut PiscemStreamingQuery<'_, K>,
+    hs: &mut HitSearcher<'_, D, C>,
+    query: &mut PiscemStreamingQuery<'_, K, D>,
     cache_left: &mut MappingCache<S>,
     cache_right: &mut MappingCache<S>,
     cache_out: &mut MappingCache<S>,
-    index: &ReferenceIndex,
+    index: &ReferenceIndex<D, C>,
     poison_state: &mut PoisonState<'_>,
     strat: SkippingStrategy,
 ) -> bool
@@ -62,13 +63,13 @@ where
     cache_out.clear();
 
     poison_state.set_fragment_end(FragmentEnd::Left);
-    let early_left = map_read::<K, S>(seq1, cache_left, hs, query, index, poison_state, strat);
+    let early_left = map_read(seq1, cache_left, hs, query, index, poison_state, strat);
     if poison_state.is_poisoned() {
         return false;
     }
 
     poison_state.set_fragment_end(FragmentEnd::Right);
-    let early_right = map_read::<K, S>(seq2, cache_right, hs, query, index, poison_state, strat);
+    let early_right = map_read(seq2, cache_right, hs, query, index, poison_state, strat);
     if poison_state.is_poisoned() {
         return false;
     }
@@ -88,12 +89,12 @@ where
 ///
 /// Returns `true` for early stop.
 #[allow(clippy::too_many_arguments)]
-pub fn map_se_fragment_atac<const K: usize>(
+pub fn map_se_fragment_atac<const K: usize, D: KmerDictionary, C: ContigTableLike>(
     seq: &[u8],
-    hs: &mut HitSearcher<'_>,
-    query: &mut PiscemStreamingQuery<'_, K>,
+    hs: &mut HitSearcher<'_, D, C>,
+    query: &mut PiscemStreamingQuery<'_, K, D>,
     cache_out: &mut MappingCache<SketchHitInfoSimple>,
-    index: &ReferenceIndex,
+    index: &ReferenceIndex<D, C>,
     poison_state: &mut PoisonState<'_>,
     binning: &BinPos,
 ) -> bool
@@ -101,7 +102,7 @@ where
     Kmer<K>: KmerBits,
 {
     poison_state.clear();
-    map_read_atac::<K, SketchHitInfoSimple>(seq, cache_out, hs, query, index, poison_state, binning)
+    map_read_atac(seq, cache_out, hs, query, index, poison_state, binning)
 }
 
 /// Map a paired-end read fragment using bin-based hit collection (scATAC).
@@ -110,15 +111,15 @@ where
 /// using bin-aware pairing.
 /// Returns `true` for early stop.
 #[allow(clippy::too_many_arguments)]
-pub fn map_pe_fragment_atac<const K: usize>(
+pub fn map_pe_fragment_atac<const K: usize, D: KmerDictionary, C: ContigTableLike>(
     seq1: &[u8],
     seq2: &[u8],
-    hs: &mut HitSearcher<'_>,
-    query: &mut PiscemStreamingQuery<'_, K>,
+    hs: &mut HitSearcher<'_, D, C>,
+    query: &mut PiscemStreamingQuery<'_, K, D>,
     cache_left: &mut MappingCache<SketchHitInfoSimple>,
     cache_right: &mut MappingCache<SketchHitInfoSimple>,
     cache_out: &mut MappingCache<SketchHitInfoSimple>,
-    index: &ReferenceIndex,
+    index: &ReferenceIndex<D, C>,
     poison_state: &mut PoisonState<'_>,
     binning: &BinPos,
 ) -> bool
@@ -129,7 +130,7 @@ where
     cache_out.clear();
 
     poison_state.set_fragment_end(FragmentEnd::Left);
-    let early_left = map_read_atac::<K, SketchHitInfoSimple>(
+    let early_left = map_read_atac(
         seq1,
         cache_left,
         hs,
@@ -143,7 +144,7 @@ where
     }
 
     poison_state.set_fragment_end(FragmentEnd::Right);
-    let early_right = map_read_atac::<K, SketchHitInfoSimple>(
+    let early_right = map_read_atac(
         seq2,
         cache_right,
         hs,

@@ -7,11 +7,12 @@
 //! Corresponds to the C++ `reference_index` class.
 
 use anyhow::{Context, Result};
-use sshash_lib::Dictionary;
+use sshash_lib::{Dictionary, Kmer, KmerBits, KmerDictionary};
+use tiny_dict::TinyDictionary;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-use super::contig_table::{ContigTable, EntryEncoding};
+use super::contig_table::{ContigTable, ContigTableLike, EntryEncoding, TinyContigTable};
 use super::eq_classes::EqClassMap;
 use super::poison_table::PoisonTable;
 use super::refinfo::RefInfo;
@@ -132,11 +133,15 @@ fn with_ext(prefix: &Path, ext: &str) -> PathBuf {
 /// - `/path/to/index.refinfo` — reference names and lengths
 /// - `/path/to/index.ectab` — equivalence class table (optional)
 /// - `/path/to/index.poison` — poison k-mer table (optional)
-pub struct ReferenceIndex {
+pub struct ReferenceIndex<D = Dictionary, C = ContigTable>
+where
+    D: KmerDictionary,
+    C: ContigTableLike,
+{
     /// SSHash compressed k-mer dictionary.
-    dict: Dictionary,
+    dict: D,
     /// Contig (unitig) → packed reference occurrence table.
-    contig_table: ContigTable,
+    contig_table: C,
     /// Reference sequence names and lengths.
     ref_info: RefInfo,
     /// Pre-computed entry encoding parameters (derived from contig table).
@@ -149,7 +154,11 @@ pub struct ReferenceIndex {
     sig_info: Option<RefSigInfo>,
 }
 
-impl ReferenceIndex {
+// ---------------------------------------------------------------------------
+// File I/O and construction — only for the default (sshash) parameters.
+// TinyDictionary-based variants will add their own load/save paths.
+// ---------------------------------------------------------------------------
+impl ReferenceIndex<Dictionary, ContigTable> {
     /// Load a reference index from files with the given path prefix.
     ///
     /// Loads the dictionary, contig table, and reference info. Optionally
@@ -337,6 +346,87 @@ impl ReferenceIndex {
     }
 
     // -----------------------------------------------------------------------
+    // Construction (for building a new index)
+    // -----------------------------------------------------------------------
+
+    /// Assemble a `ReferenceIndex` from pre-built components.
+    pub fn from_parts(
+        dict: Dictionary,
+        contig_table: ContigTable,
+        ref_info: RefInfo,
+        ec_table: Option<EqClassMap>,
+        poison_table: Option<PoisonTable>,
+    ) -> Self {
+        let encoding = contig_table.encoding();
+        Self {
+            dict,
+            contig_table,
+            ref_info,
+            encoding,
+            ec_table,
+            poison_table,
+            sig_info: None,
+        }
+    }
+
+    /// Convert this sshash-backed index into a TinyDictionary-backed one.
+    ///
+    /// Builds a `TinyDictionary` from the loaded sshash dictionary and keeps
+    /// every other component (contig table, refinfo, EC/poison tables) as-is.
+    ///
+    /// TODO: eventually persist the TinyDictionary directly (its own `.tdct`
+    /// file) so we can skip the sshash → tiny conversion at load time.
+    pub fn into_tiny<const K: usize>(self) -> ReferenceIndex<TinyDictionary, ContigTable>
+    where
+        Kmer<K>: KmerBits,
+    {
+        let tiny = TinyDictionary::from_sshash::<K>(&self.dict);
+        ReferenceIndex {
+            dict: tiny,
+            contig_table: self.contig_table,
+            ref_info: self.ref_info,
+            encoding: self.encoding,
+            ec_table: self.ec_table,
+            poison_table: self.poison_table,
+            sig_info: self.sig_info,
+        }
+    }
+
+    /// Convert to a fully Tiny-backed index: TinyDictionary + TinyContigTable.
+    ///
+    /// Builds a `TinyDictionary` from the loaded sshash dictionary and a
+    /// `TinyContigTable` (inline-single-ref fast path) from the loaded
+    /// `ContigTable`. Other components are preserved.
+    pub fn into_tiny_full<const K: usize>(self) -> ReferenceIndex<TinyDictionary, TinyContigTable>
+    where
+        Kmer<K>: KmerBits,
+    {
+        let tiny_dict = TinyDictionary::from_sshash::<K>(&self.dict);
+        let tiny_ctab = TinyContigTable::from_contig_table(&self.contig_table);
+        ReferenceIndex {
+            dict: tiny_dict,
+            contig_table: tiny_ctab,
+            ref_info: self.ref_info,
+            encoding: self.encoding,
+            ec_table: self.ec_table,
+            poison_table: self.poison_table,
+            sig_info: self.sig_info,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generic accessors and query/resolution — work for any KmerDictionary +
+// ContigTableLike pair. Today only the default (Dictionary, ContigTable) is
+// instantiated; the generics are here so future TinyDictionary / TinyContigTable
+// variants can drop in without touching call sites.
+// ---------------------------------------------------------------------------
+impl<D, C> ReferenceIndex<D, C>
+where
+    D: KmerDictionary,
+    C: ContigTableLike,
+{
+    // -----------------------------------------------------------------------
     // Accessors
     // -----------------------------------------------------------------------
 
@@ -354,13 +444,13 @@ impl ReferenceIndex {
 
     /// The SSHash dictionary.
     #[inline]
-    pub fn dict(&self) -> &Dictionary {
+    pub fn dict(&self) -> &D {
         &self.dict
     }
 
     /// The contig (unitig) occurrence table.
     #[inline]
-    pub fn contig_table(&self) -> &ContigTable {
+    pub fn contig_table(&self) -> &C {
         &self.contig_table
     }
 
@@ -455,32 +545,13 @@ impl ReferenceIndex {
         ))
     }
 
-    // -----------------------------------------------------------------------
-    // Construction (for building a new index)
-    // -----------------------------------------------------------------------
-
-    /// Assemble a `ReferenceIndex` from pre-built components.
-    pub fn from_parts(
-        dict: Dictionary,
-        contig_table: ContigTable,
-        ref_info: RefInfo,
-        ec_table: Option<EqClassMap>,
-        poison_table: Option<PoisonTable>,
-    ) -> Self {
-        let encoding = contig_table.encoding();
-        Self {
-            dict,
-            contig_table,
-            ref_info,
-            encoding,
-            ec_table,
-            poison_table,
-            sig_info: None,
-        }
-    }
 }
 
-impl std::fmt::Debug for ReferenceIndex {
+impl<D, C> std::fmt::Debug for ReferenceIndex<D, C>
+where
+    D: KmerDictionary,
+    C: ContigTableLike,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReferenceIndex")
             .field("k", &self.k())

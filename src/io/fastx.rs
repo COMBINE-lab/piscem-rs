@@ -15,6 +15,18 @@ pub use paraseq::parallel::{
     MultiParallelProcessor, PairedParallelProcessor, ParallelProcessor, ParallelReader,
 };
 
+/// Batch size for paraseq record sets. paraseq's default is 1024; we raise it
+/// to reduce contention on the per-reader mutex when many mapping threads drain
+/// batches faster than a single thread can fill them.
+pub const READER_BATCH_SIZE: usize = 16384;
+
+/// Build a paraseq fastx Reader with the shared piscem batch size.
+pub fn reader_with_batch_size<R: std::io::Read>(
+    inner: R,
+) -> Result<paraseq::fastx::Reader<R>, paraseq::Error> {
+    paraseq::fastx::Reader::new_with_batch_size(inner, READER_BATCH_SIZE)
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

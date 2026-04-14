@@ -17,8 +17,9 @@ use paraseq::Record;
 use paraseq::parallel::{MultiParallelProcessor, PairedParallelProcessor, ParallelProcessor};
 use seq_geom_parser::normalize::PadBuf;
 use smallvec::SmallVec;
-use sshash_lib::{Kmer, KmerBits};
+use sshash_lib::{Kmer, KmerBits, KmerDictionary};
 
+use crate::index::contig_table::{ContigTable, ContigTableLike};
 use crate::index::reference_index::ReferenceIndex;
 use crate::io::rad::{
     RadWriter, pack_bases_2bit, write_atac_record, write_bulk_record, write_sc_record,
@@ -108,11 +109,13 @@ struct CommonThreadState<
     'a,
     const K: usize,
     S: SketchHitInfo + Send + 'static = SketchHitInfoSimple,
+    D: KmerDictionary + 'a = sshash_lib::Dictionary,
+    C: ContigTableLike + 'a = ContigTable,
 > where
     Kmer<K>: KmerBits,
 {
-    hs: HitSearcher<'a>,
-    query: PiscemStreamingQuery<'a, K>,
+    hs: HitSearcher<'a, D, C>,
+    query: PiscemStreamingQuery<'a, K, D>,
     cache_out: MappingCache<S>,
     cache_left: MappingCache<S>,
     cache_right: MappingCache<S>,
@@ -125,18 +128,24 @@ struct CommonThreadState<
     chunk_in_progress: bool,
 }
 
-impl<'a, const K: usize, S: SketchHitInfo + Send + 'static> CommonThreadState<'a, K, S>
+impl<
+    'a,
+    const K: usize,
+    S: SketchHitInfo + Send + 'static,
+    D: KmerDictionary + 'a,
+    C: ContigTableLike + 'a,
+> CommonThreadState<'a, K, S, D, C>
 where
     Kmer<K>: KmerBits,
 {
     fn new(
-        index: &'a ReferenceIndex,
+        index: &'a ReferenceIndex<D, C>,
         end_cache: Option<&'a UnitigEndCache>,
         opts: &MappingOpts,
     ) -> Self {
         let query = match end_cache {
-            Some(cache) => PiscemStreamingQuery::<K>::with_cache(index.dict(), cache),
-            None => PiscemStreamingQuery::<K>::new(index.dict()),
+            Some(cache) => PiscemStreamingQuery::<K, D>::with_cache(index.dict(), cache),
+            None => PiscemStreamingQuery::<K, D>::new(index.dict()),
         };
         let mut cache_out = MappingCache::new(K);
         opts.apply_to(&mut cache_out);
@@ -223,25 +232,33 @@ pub struct BulkProcessor<
     'a,
     const K: usize,
     S: SketchHitInfo + Send + 'static = SketchHitInfoSimple,
+    D: KmerDictionary + 'a = sshash_lib::Dictionary,
+    C: ContigTableLike + 'a = ContigTable,
 > where
     Kmer<K>: KmerBits,
 {
-    index: &'a ReferenceIndex,
+    index: &'a ReferenceIndex<D, C>,
     end_cache: Option<&'a UnitigEndCache>,
     output: &'a OutputInfo,
     stats: &'a MappingStats,
     progress: &'a ProgressBar,
     strat: SkippingStrategy,
     opts: MappingOpts,
-    state: Option<CommonThreadState<'a, K, S>>,
+    state: Option<CommonThreadState<'a, K, S, D, C>>,
 }
 
-impl<'a, const K: usize, S: SketchHitInfo + Send + 'static> BulkProcessor<'a, K, S>
+impl<
+    'a,
+    const K: usize,
+    S: SketchHitInfo + Send + 'static,
+    D: KmerDictionary + 'a,
+    C: ContigTableLike + 'a,
+> BulkProcessor<'a, K, S, D, C>
 where
     Kmer<K>: KmerBits,
 {
     pub fn new(
-        index: &'a ReferenceIndex,
+        index: &'a ReferenceIndex<D, C>,
         end_cache: Option<&'a UnitigEndCache>,
         output: &'a OutputInfo,
         stats: &'a MappingStats,
@@ -262,7 +279,8 @@ where
     }
 }
 
-impl<const K: usize, S: SketchHitInfo + Send + 'static> Clone for BulkProcessor<'_, K, S>
+impl<const K: usize, S: SketchHitInfo + Send + 'static, D: KmerDictionary, C: ContigTableLike> Clone
+    for BulkProcessor<'_, K, S, D, C>
 where
     Kmer<K>: KmerBits,
 {
@@ -281,15 +299,23 @@ where
 }
 
 // Safety: all shared fields are `Copy` references; `state` is always `None` at clone time.
-unsafe impl<const K: usize, S: SketchHitInfo + Send + 'static> Send for BulkProcessor<'_, K, S> where
-    Kmer<K>: KmerBits
+unsafe impl<const K: usize, S: SketchHitInfo + Send + 'static, D: KmerDictionary, C: ContigTableLike> Send
+    for BulkProcessor<'_, K, S, D, C>
+where
+    Kmer<K>: KmerBits,
 {
 }
 
 // --- Bulk PE ---
 
-impl<'a, 'r, const K: usize, S: SketchHitInfo + Send + 'static>
-    PairedParallelProcessor<paraseq::fastx::RefRecord<'r>> for BulkProcessor<'a, K, S>
+impl<
+    'a,
+    'r,
+    const K: usize,
+    S: SketchHitInfo + Send + 'static,
+    D: KmerDictionary + 'a,
+    C: ContigTableLike + 'a,
+> PairedParallelProcessor<paraseq::fastx::RefRecord<'r>> for BulkProcessor<'a, K, S, D, C>
 where
     Kmer<K>: KmerBits,
 {
@@ -315,7 +341,7 @@ where
             let seq2 = rec2.seq();
 
             s.poison_state.paired_for_mapping = true;
-            map_pe_fragment::<K, S>(
+            map_pe_fragment(
                 &seq1,
                 &seq2,
                 &mut s.hs,
@@ -368,8 +394,14 @@ where
 
 // --- Bulk SE ---
 
-impl<'a, 'r, const K: usize, S: SketchHitInfo + Send + 'static>
-    ParallelProcessor<paraseq::fastx::RefRecord<'r>> for BulkProcessor<'a, K, S>
+impl<
+    'a,
+    'r,
+    const K: usize,
+    S: SketchHitInfo + Send + 'static,
+    D: KmerDictionary + 'a,
+    C: ContigTableLike + 'a,
+> ParallelProcessor<paraseq::fastx::RefRecord<'r>> for BulkProcessor<'a, K, S, D, C>
 where
     Kmer<K>: KmerBits,
 {
@@ -392,7 +424,7 @@ where
             let seq1 = rec.seq();
 
             s.poison_state.paired_for_mapping = false;
-            map_se_fragment::<K, S>(
+            map_se_fragment(
                 &seq1,
                 &mut s.hs,
                 &mut s.query,
@@ -620,11 +652,16 @@ fn normalized_umi_packed(
 }
 
 /// Per-thread state for scRNA mapping (extends common state).
-struct ScrnaThreadState<'a, const K: usize, S: SketchHitInfo + Send + 'static = SketchHitInfoSimple>
-where
+struct ScrnaThreadState<
+    'a,
+    const K: usize,
+    S: SketchHitInfo + Send + 'static = SketchHitInfoSimple,
+    D: KmerDictionary + 'a = sshash_lib::Dictionary,
+    C: ContigTableLike + 'a = ContigTable,
+> where
     Kmer<K>: KmerBits,
 {
-    common: CommonThreadState<'a, K, S>,
+    common: CommonThreadState<'a, K, S, D, C>,
     local_rlen_samples: Vec<u32>,
     unmapped_bc_counts: UnmappedBcCounts,
     normalization: Option<TechNormalizationState>,
@@ -638,10 +675,12 @@ pub struct ScrnaProcessor<
     'a,
     const K: usize,
     S: SketchHitInfo + Send + 'static = SketchHitInfoSimple,
+    D: KmerDictionary + 'a = sshash_lib::Dictionary,
+    C: ContigTableLike + 'a = ContigTable,
 > where
     Kmer<K>: KmerBits,
 {
-    index: &'a ReferenceIndex,
+    index: &'a ReferenceIndex<D, C>,
     end_cache: Option<&'a UnitigEndCache>,
     output: &'a OutputInfo,
     stats: &'a MappingStats,
@@ -654,16 +693,22 @@ pub struct ScrnaProcessor<
     normalization_plan: TechNormalizationPlan,
     with_position: bool,
     read_length_samples: &'a Mutex<Vec<u32>>,
-    state: Option<ScrnaThreadState<'a, K, S>>,
+    state: Option<ScrnaThreadState<'a, K, S, D, C>>,
 }
 
-impl<'a, const K: usize, S: SketchHitInfo + Send + 'static> ScrnaProcessor<'a, K, S>
+impl<
+    'a,
+    const K: usize,
+    S: SketchHitInfo + Send + 'static,
+    D: KmerDictionary + 'a,
+    C: ContigTableLike + 'a,
+> ScrnaProcessor<'a, K, S, D, C>
 where
     Kmer<K>: KmerBits,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        index: &'a ReferenceIndex,
+        index: &'a ReferenceIndex<D, C>,
         end_cache: Option<&'a UnitigEndCache>,
         output: &'a OutputInfo,
         stats: &'a MappingStats,
@@ -703,7 +748,8 @@ where
     }
 }
 
-impl<const K: usize, S: SketchHitInfo + Send + 'static> Clone for ScrnaProcessor<'_, K, S>
+impl<const K: usize, S: SketchHitInfo + Send + 'static, D: KmerDictionary, C: ContigTableLike> Clone
+    for ScrnaProcessor<'_, K, S, D, C>
 where
     Kmer<K>: KmerBits,
 {
@@ -728,13 +774,21 @@ where
 }
 
 // Safety: all shared fields are `Copy` references; `state` is always `None` at clone time.
-unsafe impl<const K: usize, S: SketchHitInfo + Send + 'static> Send for ScrnaProcessor<'_, K, S> where
-    Kmer<K>: KmerBits
+unsafe impl<const K: usize, S: SketchHitInfo + Send + 'static, D: KmerDictionary, C: ContigTableLike> Send
+    for ScrnaProcessor<'_, K, S, D, C>
+where
+    Kmer<K>: KmerBits,
 {
 }
 
-impl<'a, 'r, const K: usize, S: SketchHitInfo + Send + 'static>
-    PairedParallelProcessor<paraseq::fastx::RefRecord<'r>> for ScrnaProcessor<'a, K, S>
+impl<
+    'a,
+    'r,
+    const K: usize,
+    S: SketchHitInfo + Send + 'static,
+    D: KmerDictionary + 'a,
+    C: ContigTableLike + 'a,
+> PairedParallelProcessor<paraseq::fastx::RefRecord<'r>> for ScrnaProcessor<'a, K, S, D, C>
 where
     Kmer<K>: KmerBits,
 {
@@ -757,7 +811,7 @@ where
         let is_multi_bc = protocol.is_multi_barcode();
         let bc_descs = protocol.barcode_descs();
 
-        let st = self.state.get_or_insert_with(|| ScrnaThreadState::<K, S> {
+        let st = self.state.get_or_insert_with(|| ScrnaThreadState::<K, S, D, C> {
             common: CommonThreadState::new(index, end_cache, &self.opts),
             local_rlen_samples: Vec::new(),
             unmapped_bc_counts: if is_multi_bc {
@@ -958,7 +1012,7 @@ where
                         continue;
                     }
                     s.poison_state.paired_for_mapping = true;
-                    map_pe_fragment::<K, S>(
+                    map_pe_fragment(
                         read1,
                         read2,
                         &mut s.hs,
@@ -981,7 +1035,7 @@ where
                         continue;
                     }
                     s.poison_state.paired_for_mapping = false;
-                    map_se_fragment::<K, S>(
+                    map_se_fragment(
                         bio_seq,
                         &mut s.hs,
                         &mut s.query,
@@ -1077,11 +1131,15 @@ where
 // ===========================================================================
 
 /// Per-thread state for scATAC mapping (extends common state).
-struct ScatacThreadState<'a, const K: usize>
-where
+struct ScatacThreadState<
+    'a,
+    const K: usize,
+    D: KmerDictionary + 'a = sshash_lib::Dictionary,
+    C: ContigTableLike + 'a = ContigTable,
+> where
     Kmer<K>: KmerBits,
 {
-    common: CommonThreadState<'a, K>,
+    common: CommonThreadState<'a, K, SketchHitInfoSimple, D, C>,
     unmapped_bc_counts: AHashMap<u64, u32>,
 }
 
@@ -1089,11 +1147,15 @@ where
 ///
 /// Supports both paired-end (arity=3: R1, barcode, R2) and single-end
 /// (arity=2: reads, barcode) via `is_paired`.
-pub struct ScatacProcessor<'a, const K: usize>
-where
+pub struct ScatacProcessor<
+    'a,
+    const K: usize,
+    D: KmerDictionary + 'a = sshash_lib::Dictionary,
+    C: ContigTableLike + 'a = ContigTable,
+> where
     Kmer<K>: KmerBits,
 {
-    index: &'a ReferenceIndex,
+    index: &'a ReferenceIndex<D, C>,
     end_cache: Option<&'a UnitigEndCache>,
     output: &'a OutputInfo,
     stats: &'a MappingStats,
@@ -1104,16 +1166,16 @@ where
     min_overlap: i32,
     is_paired: bool,
     opts: MappingOpts,
-    state: Option<ScatacThreadState<'a, K>>,
+    state: Option<ScatacThreadState<'a, K, D, C>>,
 }
 
-impl<'a, const K: usize> ScatacProcessor<'a, K>
+impl<'a, const K: usize, D: KmerDictionary + 'a, C: ContigTableLike + 'a> ScatacProcessor<'a, K, D, C>
 where
     Kmer<K>: KmerBits,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        index: &'a ReferenceIndex,
+        index: &'a ReferenceIndex<D, C>,
         end_cache: Option<&'a UnitigEndCache>,
         output: &'a OutputInfo,
         stats: &'a MappingStats,
@@ -1142,7 +1204,7 @@ where
     }
 }
 
-impl<const K: usize> Clone for ScatacProcessor<'_, K>
+impl<const K: usize, D: KmerDictionary, C: ContigTableLike> Clone for ScatacProcessor<'_, K, D, C>
 where
     Kmer<K>: KmerBits,
 {
@@ -1164,10 +1226,13 @@ where
     }
 }
 
-unsafe impl<const K: usize> Send for ScatacProcessor<'_, K> where Kmer<K>: KmerBits {}
+unsafe impl<const K: usize, D: KmerDictionary, C: ContigTableLike> Send for ScatacProcessor<'_, K, D, C> where
+    Kmer<K>: KmerBits
+{
+}
 
-impl<'a, 'r, const K: usize> MultiParallelProcessor<paraseq::fastx::RefRecord<'r>>
-    for ScatacProcessor<'a, K>
+impl<'a, 'r, const K: usize, D: KmerDictionary + 'a, C: ContigTableLike + 'a>
+    MultiParallelProcessor<paraseq::fastx::RefRecord<'r>> for ScatacProcessor<'a, K, D, C>
 where
     Kmer<K>: KmerBits,
 {
@@ -1257,7 +1322,7 @@ where
                 if mate_ov.ov_type != OverlapType::NoOverlap && !mate_ov.frag.is_empty() {
                     // Map merged fragment as single read (bin-based)
                     s.poison_state.paired_for_mapping = false;
-                    map_se_fragment_atac::<K>(
+                    map_se_fragment_atac(
                         &mate_ov.frag,
                         &mut s.hs,
                         &mut s.query,
@@ -1302,7 +1367,7 @@ where
                 } else {
                     // No overlap: map both ends independently, then merge (bin-aware)
                     s.poison_state.paired_for_mapping = true;
-                    map_pe_fragment_atac::<K>(
+                    map_pe_fragment_atac(
                         &r1,
                         &r2,
                         &mut s.hs,
@@ -1328,7 +1393,7 @@ where
             } else {
                 // SE mode: map the single biological read
                 s.poison_state.paired_for_mapping = false;
-                map_se_fragment_atac::<K>(
+                map_se_fragment_atac(
                     &r1,
                     &mut s.hs,
                     &mut s.query,

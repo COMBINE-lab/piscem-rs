@@ -38,13 +38,13 @@ pub fn run(args: BuildPoisonArgs) -> Result<()> {
     let k = index.k();
 
     let table = dispatch_on_k!(k, K => {
-        build_poison_table::<K>(&index, &args.decoys, args.threads)?
+        build_poison_table::<K, _, _>(&index, &args.decoys, args.threads)?
     });
 
     // Verify: no poison k-mers should be in the dictionary
     info!("Verifying poison table against dictionary...");
     let found_in_dict = dispatch_on_k!(k, K => {
-        verify_poison_table::<K>(&table, &index)
+        verify_poison_table::<K, _, _>(&table, &index)
     });
     if found_in_dict > 0 {
         tracing::warn!(

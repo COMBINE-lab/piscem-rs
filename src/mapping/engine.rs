@@ -12,8 +12,9 @@
 use std::collections::HashMap;
 
 use ahash::AHashMap;
-use sshash_lib::{Kmer, KmerBits};
+use sshash_lib::{Kmer, KmerBits, KmerDictionary};
 
+use crate::index::contig_table::ContigTableLike;
 use crate::index::eq_classes::ec_entry_transcript_id;
 use crate::index::reference_index::ReferenceIndex;
 use crate::mapping::binning::BinPos;
@@ -34,12 +35,12 @@ use crate::mapping::streaming_query::PiscemStreamingQuery;
 /// returns the early_stop flag from hit collection).
 ///
 /// Port of C++ `map_read()` (non-binned version).
-pub fn map_read<const K: usize, S: SketchHitInfo>(
+pub fn map_read<const K: usize, S: SketchHitInfo, D: KmerDictionary, C: ContigTableLike>(
     read_seq: &[u8],
     cache: &mut MappingCache<S>,
-    hs: &mut HitSearcher<'_>,
-    query: &mut PiscemStreamingQuery<'_, K>,
-    index: &ReferenceIndex,
+    hs: &mut HitSearcher<'_, D, C>,
+    query: &mut PiscemStreamingQuery<'_, K, D>,
+    index: &ReferenceIndex<D, C>,
     poison_state: &mut PoisonState<'_>,
     strat: SkippingStrategy,
 ) -> bool
@@ -261,12 +262,12 @@ impl<S: SketchHitInfo> Default for BinnedHitEntry<S> {
 ///
 /// Port of C++ `map_read()` with `bin_pos` overload.
 #[allow(clippy::too_many_arguments)]
-pub fn map_read_atac<const K: usize, S: SketchHitInfo>(
+pub fn map_read_atac<const K: usize, S: SketchHitInfo, D: KmerDictionary, C: ContigTableLike>(
     read_seq: &[u8],
     cache: &mut MappingCache<S>,
-    hs: &mut HitSearcher<'_>,
-    query: &mut PiscemStreamingQuery<'_, K>,
-    index: &ReferenceIndex,
+    hs: &mut HitSearcher<'_, D, C>,
+    query: &mut PiscemStreamingQuery<'_, K, D>,
+    index: &ReferenceIndex<D, C>,
     poison_state: &mut PoisonState<'_>,
     binning: &BinPos,
 ) -> bool
@@ -485,7 +486,7 @@ where
 ///
 /// Port of C++ `collect_mappings_from_hits_thr` lambda in binned `map_read`.
 #[allow(clippy::too_many_arguments)]
-fn collect_mappings_from_hits_binned<S: SketchHitInfo>(
+fn collect_mappings_from_hits_binned<S: SketchHitInfo, D: KmerDictionary, C: ContigTableLike>(
     raw_hits: &[(i32, ProjectedHits<'_>)],
     bin_hit_map: &mut HashMap<u64, BinnedHitEntry<S>>,
     num_valid_hits: &mut u32,
@@ -496,7 +497,7 @@ fn collect_mappings_from_hits_binned<S: SketchHitInfo>(
     max_stretch: i32,
     perform_ambig_filtering: bool,
     ambiguous_hit_indices: &mut Vec<u32>,
-    index: &ReferenceIndex,
+    index: &ReferenceIndex<D, C>,
     binning: &BinPos,
 ) {
     bin_hit_map.clear();
@@ -585,7 +586,7 @@ fn collect_mappings_from_hits_binned<S: SketchHitInfo>(
 ///
 /// Returns `true` for early stop (no valid targets remaining).
 #[allow(clippy::too_many_arguments)]
-fn collect_mappings_from_hits<S: SketchHitInfo>(
+fn collect_mappings_from_hits<S: SketchHitInfo, D: KmerDictionary, C: ContigTableLike>(
     raw_hits: &[(i32, ProjectedHits<'_>)],
     hit_map: &mut AHashMap<u32, S>,
     num_valid_hits: &mut u32,
@@ -596,7 +597,7 @@ fn collect_mappings_from_hits<S: SketchHitInfo>(
     max_stretch: i32,
     perform_ambig_filtering: bool,
     ambiguous_hit_indices: &mut Vec<u32>,
-    index: &ReferenceIndex,
+    index: &ReferenceIndex<D, C>,
 ) -> bool {
     hit_map.clear();
     let encoding = index.encoding();

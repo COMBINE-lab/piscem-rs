@@ -5,6 +5,9 @@
 //!
 //! Port of C++ `mapping::util::bin_pos`.
 
+use sshash_lib::KmerDictionary;
+
+use crate::index::contig_table::ContigTableLike;
 use crate::index::reference_index::ReferenceIndex;
 
 // ---------------------------------------------------------------------------
@@ -35,7 +38,12 @@ impl BinPos {
     /// Create a new binning scheme from the reference index.
     ///
     /// Matches C++ `bin_pos::compute_cum_rank()`.
-    pub fn new(index: &ReferenceIndex, bin_size: u64, overlap: u64, thr: f32) -> Self {
+    pub fn new<D: KmerDictionary, C: ContigTableLike>(
+        index: &ReferenceIndex<D, C>,
+        bin_size: u64,
+        overlap: u64,
+        thr: f32,
+    ) -> Self {
         let num_refs = index.num_refs();
         let mut cum_bin_ids = Vec::with_capacity(num_refs + 1);
         cum_bin_ids.push(0);

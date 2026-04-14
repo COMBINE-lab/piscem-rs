@@ -7,7 +7,21 @@ pub mod poison;
 mod stats;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// K-mer dictionary backend to use for mapping.
+///
+/// `Sshash` (default) uses the compact sshash dictionary loaded from the
+/// index files on disk. `Tiny` converts the loaded sshash dictionary into
+/// a hashbrown-backed `TinyDictionary` in RAM — faster per lookup, but
+/// uses more memory and incurs a conversion cost at startup.
+#[derive(Copy, Clone, Debug, ValueEnum, Default)]
+#[value(rename_all = "lowercase")]
+pub enum DictKind {
+    #[default]
+    Sshash,
+    Tiny,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "piscem-rs")]

@@ -13,8 +13,9 @@
 //! C++ reference: `piscem-cpp/include/hit_searcher.hpp`,
 //! `piscem-cpp/src/hit_searcher.cpp`.
 
-use sshash_lib::{Kmer, KmerBits};
+use sshash_lib::{Kmer, KmerBits, KmerDictionary};
 
+use crate::index::contig_table::{ContigTable, ContigTableLike};
 use crate::index::reference_index::ReferenceIndex;
 use crate::mapping::projected_hits::ProjectedHits;
 use crate::mapping::streaming_query::PiscemStreamingQuery;
@@ -238,17 +239,21 @@ impl<'a> ReadKmerIter<'a> {
 ///
 /// Given a read sequence, scans k-mers, looks them up in the dictionary, and
 /// produces a list of `(read_position, ProjectedHits)` pairs.
-pub struct HitSearcher<'idx> {
-    index: &'idx ReferenceIndex,
+pub struct HitSearcher<
+    'idx,
+    D: KmerDictionary = sshash_lib::Dictionary,
+    C: ContigTableLike = ContigTable,
+> {
+    index: &'idx ReferenceIndex<D, C>,
     k: usize,
     alt_skip: u32,
     left_hits: Vec<(i32, ProjectedHits<'idx>)>,
     right_hits: Vec<(i32, ProjectedHits<'idx>)>,
 }
 
-impl<'idx> HitSearcher<'idx> {
+impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
     /// Create a new hit searcher for the given index.
-    pub fn new(index: &'idx ReferenceIndex) -> Self {
+    pub fn new(index: &'idx ReferenceIndex<D, C>) -> Self {
         Self {
             k: index.k(),
             index,
@@ -285,7 +290,7 @@ impl<'idx> HitSearcher<'idx> {
     }
 
     /// Reference to the underlying index.
-    pub fn index(&self) -> &'idx ReferenceIndex {
+    pub fn index(&self) -> &'idx ReferenceIndex<D, C> {
         self.index
     }
 
@@ -300,7 +305,7 @@ impl<'idx> HitSearcher<'idx> {
     pub fn get_raw_hits_sketch_everykmer<const K: usize>(
         &mut self,
         read: &[u8],
-        query: &mut PiscemStreamingQuery<'_, K>,
+        query: &mut PiscemStreamingQuery<'_, K, D>,
         is_left: bool,
     ) -> bool
     where
@@ -344,7 +349,7 @@ impl<'idx> HitSearcher<'idx> {
     pub fn get_raw_hits_sketch<const K: usize>(
         &mut self,
         read: &[u8],
-        query: &mut PiscemStreamingQuery<'_, K>,
+        query: &mut PiscemStreamingQuery<'_, K, D>,
         strategy: SkippingStrategy,
         is_left: bool,
     ) -> bool
@@ -386,10 +391,10 @@ impl<'idx> HitSearcher<'idx> {
     ///
     /// Matches C++ `get_raw_hits_sketch` lines 914-1147.
     fn collect_permissive<const K: usize>(
-        index: &'idx ReferenceIndex,
+        index: &'idx ReferenceIndex<D, C>,
         k_usize: usize,
         read: &[u8],
-        query: &mut PiscemStreamingQuery<'_, K>,
+        query: &mut PiscemStreamingQuery<'_, K, D>,
         raw_hits: &mut Vec<(i32, ProjectedHits<'idx>)>,
     ) where
         Kmer<K>: KmerBits,
@@ -624,9 +629,9 @@ impl<'idx> HitSearcher<'idx> {
     ///
     /// Matches C++ `walk_safely_until` (lines 548-692).
     fn walk_safely_until<const K: usize>(
-        index: &'idx ReferenceIndex,
+        index: &'idx ReferenceIndex<D, C>,
         iter: &mut ReadKmerIter<'_>,
-        query: &mut PiscemStreamingQuery<'_, K>,
+        query: &mut PiscemStreamingQuery<'_, K, D>,
         _read: &[u8],
         end_read_pos: i32,
         raw_hits: &mut Vec<(i32, ProjectedHits<'idx>)>,
@@ -759,7 +764,7 @@ impl<'idx> HitSearcher<'idx> {
     /// regardless of whether the match succeeds.
     #[allow(clippy::too_many_arguments)]
     fn check_direct_match<const K: usize>(
-        index: &'idx ReferenceIndex,
+        index: &'idx ReferenceIndex<D, C>,
         iter: &ReadKmerIter<'_>,
         _read: &[u8],
         direction: i32,
