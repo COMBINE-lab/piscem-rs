@@ -158,6 +158,59 @@ where
         result
     }
 
+    /// Same as [`Self::lookup_at`] but caller supplies the pre-parsed canonical
+    /// k-mer bits. Skips the ASCII→2-bit parse entirely and feeds the dict
+    /// layer through its bit-level entry point.
+    #[inline]
+    pub fn lookup_at_bits(
+        &mut self,
+        canonical_bits: u64,
+        fw_is_canonical: bool,
+        fw_bytes: &[u8],
+        read_pos: i32,
+    ) -> LookupResult {
+        if read_pos != self.prev_query_pos.wrapping_add(1) {
+            self.engine.reset();
+            self.cache_end = false;
+        }
+        self.prev_query_pos = read_pos;
+
+        if self.cache_end && let Some(cache) = self.cache {
+            let canonical_hash = CanonicalKmer::new(canonical_bits);
+            if let Some(result) = cache.get(canonical_hash, fw_is_canonical) {
+                self.num_cache_hits += 1;
+                self.cache_end = false;
+                self.engine.reset();
+                return result;
+            }
+        }
+
+        let was_cache_end = self.cache_end;
+        self.cache_end = false;
+
+        let result = self.engine.lookup_bits(canonical_bits, fw_is_canonical, fw_bytes);
+
+        if was_cache_end && result.is_found() && let Some(cache) = self.cache {
+            let canonical_hash = CanonicalKmer::new(canonical_bits);
+            cache.insert(canonical_hash, &result, fw_is_canonical);
+        }
+
+        if result.is_found() {
+            let direction = result.kmer_orientation;
+            let remaining = if direction > 0 {
+                let slen = result.string_length();
+                slen.saturating_sub(result.kmer_id_in_string + self.k as u64)
+            } else {
+                result.kmer_id_in_string
+            };
+            if remaining == 0 {
+                self.cache_end = true;
+            }
+        }
+
+        result
+    }
+
     /// Look up a k-mer without position tracking (always resets engine).
     ///
     /// This is a convenience method for callers that don't track read position.
@@ -185,5 +238,26 @@ where
     #[inline]
     pub fn num_cache_hits(&self) -> u64 {
         self.num_cache_hits
+    }
+
+    /// Shift the engine's anchor along the current SPSS string by `read_offset`
+    /// read-positions (the caller must have independently verified the sequence
+    /// agreement, e.g. via a direct SPSS comparison). On success, updates
+    /// `prev_query_pos` to `new_read_pos` so a subsequent `lookup_at_bits` at
+    /// `new_read_pos + 1` stays on the streaming fast path without an engine
+    /// reset. Returns `false` when the engine has no anchor concept or the
+    /// shift would leave the current string — caller must then fall back to a
+    /// regular lookup.
+    #[inline]
+    pub fn skip_along_anchor(&mut self, read_offset: i32, new_read_pos: i32) -> bool {
+        if self.engine.skip_anchor_along_string(read_offset) {
+            self.prev_query_pos = new_read_pos;
+            // The old cache_end hint referred to the pre-skip anchor boundary;
+            // invalidate to avoid poisoning the next lookup.
+            self.cache_end = false;
+            true
+        } else {
+            false
+        }
     }
 }

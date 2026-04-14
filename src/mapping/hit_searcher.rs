@@ -402,6 +402,14 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
         let k = k_usize as i32;
         let read_len = read.len() as i32;
         let mut iter = ReadKmerIter::new(read, k_usize);
+        // Rolling canonical k-mer state, only maintained when the dictionary
+        // prefers pre-parsed bits (tiny-dict). For byte-oriented dicts (sshash)
+        // the associated const `PREFERS_BITS` is false and LLVM const-folds
+        // away all the rolling/canonicalization work after monomorphization.
+        #[allow(non_snake_case)]
+        let PREFERS_BITS: bool =
+            <D::Query<'_, K> as sshash_lib::KmerStreamingQuery>::PREFERS_BITS;
+        let mut fw_opt: Option<Kmer<K>> = None;
 
         while !iter.is_exhausted() {
             let kmer_bytes = iter.kmer_bytes();
@@ -409,18 +417,54 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
 
             // Skip homopolymers.
             if is_homopolymer(kmer_bytes) {
-                iter.advance();
+                let dist = iter.advance();
+                if PREFERS_BITS {
+                    fw_opt = if dist == 1 && !iter.is_exhausted() {
+                        fw_opt.map(|f| f.roll_right_base((iter.kmer_bytes()[K - 1] >> 1) & 3))
+                    } else {
+                        None
+                    };
+                }
                 continue;
             }
 
             // Query the index. Position tracking in PiscemStreamingQuery
             // auto-detects non-consecutive jumps and resets the engine,
             // while allowing the fast incremental path for stride-1 lookups.
-            let result = query.lookup_at(kmer_bytes, read_pos);
+            //
+            // For dictionaries that prefer pre-parsed bits (tiny), maintain
+            // a rolling `fw_kmer` and call `lookup_at_bits`. For byte-oriented
+            // dictionaries (sshash), skip that bookkeeping and just call
+            // `lookup_at` — both branches are monomorphized away.
+            let result;
+            // fw_kmer is only defined and used on the PREFERS_BITS path.
+            let fw_kmer: Kmer<K> = if PREFERS_BITS {
+                let fk = match fw_opt {
+                    Some(k) => k,
+                    None => Kmer::<K>::from_ascii_unchecked(kmer_bytes),
+                };
+                let canonical = fk.canonical();
+                let fw_bits = <Kmer<K> as KmerBits>::to_u64(fk.bits());
+                let canon_bits = <Kmer<K> as KmerBits>::to_u64(canonical.bits());
+                let fw_is_canonical = fw_bits == canon_bits;
+                result = query.lookup_at_bits(canon_bits, fw_is_canonical, kmer_bytes, read_pos);
+                fk
+            } else {
+                result = query.lookup_at(kmer_bytes, read_pos);
+                // Dead on this branch; DCE'd after monomorph.
+                Kmer::<K>::from_ascii_unchecked(kmer_bytes)
+            };
 
             if let Some(phit) = index.resolve_lookup(&result) {
                 if phit.is_empty() {
-                    iter.advance();
+                    let dist = iter.advance();
+                    if PREFERS_BITS {
+                        fw_opt = if dist == 1 && !iter.is_exhausted() {
+                            Some(fw_kmer.roll_right_base((iter.kmer_bytes()[K - 1] >> 1) & 3))
+                        } else {
+                            None
+                        };
+                    }
                     continue;
                 }
 
@@ -451,6 +495,9 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
                 let skip_dist = std::cmp::min(dist_to_read_end, dist_to_contig_end) as i32;
 
                 if skip_dist > 1 {
+                    // Complex skip paths below may jump, restore, or walk safely;
+                    // invalidate rolling state across all of them.
+                    fw_opt = None;
                     // Save backup iterator and contig position.
                     let backup_iter = iter.clone();
                     let backup_cpos = c_curr_pos_initial;
@@ -517,6 +564,12 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
                             true, // add hit if successful
                         );
                         if found_match {
+                            // The SPSS compare confirmed the read k-mer at
+                            // iter.pos() matches the anchor's unitig at an
+                            // offset of `skip_dist` read-positions. Thread the
+                            // anchor through so subsequent consecutive lookups
+                            // use the streaming fast path instead of resetting
+                            // and re-probing the hash table.
                             iter.advance();
                             continue;
                         }
@@ -612,10 +665,24 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
                 }
 
                 // skip_dist <= 1: just advance by 1.
-                iter.advance();
+                let dist = iter.advance();
+                if PREFERS_BITS {
+                    fw_opt = if dist == 1 && !iter.is_exhausted() {
+                        Some(fw_kmer.roll_right_base((iter.kmer_bytes()[K - 1] >> 1) & 3))
+                    } else {
+                        None
+                    };
+                }
             } else {
                 // Miss: advance by 1.
-                iter.advance();
+                let dist = iter.advance();
+                if PREFERS_BITS {
+                    fw_opt = if dist == 1 && !iter.is_exhausted() {
+                        Some(fw_kmer.roll_right_base((iter.kmer_bytes()[K - 1] >> 1) & 3))
+                    } else {
+                        None
+                    };
+                }
             }
         }
     }

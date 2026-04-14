@@ -219,7 +219,7 @@ where
     )?;
 
     // Create binning scheme
-    let binning = BinPos::new(&index, args.bin_size, args.bin_overlap, args.thr);
+    let binning = BinPos::new(index, args.bin_size, args.bin_overlap, args.thr);
     info!("Binning: {} total bins", binning.num_bins());
 
     // Create unmapped barcode count file
