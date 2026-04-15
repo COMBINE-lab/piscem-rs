@@ -10,6 +10,7 @@
 //! operation: `&read[offset..offset+len]`. For inferable variable-length
 //! geometries, a search phase locates the right boundary (an anchor or the read
 //! end) and resolves the variable-width span before slicing.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 use smallvec::{smallvec, SmallVec};
 
