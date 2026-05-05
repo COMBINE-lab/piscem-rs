@@ -96,3 +96,7 @@ opt-level = 3
 [profile.bench]
 inherits = "release"
 debug = true
+
+[patch.crates-io]
+sshash-lib = { path = "sshash-rs/crates/sshash-lib" }
+tiny-dict = { path = "sshash-rs/crates/tiny-dict" }

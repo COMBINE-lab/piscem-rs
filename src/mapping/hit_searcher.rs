@@ -49,24 +49,6 @@ pub(crate) enum KmerMatchType {
     TwinMatch,
 }
 
-/// Compare a read k-mer against a reference k-mer.
-///
-/// - `IdentityMatch`: `ref_kmer == read_kmer`
-/// - `TwinMatch`: `ref_kmer == read_kmer.reverse_complement()`
-/// - `NoMatch`: neither
-#[inline]
-fn kmer_match<const K: usize>(read_kmer: &Kmer<K>, ref_kmer: &Kmer<K>) -> KmerMatchType
-where
-    Kmer<K>: KmerBits,
-{
-    if ref_kmer == read_kmer {
-        KmerMatchType::IdentityMatch
-    } else if *ref_kmer == read_kmer.reverse_complement() {
-        KmerMatchType::TwinMatch
-    } else {
-        KmerMatchType::NoMatch
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -88,18 +70,6 @@ pub(crate) fn is_homopolymer(kmer: &[u8]) -> bool {
     kmer.iter().all(|&b| b == first)
 }
 
-/// Parse a k-mer from a byte slice known to contain only valid DNA bases
-/// (e.g. SPSS unitig sequence). No per-base validation is performed.
-#[inline]
-fn parse_read_kmer_unchecked<const K: usize>(bytes: &[u8]) -> Option<Kmer<K>>
-where
-    Kmer<K>: KmerBits,
-{
-    if bytes.len() != K {
-        return None;
-    }
-    Some(Kmer::<K>::from_ascii_unchecked(bytes))
-}
 
 // ---------------------------------------------------------------------------
 // ReadKmerIter
@@ -118,9 +88,50 @@ pub(crate) struct ReadKmerIter<'a> {
     pos: i32,
     /// Index of the last non-ACGT byte seen so far (init: -1).
     last_invalid: i32,
+    /// Rolling forward k-mer (2-bit encoded, position 0 at bits[0:1]).
+    fw: u64,
+    /// Rolling reverse-complement k-mer.
+    rc: u64,
+    /// Precomputed: 2 * (k - 1), shift amount for inserting new base at top.
+    fw_shift: u32,
+    /// Precomputed: (1 << 2k) - 1, mask for keeping only k bases in RC.
+    rc_mask: u64,
 }
 
 impl<'a> ReadKmerIter<'a> {
+    /// Encode a single base to 2-bit (ACTG: A=00, C=01, T=10, G=11).
+    #[inline(always)]
+    fn encode(b: u8) -> u64 {
+        ((b >> 1) & 3) as u64
+    }
+
+    /// Complement a 2-bit encoded base (A<->T, C<->G).
+    #[inline(always)]
+    fn complement(b: u64) -> u64 {
+        b ^ 0x2
+    }
+
+    /// Roll the forward and RC k-mer words by one base.
+    #[inline(always)]
+    fn roll(&mut self, new_base: u8) {
+        let b = Self::encode(new_base);
+        self.fw = (self.fw >> 2) | (b << self.fw_shift);
+        self.rc = ((self.rc << 2) | Self::complement(b)) & self.rc_mask;
+    }
+
+    /// Build fw/rc words from scratch at the current position.
+    fn build_kmer_words(&mut self) {
+        let start = self.pos as usize;
+        self.fw = 0;
+        self.rc = 0;
+        for i in 0..self.k {
+            let b = Self::encode(self.read[start + i]);
+            self.fw |= b << (2 * i);
+            let comp = Self::complement(Self::encode(self.read[start + self.k - 1 - i]));
+            self.rc |= comp << (2 * i);
+        }
+    }
+
     /// Create a new iterator. Positions at the first valid k-mer window.
     pub fn new(read: &'a [u8], k: usize) -> Self {
         let mut iter = Self {
@@ -128,6 +139,10 @@ impl<'a> ReadKmerIter<'a> {
             k,
             pos: 0,
             last_invalid: -1,
+            fw: 0,
+            rc: 0,
+            fw_shift: (2 * (k - 1)) as u32,
+            rc_mask: (1u64 << (2 * k)) - 1,
         };
         // Scan the first k-1 bases for invalid characters.
         let scan_end = k.saturating_sub(1).min(read.len());
@@ -138,6 +153,10 @@ impl<'a> ReadKmerIter<'a> {
         }
         // Find the first valid window (scan rightmost base and beyond).
         iter.find_next_valid();
+        // Build k-mer words at the first valid position.
+        if !iter.is_exhausted() {
+            iter.build_kmer_words();
+        }
         iter
     }
 
@@ -160,6 +179,33 @@ impl<'a> ReadKmerIter<'a> {
         &self.read[start..start + self.k]
     }
 
+    /// Forward k-mer word (2-bit encoded).
+    #[inline]
+    #[allow(dead_code)]
+    pub fn fw_word(&self) -> u64 {
+        self.fw
+    }
+
+    /// Reverse-complement k-mer word (2-bit encoded).
+    #[inline]
+    #[allow(dead_code)]
+    pub fn rc_word(&self) -> u64 {
+        self.rc
+    }
+
+    /// Compare rolling k-mer against a reference k-mer (uint64).
+    /// O(1) — no parsing needed.
+    #[inline]
+    pub fn is_equivalent(&self, ref_kmer_bits: u64) -> KmerMatchType {
+        if ref_kmer_bits == self.fw {
+            KmerMatchType::IdentityMatch
+        } else if ref_kmer_bits == self.rc {
+            KmerMatchType::TwinMatch
+        } else {
+            KmerMatchType::NoMatch
+        }
+    }
+
     /// Advance by one base. Returns the actual distance moved (may be > 1
     /// if N characters are skipped).
     pub fn advance(&mut self) -> i32 {
@@ -174,6 +220,11 @@ impl<'a> ReadKmerIter<'a> {
         if self.last_invalid >= self.pos {
             self.pos = self.last_invalid + 1;
             self.find_next_valid();
+            if !self.is_exhausted() {
+                self.build_kmer_words();
+            }
+        } else if !self.is_exhausted() {
+            self.roll(self.read[new_right]);
         }
         self.pos - old_pos
     }
@@ -181,14 +232,55 @@ impl<'a> ReadKmerIter<'a> {
     /// Advance by `n` bases. Returns the actual distance moved (may be > n
     /// if N characters are skipped).
     ///
-    /// Matches C++ `operator+=(n)` semantics: performs `n` individual
-    /// `advance()` steps so that each step independently handles N-skipping.
+    /// For small n, rolls incrementally. For large n (> k), rebuilds from
+    /// scratch at the target — O(k) instead of O(n).
     pub fn advance_by(&mut self, n: i32) -> i32 {
+        if n <= 0 || self.is_exhausted() {
+            return 0;
+        }
         let old_pos = self.pos;
-        for _ in 0..n {
-            self.advance();
-            if self.is_exhausted() {
-                break;
+
+        if n as usize <= self.k {
+            // Small skip: roll incrementally
+            for _ in 0..n {
+                self.advance();
+                if self.is_exhausted() {
+                    break;
+                }
+            }
+        } else {
+            // Large skip: jump and rebuild from scratch
+            let target = self.pos + n;
+            self.pos = target;
+            // Check for Ns in the new window
+            let window_end = self.pos as usize + self.k;
+            if window_end > self.read.len() {
+                // Past the end — find last valid position by scanning back
+                self.pos = target;
+                if self.pos as usize + self.k > self.read.len() {
+                    // Try to find valid position before the end
+                    self.find_next_valid();
+                    if self.is_exhausted() {
+                        return self.read.len() as i32 - old_pos;
+                    }
+                }
+            }
+            // Scan for Ns in [pos, pos+k)
+            let start = self.pos as usize;
+            let end = (start + self.k).min(self.read.len());
+            let mut last_inv = self.last_invalid;
+            for i in start..end {
+                if !is_valid_base(self.read[i]) {
+                    last_inv = i as i32;
+                }
+            }
+            self.last_invalid = last_inv;
+            if self.last_invalid >= self.pos {
+                self.pos = self.last_invalid + 1;
+                self.find_next_valid();
+            }
+            if !self.is_exhausted() {
+                self.build_kmer_words();
             }
         }
         self.pos - old_pos
@@ -770,25 +862,21 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
                             break;
                         }
                         let ref_kmer: Kmer<K> = index.dict().kmer_at_pos(c_curr_pos as usize);
-                        let read_kmer_bytes = iter.kmer_bytes();
-                        if let Some(read_kmer) = parse_read_kmer_unchecked::<K>(read_kmer_bytes) {
-                            let match_type = kmer_match(&read_kmer, &ref_kmer);
-                            matches = match_type != KmerMatchType::NoMatch;
+                        let ref_bits = <Kmer<K> as KmerBits>::to_u64(ref_kmer.bits());
+                        let match_type = iter.is_equivalent(ref_bits);
+                        matches = match_type != KmerMatchType::NoMatch;
 
-                            if matches {
-                                let hit_fw = match_type == KmerMatchType::IdentityMatch;
-                                let phit = &mut last_valid_hit.1;
-                                phit.set_resulted_from_open_search(false);
-                                phit.set_contig_orientation(hit_fw);
-                                phit.set_global_pos(
-                                    (phit.global_pos() as i64 + inc_offset as i64) as u64,
-                                );
-                                phit.set_contig_pos((phit.contig_pos() as i32 + inc_offset) as u32);
-                                last_valid_hit.0 = iter.pos();
-                                ended_on_match = dist_to_contig_end == 0;
-                            } else {
-                                break;
-                            }
+                        if matches {
+                            let hit_fw = match_type == KmerMatchType::IdentityMatch;
+                            let phit = &mut last_valid_hit.1;
+                            phit.set_resulted_from_open_search(false);
+                            phit.set_contig_orientation(hit_fw);
+                            phit.set_global_pos(
+                                (phit.global_pos() as i64 + inc_offset as i64) as u64,
+                            );
+                            phit.set_contig_pos((phit.contig_pos() as i32 + inc_offset) as u32);
+                            last_valid_hit.0 = iter.pos();
+                            ended_on_match = dist_to_contig_end == 0;
                         } else {
                             break;
                         }
@@ -863,13 +951,9 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
                 .set_contig_pos((direct_phit.contig_pos() as i32 + inc_offset as i32) as u32);
         }
 
-        // Compare read k-mer to ref k-mer.
-        let read_kmer_bytes = iter.kmer_bytes();
-        let read_kmer = match parse_read_kmer_unchecked::<K>(read_kmer_bytes) {
-            Some(k) => k,
-            None => return false,
-        };
-        let match_type = kmer_match(&read_kmer, &ref_kmer);
+        // Compare read k-mer to ref k-mer using rolling words (O(1)).
+        let ref_bits = <Kmer<K> as KmerBits>::to_u64(ref_kmer.bits());
+        let match_type = iter.is_equivalent(ref_bits);
         let matches = match_type != KmerMatchType::NoMatch;
 
         let hit_fw = match_type == KmerMatchType::IdentityMatch;
@@ -1033,24 +1117,28 @@ mod tests {
     }
 
     #[test]
-    fn test_kmer_match_identity() {
+    fn test_is_equivalent_identity() {
+        let iter = ReadKmerIter::new(b"ACGTG", 5);
         let kmer = Kmer::<5>::from_str("ACGTG").unwrap();
-        let same = Kmer::<5>::from_str("ACGTG").unwrap();
-        assert_eq!(kmer_match(&kmer, &same), KmerMatchType::IdentityMatch);
+        let bits = <Kmer<5> as KmerBits>::to_u64(kmer.bits());
+        assert_eq!(iter.is_equivalent(bits), KmerMatchType::IdentityMatch);
     }
 
     #[test]
-    fn test_kmer_match_twin() {
+    fn test_is_equivalent_twin() {
+        let iter = ReadKmerIter::new(b"ACGTG", 5);
         let kmer = Kmer::<5>::from_str("ACGTG").unwrap();
         let rc = kmer.reverse_complement();
-        assert_eq!(kmer_match(&kmer, &rc), KmerMatchType::TwinMatch);
+        let rc_bits = <Kmer<5> as KmerBits>::to_u64(rc.bits());
+        assert_eq!(iter.is_equivalent(rc_bits), KmerMatchType::TwinMatch);
     }
 
     #[test]
-    fn test_kmer_match_none() {
-        let kmer1 = Kmer::<5>::from_str("ACGTG").unwrap();
+    fn test_is_equivalent_none() {
+        let iter = ReadKmerIter::new(b"ACGTG", 5);
         let kmer2 = Kmer::<5>::from_str("TTTTT").unwrap();
-        assert_eq!(kmer_match(&kmer1, &kmer2), KmerMatchType::NoMatch);
+        let bits2 = <Kmer<5> as KmerBits>::to_u64(kmer2.bits());
+        assert_eq!(iter.is_equivalent(bits2), KmerMatchType::NoMatch);
     }
 
     #[test]
@@ -1093,12 +1181,22 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_read_kmer_unchecked() {
-        let kmer: Option<Kmer<5>> = parse_read_kmer_unchecked(b"ACGTG");
-        assert!(kmer.is_some());
+    fn test_rolling_kmer_advance() {
+        let seq = b"ACGTGTTCAA";
+        let mut iter = ReadKmerIter::new(seq, 5);
+        assert_eq!(iter.pos(), 0);
+        assert!(!iter.is_exhausted());
 
-        // Wrong length returns None
-        let bad: Option<Kmer<5>> = parse_read_kmer_unchecked(b"ACGT");
-        assert!(bad.is_none());
+        // Verify first k-mer matches what Kmer::from_str produces
+        let kmer0 = Kmer::<5>::from_str("ACGTG").unwrap();
+        let bits0 = <Kmer<5> as KmerBits>::to_u64(kmer0.bits());
+        assert_eq!(iter.is_equivalent(bits0), KmerMatchType::IdentityMatch);
+
+        // Advance and check second k-mer
+        iter.advance();
+        assert_eq!(iter.pos(), 1);
+        let kmer1 = Kmer::<5>::from_str("CGTGT").unwrap();
+        let bits1 = <Kmer<5> as KmerBits>::to_u64(kmer1.bits());
+        assert_eq!(iter.is_equivalent(bits1), KmerMatchType::IdentityMatch);
     }
 }

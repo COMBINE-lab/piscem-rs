@@ -1230,7 +1230,8 @@ dependencies = [
 [[package]]
 name = "libradicl"
 version = "0.12.2"
-source = "git+https://github.com/COMBINE-lab/libradicl.git?branch=develop#1401b18bd38cff4dc76f7257734fbe426dc8b891"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30b7867a93990aa3bd1b61ca44c925acb6a3612e6ecf9eb4e08fec35dba39257"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1253,7 +1254,8 @@ dependencies = [
 [[package]]
 name = "libradicl-macros"
 version = "0.12.2"
-source = "git+https://github.com/COMBINE-lab/libradicl.git?branch=develop#1401b18bd38cff4dc76f7257734fbe426dc8b891"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e5f9a2b93f8c382229d1a785f7dc5b61bf93f3481b24e8abd6afeed431a38f2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2515,8 +2517,6 @@ dependencies = [
 [[package]]
 name = "tiny-dict"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c04b03be6d5f684a77a23cc73e364f97c0b6ffa0060ff56cb2f7107990ea749"
 dependencies = [
  "anyhow",
  "hashbrown 0.15.5",
