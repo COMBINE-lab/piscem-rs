@@ -1,3 +1,4 @@
+pub mod bench;
 pub mod build;
 pub mod map_bulk;
 pub mod map_scatac;
@@ -69,6 +70,7 @@ enum Commands {
     BuildPoison(poison::BuildPoisonArgs),
     Stats(stats::StatsArgs),
     Parity(parity::ParityArgs),
+    LookupBench(bench::LookupBenchArgs),
 }
 
 pub fn run() -> Result<()> {
@@ -81,5 +83,6 @@ pub fn run() -> Result<()> {
         Commands::BuildPoison(args) => poison::run(args),
         Commands::Stats(args) => stats::run(args),
         Commands::Parity(args) => parity::run(args),
+        Commands::LookupBench(args) => bench::run(args),
     }
 }

@@ -100,7 +100,7 @@ impl UnitigEndCache {
 mod tests {
     use super::*;
 
-    fn make_result(string_id: u64, kmer_id: u64, orientation: i8) -> LookupResult {
+    fn make_result(string_id: u64, kmer_id: u64, orientation: i64) -> LookupResult {
         LookupResult {
             kmer_id,
             kmer_id_in_string: 5,

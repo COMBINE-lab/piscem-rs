@@ -38,7 +38,7 @@ fn test_fastq() -> std::path::PathBuf {
 #[derive(Debug, PartialEq, Eq)]
 struct CompareFields {
     is_found: bool,
-    kmer_orientation: i8,
+    kmer_orientation: i64,
     kmer_id_in_string: u64,
     string_id: u64,
     string_begin: u64,
