@@ -17,6 +17,7 @@ use pyo3::prelude::*;
 use sshash_lib::{Kmer, KmerBits, LookupResult, StreamingQuery, dispatch_on_k};
 
 use piscem_rs::index::build_poison::{build_poison_table, verify_poison_table};
+use piscem_rs::index::contig_table::ContigTable;
 use piscem_rs::index::reference_index::ReferenceIndex;
 use piscem_rs::mapping::binning::BinPos;
 use piscem_rs::mapping::cache::MappingCache;
@@ -30,6 +31,7 @@ use piscem_rs::mapping::map_fragment::{
 };
 use piscem_rs::mapping::sketch_hit_simple::SketchHitInfoSimple;
 use piscem_rs::mapping::streaming_query::PiscemStreamingQuery;
+use sshash_lib::Dictionary;
 
 // ─── MappingOpts ──────────────────────────────────────────────────────────────
 
@@ -292,7 +294,7 @@ where
 
         apply_opts(&mut self.cache_out, &self.opts);
 
-        map_se_fragment::<K, S>(
+        map_se_fragment::<K, S, Dictionary, ContigTable>(
             seq,
             &mut hs,
             &mut query,
@@ -315,7 +317,7 @@ where
         apply_opts(&mut self.cache_right, &self.opts);
         apply_opts(&mut self.cache_out, &self.opts);
 
-        map_pe_fragment::<K, S>(
+        map_pe_fragment::<K, S, Dictionary, ContigTable>(
             seq1,
             seq2,
             &mut hs,
@@ -348,7 +350,7 @@ where
 
         apply_opts(&mut self.cache_out, &self.opts);
 
-        map_se_fragment_atac::<K>(
+        map_se_fragment_atac::<K, Dictionary, ContigTable>(
             seq,
             &mut hs,
             &mut query,
@@ -371,7 +373,7 @@ where
         apply_opts(&mut self.cache_right, &self.opts);
         apply_opts(&mut self.cache_out, &self.opts);
 
-        map_pe_fragment_atac::<K>(
+        map_pe_fragment_atac::<K, Dictionary, ContigTable>(
             seq1,
             seq2,
             &mut hs,
@@ -885,6 +887,7 @@ impl PyReferenceIndex {
             canonical,
             seed: 1,
             single_mphf: false,
+            emit_tiny: None,
         };
         let out_prefix = output_prefix.to_owned();
         let has_poison = decoys.is_some();
@@ -902,13 +905,13 @@ impl PyReferenceIndex {
 
                 let k = index.k();
                 let table = dispatch_on_k!(k, K => {
-                    build_poison_table::<K>(&index, paths, threads)
+                    build_poison_table::<K, Dictionary, ContigTable>(&index, paths, threads)
                         .map_err(|e| format!("Poison table build failed: {e}"))?
                 });
 
                 // Verify: no poison k-mers should be in the dictionary
                 let found_in_dict = dispatch_on_k!(k, K => {
-                    verify_poison_table::<K>(&table, &index)
+                    verify_poison_table::<K, Dictionary, ContigTable>(&table, &index)
                 });
                 if found_in_dict > 0 {
                     return Err(format!(
