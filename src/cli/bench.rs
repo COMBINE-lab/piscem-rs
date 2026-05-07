@@ -75,6 +75,9 @@ fn run_streaming_bench<const K: usize>(
 
     let t_start = Instant::now();
 
+    let ct = ri.contig_table();
+    let mut cached_entries: Vec<u64> = Vec::with_capacity(64);
+
     for seq in sequences {
         if seq.len() < k {
             continue;
@@ -82,27 +85,24 @@ fn run_streaming_bench<const K: usize>(
         engine.reset();
         let n = seq.len() - k + 1;
         let mut prev_string_id = u64::MAX;
-        let mut cached_span: Option<crate::index::contig_table::ContigSpan<'_>> = None;
 
         for i in 0..n {
-            let kmer_bytes = &seq[i..i + k];
+            let kmer_bytes = unsafe { seq.get_unchecked(i..i + k) };
             let result = engine.lookup(kmer_bytes);
             num_kmers += 1;
             if result.is_found() {
                 found += 1;
                 if locate {
                     let string_id = result.string_id;
-                    let span = if string_id == prev_string_id {
-                        cached_span.as_ref().unwrap()
-                    } else {
+                    if string_id != prev_string_id {
                         prev_string_id = string_id;
-                        cached_span = Some(ri.contig_table().contig_entries(string_id));
-                        cached_span.as_ref().unwrap()
-                    };
-                    for entry in span.iter() {
-                        let _pos = encoding.pos(entry);
-                        let _ori = encoding.orientation(entry);
-                        decoded += 1;
+                        cached_entries.clear();
+                        for entry in ct.contig_entries(string_id).iter() {
+                            cached_entries.push(entry);
+                        }
+                    }
+                    for &entry in &cached_entries {
+                        decoded += encoding.pos(entry) as u64;
                     }
                 }
             }

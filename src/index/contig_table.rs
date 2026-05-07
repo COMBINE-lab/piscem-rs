@@ -22,9 +22,9 @@ use epserde::deser::Deserialize;
 use epserde::ser::Serialize;
 use mem_dbg::{MemSize, SizeFlags};
 use std::io::{Read, Write};
-use sux::bits::bit_field_vec::BitFieldVec;
+use sux::bits::bit_field_vec::{BitFieldVec, BitFieldVecUncheckedIter};
 use sux::dict::elias_fano::{EfSeq, EliasFanoBuilder};
-use sux::traits::IndexedSeq;
+use sux::traits::{IndexedSeq, IntoUncheckedIterator, UncheckedIterator};
 use value_traits::slices::SliceByValue;
 use value_traits::slices::SliceByValueMut;
 
@@ -201,9 +201,8 @@ impl<'a> ContigSpan<'a> {
                 start,
                 len,
             } => ContigSpanIter::Packed {
-                entries,
-                pos: start,
-                end: start + len,
+                iter: entries.into_unchecked_iter_from(start),
+                remaining: len,
             },
             ContigSpan::Inline(v) => ContigSpanIter::Inline(Some(v)),
             ContigSpan::Flat(s) => ContigSpanIter::Flat(s.iter()),
@@ -223,9 +222,8 @@ impl<'a> IntoIterator for &'a ContigSpan<'a> {
 /// Iterator over packed entries in a contig span.
 pub enum ContigSpanIter<'a> {
     Packed {
-        entries: &'a BitFieldVec<usize>,
-        pos: usize,
-        end: usize,
+        iter: BitFieldVecUncheckedIter<'a, usize, Vec<usize>>,
+        remaining: usize,
     },
     Inline(Option<u64>),
     Flat(std::slice::Iter<'a, u64>),
@@ -237,11 +235,10 @@ impl Iterator for ContigSpanIter<'_> {
     #[inline]
     fn next(&mut self) -> Option<u64> {
         match self {
-            ContigSpanIter::Packed { entries, pos, end } => {
-                if *pos < *end {
-                    let v = entries.index_value(*pos) as u64;
-                    *pos += 1;
-                    Some(v)
+            ContigSpanIter::Packed { iter, remaining } => {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    Some(unsafe { iter.next_unchecked() } as u64)
                 } else {
                     None
                 }
@@ -254,10 +251,7 @@ impl Iterator for ContigSpanIter<'_> {
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
-            ContigSpanIter::Packed { pos, end, .. } => {
-                let r = end - pos;
-                (r, Some(r))
-            }
+            ContigSpanIter::Packed { remaining, .. } => (*remaining, Some(*remaining)),
             ContigSpanIter::Inline(slot) => {
                 let r = if slot.is_some() { 1 } else { 0 };
                 (r, Some(r))
@@ -326,6 +320,7 @@ impl ContigTable {
         let end = unsafe { self.ctg_offsets.get_unchecked(contig_id as usize + 1) };
         ContigSpan::packed(&self.ctg_entries, start, end - start)
     }
+
 
     /// Approximate size in bytes of the in-memory representation.
     pub fn size_bytes(&self) -> usize {
