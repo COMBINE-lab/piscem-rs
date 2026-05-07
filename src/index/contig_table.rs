@@ -134,7 +134,7 @@ pub(crate) fn ceil_log2(n: u64) -> u64 {
 #[derive(Clone)]
 pub enum ContigSpan<'a> {
     Packed {
-        entries: &'a BitFieldVec<usize>,
+        entries: &'a BitFieldVec,
         start: usize,
         len: usize,
     },
@@ -145,7 +145,7 @@ pub enum ContigSpan<'a> {
 impl<'a> ContigSpan<'a> {
     /// Construct a `Packed` span (the common [`ContigTable`] case).
     #[inline]
-    pub(crate) fn packed(entries: &'a BitFieldVec<usize>, start: usize, len: usize) -> Self {
+    pub(crate) fn packed(entries: &'a BitFieldVec, start: usize, len: usize) -> Self {
         ContigSpan::Packed {
             entries,
             start,
@@ -222,7 +222,7 @@ impl<'a> IntoIterator for &'a ContigSpan<'a> {
 /// Iterator over packed entries in a contig span.
 pub enum ContigSpanIter<'a> {
     Packed {
-        iter: BitFieldVecUncheckedIter<'a, usize, Vec<usize>>,
+        iter: BitFieldVecUncheckedIter<'a, Vec<usize>>,
         remaining: usize,
     },
     Inline(Option<u64>),
@@ -280,7 +280,7 @@ pub struct ContigTable {
     /// `[ctg_offsets[i], ctg_offsets[i+1])`.
     ctg_offsets: EfSeq,
     /// Bit-packed entry vector. Each entry is `ref_len_bits + num_ref_bits + 1` bits.
-    ctg_entries: BitFieldVec<usize>,
+    ctg_entries: BitFieldVec,
 }
 
 impl ContigTable {
@@ -401,7 +401,7 @@ impl ContigTable {
     }
 }
 
-const CONTIG_TABLE_MAGIC: &[u8; 8] = b"PCTAB02\0";
+const CONTIG_TABLE_MAGIC: &[u8; 8] = b"PCTAB03\0";
 
 fn read_u64_le<R: Read>(reader: &mut R) -> std::io::Result<u64> {
     let mut buf = [0u8; 8];
@@ -607,7 +607,7 @@ impl ContigTableBuilder {
 pub struct ContigTableDirectBuilder {
     encoding: EntryEncoding,
     ctg_offsets: EfSeq,
-    ctg_entries: BitFieldVec<usize>,
+    ctg_entries: BitFieldVec,
     /// Per-unitig write cursor (index into ctg_entries).
     cursors: Vec<u64>,
 }

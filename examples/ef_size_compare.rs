@@ -105,7 +105,7 @@ fn run_test(n: usize, max_val: u64) {
     );
 
     // Breakdown of data structures
-    let (n_ef, u_ef, l_ef, _low_bits, _high_bits) = ef.clone().into_parts();
+    let (n_ef, u_ef, l_ef, _low_bits, _high_bits, _first, _last) = ef.clone().into_parts();
     println!("  EliasFano breakdown:");
     println!(
         "    n={}, u={}, l={} (low bits per element)",

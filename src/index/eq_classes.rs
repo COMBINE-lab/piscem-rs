@@ -77,7 +77,7 @@ impl Orientation {
 /// Corresponds to the C++ `sshash::util::ec_span`.
 #[derive(Clone)]
 pub struct EcSpan<'a> {
-    entries: &'a BitFieldVec<usize>,
+    entries: &'a BitFieldVec,
     start: usize,
     len: usize,
 }
@@ -135,7 +135,7 @@ impl<'a> IntoIterator for &'a EcSpan<'a> {
 
 /// Iterator over packed entries in an EC span.
 pub struct EcSpanIter<'a> {
-    entries: &'a BitFieldVec<usize>,
+    entries: &'a BitFieldVec,
     pos: usize,
     end: usize,
 }
@@ -175,12 +175,12 @@ impl ExactSizeIterator for EcSpanIter<'_> {}
 /// Corresponds to the C++ `equivalence_class_map`.
 pub struct EqClassMap {
     /// Maps tile (contig) ID → equivalence class ID.
-    tile_ec_ids: BitFieldVec<usize>,
+    tile_ec_ids: BitFieldVec,
     /// Elias-Fano encoded cumulative offsets into `label_entries`.
     /// Length = num_ecs + 1.
     label_list_offsets: EfSeq,
     /// Packed label entries: `(transcript_id << 2) | orientation_bits`.
-    label_entries: BitFieldVec<usize>,
+    label_entries: BitFieldVec,
 }
 
 impl EqClassMap {
@@ -312,7 +312,7 @@ impl EqClassMap {
     }
 }
 
-const EC_TABLE_MAGIC: &[u8; 8] = b"PECTB02\0";
+const EC_TABLE_MAGIC: &[u8; 8] = b"PECTB03\0";
 
 impl std::fmt::Debug for EqClassMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

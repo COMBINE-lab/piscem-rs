@@ -11,9 +11,9 @@ license-file = "LICENSE"
 repository = "https://github.com/COMBINE-lab/sshash-rs"
 
 [workspace.dependencies]
-sshash-lib = { version = "0.5.0", git = "https://github.com/COMBINE-lab/sshash-rs.git", branch = "dev" }
-tiny-dict = { version = "0.5.0", git = "https://github.com/COMBINE-lab/sshash-rs.git", branch = "dev" }
-sux = { version = "0.13.1", features = ["epserde"] }
+sshash-lib = { version = "0.6.0" }
+tiny-dict = { version = "0.6.0" }
+sux = { version = "0.14.0", features = ["epserde"] }
 ph = { package = "ph-temp", version = "0.12.0", default-features = false, features = ["rapidhash"] }
 needletail = "0.6"
 anyhow = "1.0"
@@ -66,8 +66,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sshash-lib = "0.5"
-tiny-dict = "0.5"
+sshash-lib = "0.6"
+tiny-dict = "0.6"
 
 # Fast hashing with deterministic seeding (same version as sshash-rs)
 ahash = "0.8"
@@ -86,10 +86,10 @@ flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 indicatif = "0.18"
 
 # Succinct data structures (same versions as sshash-rs)
-sux = { version = "0.13.1", features = ["epserde"] }
-epserde = "0.12"
+sux = { version = "0.14.0", features = ["epserde"] }
+epserde = "0.12.5"
 value-traits = "0.2"
-mem_dbg = "0.4.0"
+mem_dbg = "0.4.1"
 
 # RAD file parsing — optional, enabled by parity-test feature
 libradicl = { version = "0.12", optional = true }
@@ -123,5 +123,6 @@ inherits = "release"
 debug = true
 
 [patch.crates-io]
-sshash-lib = { git = "https://github.com/COMBINE-lab/sshash-rs.git", branch = "dev" }
-tiny-dict = { git = "https://github.com/COMBINE-lab/sshash-rs.git", branch = "dev" }
+# Uncomment to use local sshash-rs checkout for development:
+# sshash-lib = { path = "sshash-rs/crates/sshash-lib" }
+# tiny-dict = { path = "sshash-rs/crates/tiny-dict" }

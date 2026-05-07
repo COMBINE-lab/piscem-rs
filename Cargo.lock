@@ -293,6 +293,20 @@ name = "bytemuck"
 version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
+dependencies = [
+ "bytemuck_derive",
+]
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9abbd1bc6865053c427f7198e6af43bfdedc55ab791faed4fbd361d789575ff"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
 
 [[package]]
 name = "byteorder"
@@ -695,9 +709,9 @@ dependencies = [
 
 [[package]]
 name = "dsi-progress-logger"
-version = "0.8.2"
+version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc2f08728b2005dd95f078e2d775a91b5339839833057b6404b58f47e6ee6ac5"
+checksum = "fa66984aaf46be4aa18df96e29fe354845cc4255e148bbfda92e73aea7cb0399"
 dependencies = [
  "log",
  "num-format",
@@ -760,9 +774,9 @@ dependencies = [
 
 [[package]]
 name = "epserde"
-version = "0.12.4"
+version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "650f525bdef228c12e3c120fe4546a558fbd047559b24f379cb9d59c38916873"
+checksum = "8ff5a6355056c6e9891ee495ceff242a1dde4bf10b49454f71ff619c8b6e8256"
 dependencies = [
  "anyhow",
  "bitflags",
@@ -1218,6 +1232,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
 name = "libmimalloc-sys"
 version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1309,9 +1329,9 @@ checksum = "59dbb09ed53f8e4f314e353dc6c1853ae5b4c480a668a422657804a544ea9f65"
 
 [[package]]
 name = "mem_dbg"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ef3b1b6f145e29e92dc3d18245560275569e34bcde7f53262cb25b49f084166"
+checksum = "c311226ce5141f28d88a455aad53327b8ef64f7804b08044fd9baa2796f8f018"
 dependencies = [
  "bitflags",
  "hashbrown 0.16.1",
@@ -1321,9 +1341,9 @@ dependencies = [
 
 [[package]]
 name = "mem_dbg-derive"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d8390caa039976e204779bd54284d813fba2625f14d1f7ff568a2ea14646539"
+checksum = "5d54bfdd5d73f1ada049878d66c268d4b0a0451038cf316e9ba53038a7884263"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2246,8 +2266,9 @@ checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
 
 [[package]]
 name = "sshash-lib"
-version = "0.5.0"
-source = "git+https://github.com/COMBINE-lab/sshash-rs.git?branch=dev#80377accea53c7925324ce8768cdeb7d13a523f8"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b29fe9ec9a93a3c9f522a229f6e16895e05c067d67a4fa173dafc197bcced133"
 dependencies = [
  "anyhow",
  "epserde",
@@ -2303,14 +2324,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "sux"
-version = "0.13.1"
+name = "succinctly"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d309e0e4aaaa9112cea777ac5ef256a9babc970d362e7d83b5bcee2e464d127"
+checksum = "efed1dfd86bb1bafeba986d5cb77f0f38924438b833c5cc3977a2afbd7e26536"
+dependencies = [
+ "bytemuck",
+ "indexmap",
+ "libm",
+]
+
+[[package]]
+name = "sux"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c7bb0732ef419ea39063a3f345cd5feea30765842354d52d709e28fb04cceec"
 dependencies = [
  "ambassador",
  "anyhow",
  "arbitrary-chunks",
+ "arrayvec",
  "atomic-primitive",
  "bitflags",
  "crossbeam-channel",
@@ -2333,6 +2366,8 @@ dependencies = [
  "rand",
  "rayon",
  "rdst",
+ "succinctly",
+ "sync-cell-slice",
  "tempfile",
  "thiserror 2.0.18",
  "thread-priority",
@@ -2365,6 +2400,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sync-cell-slice"
+version = "0.9.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cf9ace719a3856838781680d5d677c612e01a0bc0b7b1ded355057ca5015997"
+
+[[package]]
 name = "sysctl"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2380,9 +2421,9 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
-version = "0.35.2"
+version = "0.36.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c3ffa3e4ff2b324a57f7aeb3c349656c7b127c3c189520251a648102a92496e"
+checksum = "252800745060e7b9ffb7b2badbd8b31cfa4aa2e61af879d0a3bf2a317c20217d"
 dependencies = [
  "libc",
  "memchr",
@@ -2496,8 +2537,9 @@ dependencies = [
 
 [[package]]
 name = "tiny-dict"
-version = "0.5.0"
-source = "git+https://github.com/COMBINE-lab/sshash-rs.git?branch=dev#80377accea53c7925324ce8768cdeb7d13a523f8"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ac432126e3b69328f095d2ed7bee8c2c2ebcca75109a8c7b780fc214ff29dc9"
 dependencies = [
  "anyhow",
  "hashbrown 0.15.5",
