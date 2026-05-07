@@ -2247,6 +2247,7 @@ checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
 [[package]]
 name = "sshash-lib"
 version = "0.5.0"
+source = "git+https://github.com/COMBINE-lab/sshash-rs.git?branch=dev#80377accea53c7925324ce8768cdeb7d13a523f8"
 dependencies = [
  "anyhow",
  "epserde",
@@ -2496,6 +2497,7 @@ dependencies = [
 [[package]]
 name = "tiny-dict"
 version = "0.5.0"
+source = "git+https://github.com/COMBINE-lab/sshash-rs.git?branch=dev#80377accea53c7925324ce8768cdeb7d13a523f8"
 dependencies = [
  "anyhow",
  "hashbrown 0.15.5",
