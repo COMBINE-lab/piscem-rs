@@ -104,6 +104,12 @@ fn parse_tile(tok: &str) -> Result<Tile> {
     }
 }
 
+#[derive(Default)]
+struct ReferenceMetadata {
+    short_refs: Vec<(String, u64)>,
+    untiled_refs: HashMap<String, u64>,
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -311,6 +317,7 @@ fn first_pass_cf_seq(
     k: usize,
     id_to_info: &mut HashMap<u64, SegmentInfo>,
 ) -> Result<(Vec<String>, Vec<u64>, u64)> {
+    let metadata = parse_reference_metadata(json_path)?;
     let file = std::fs::File::open(cf_seq_path)
         .with_context(|| format!("failed to open {cf_seq_path}"))?;
     let reader = std::io::BufReader::new(file);
@@ -323,7 +330,7 @@ fn first_pass_cf_seq(
     for (line_num, line_result) in reader.lines().enumerate() {
         let line = line_result
             .with_context(|| format!("failed to read line {} of {cf_seq_path}", line_num + 1))?;
-        let line = line.trim();
+        let line = line.trim_end_matches(['\n', '\r']);
         if line.is_empty() {
             continue;
         }
@@ -341,7 +348,9 @@ fn first_pass_cf_seq(
 
         // Parse tiles to compute reference length and count per-unitig occurrences
         let mut current_offset: u64 = 0;
+        let mut saw_tile = false;
         for tok in tiles_str.split_whitespace() {
+            saw_tile = true;
             match parse_tile(tok)? {
                 Tile::Segment { id, .. } => {
                     let info = id_to_info.get_mut(&id).with_context(|| {
@@ -359,7 +368,17 @@ fn first_pass_cf_seq(
             }
         }
 
-        let ref_len = current_offset + k_minus_1;
+        let ref_len = if saw_tile {
+            current_offset + k_minus_1
+        } else {
+            metadata.untiled_refs.get(name).copied().with_context(|| {
+                format!(
+                    "line {} has no tiles; expected '{}'-length entry in JSON metadata key 'untiled seqs'",
+                    line_num + 1,
+                    name
+                )
+            })?
+        };
         max_ref_len = max_ref_len.max(ref_len);
         ref_names.push(name.to_string());
         ref_lens.push(ref_len);
@@ -369,8 +388,8 @@ fn first_pass_cf_seq(
         }
     }
 
-    // Parse JSON for short references
-    parse_short_refs(json_path, &mut ref_names, &mut ref_lens, &mut max_ref_len)?;
+    // Append short references from JSON metadata.
+    append_short_refs(&metadata, &mut ref_names, &mut ref_lens, &mut max_ref_len);
 
     Ok((ref_names, ref_lens, max_ref_len))
 }
@@ -396,7 +415,7 @@ fn second_pass_cf_seq(
 
     for line_result in reader.lines() {
         let line = line_result?;
-        let line = line.trim();
+        let line = line.trim_end_matches(['\n', '\r']);
         if line.is_empty() {
             continue;
         }
@@ -440,21 +459,17 @@ fn second_pass_cf_seq(
 // JSON short references
 // ---------------------------------------------------------------------------
 
-/// Parse short references from the cuttlefish .json metadata file.
+/// Parse reference metadata from the cuttlefish .json sidecar.
 ///
-/// Short references (shorter than k) are not part of the tiling and are
-/// stored separately in the JSON under the `"short seqs"` key.
-fn parse_short_refs(
-    json_path: &str,
-    ref_names: &mut Vec<String>,
-    ref_lens: &mut Vec<u64>,
-    max_ref_len: &mut u64,
-) -> Result<()> {
+/// Supported keys:
+/// - `"short seqs"` / `"short refs"`: references shorter than `k`
+/// - `"untiled seqs"`: references present in `.cf_seq` but with no tile list
+fn parse_reference_metadata(json_path: &str) -> Result<ReferenceMetadata> {
     let file = match std::fs::File::open(json_path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             info!("  No JSON metadata file found at {json_path}");
-            return Ok(());
+            return Ok(ReferenceMetadata::default());
         }
         Err(e) => return Err(e).with_context(|| format!("failed to open {json_path}")),
     };
@@ -462,9 +477,10 @@ fn parse_short_refs(
     let json: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(file))
         .with_context(|| format!("failed to parse {json_path}"))?;
 
+    let mut metadata = ReferenceMetadata::default();
+
     // Check for "short seqs" (cuttlefish 2.x) or "short refs" (older versions)
     let short_refs = json.get("short seqs").or_else(|| json.get("short refs"));
-
     if let Some(entries) = short_refs.and_then(|v| v.as_array()) {
         for entry in entries {
             let arr = entry
@@ -477,14 +493,44 @@ fn parse_short_refs(
             let len = arr[1]
                 .as_u64()
                 .context("short seqs length is not a number")?;
-            ref_names.push(name.to_string());
-            ref_lens.push(len);
-            *max_ref_len = (*max_ref_len).max(len);
+            metadata.short_refs.push((name.to_string(), len));
         }
         info!("  {} short references from JSON", entries.len());
     }
 
-    Ok(())
+    if let Some(entries) = json.get("untiled seqs").and_then(|v| v.as_array()) {
+        for entry in entries {
+            let arr = entry
+                .as_array()
+                .context("untiled seqs entry is not an array")?;
+            if arr.len() != 2 {
+                bail!("untiled seqs entry has {} elements, expected 2", arr.len());
+            }
+            let name = arr[0]
+                .as_str()
+                .context("untiled seqs name is not a string")?;
+            let len = arr[1]
+                .as_u64()
+                .context("untiled seqs length is not a number")?;
+            metadata.untiled_refs.insert(name.to_string(), len);
+        }
+        info!("  {} untiled references from JSON", entries.len());
+    }
+
+    Ok(metadata)
+}
+
+fn append_short_refs(
+    metadata: &ReferenceMetadata,
+    ref_names: &mut Vec<String>,
+    ref_lens: &mut Vec<u64>,
+    max_ref_len: &mut u64,
+) {
+    for (name, len) in &metadata.short_refs {
+        ref_names.push(name.clone());
+        ref_lens.push(*len);
+        *max_ref_len = (*max_ref_len).max(*len);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +540,7 @@ fn parse_short_refs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_parse_tile_forward() {
@@ -602,65 +649,45 @@ mod tests {
     }
 
     #[test]
-    fn test_short_refs_json() {
+    fn test_reference_metadata_json() {
         let dir = std::env::temp_dir().join("piscem_rs_test_build");
         std::fs::create_dir_all(&dir).unwrap();
-        let json_path = dir.join("test_short_refs.json");
+        let json_path = dir.join("test_reference_metadata.json");
 
         let json = r#"{
             "parameters info": {"k": 31},
             "short seqs": [
                 ["short_ref_1", 12],
                 ["short_ref_2", 25]
+            ],
+            "untiled seqs": [
+                ["all_n_1", 337],
+                ["all_n_2", 91]
             ]
         }"#;
         std::fs::write(&json_path, json).unwrap();
 
-        let mut names = vec!["existing".to_string()];
-        let mut lens = vec![1000u64];
-        let mut max_len = 1000u64;
+        let metadata = parse_reference_metadata(json_path.to_str().unwrap()).unwrap();
 
-        parse_short_refs(
-            json_path.to_str().unwrap(),
-            &mut names,
-            &mut lens,
-            &mut max_len,
-        )
-        .unwrap();
-
-        assert_eq!(names.len(), 3);
-        assert_eq!(names[1], "short_ref_1");
-        assert_eq!(names[2], "short_ref_2");
-        assert_eq!(lens[1], 12);
-        assert_eq!(lens[2], 25);
-        // Short refs are smaller than existing max
-        assert_eq!(max_len, 1000);
+        assert_eq!(metadata.short_refs.len(), 2);
+        assert_eq!(metadata.short_refs[0], ("short_ref_1".to_string(), 12));
+        assert_eq!(metadata.short_refs[1], ("short_ref_2".to_string(), 25));
+        assert_eq!(metadata.untiled_refs.get("all_n_1"), Some(&337));
+        assert_eq!(metadata.untiled_refs.get("all_n_2"), Some(&91));
 
         // Cleanup
         std::fs::remove_file(&json_path).ok();
     }
 
     #[test]
-    fn test_short_refs_json_missing_file() {
-        let mut names = Vec::new();
-        let mut lens = Vec::new();
-        let mut max_len = 0u64;
-
-        // Should not error if file doesn't exist
-        parse_short_refs(
-            "/nonexistent/path.json",
-            &mut names,
-            &mut lens,
-            &mut max_len,
-        )
-        .unwrap();
-
-        assert!(names.is_empty());
-        assert!(lens.is_empty());
+    fn test_reference_metadata_json_missing_file() {
+        let metadata = parse_reference_metadata("/nonexistent/path.json").unwrap();
+        assert!(metadata.short_refs.is_empty());
+        assert!(metadata.untiled_refs.is_empty());
     }
 
     #[test]
-    fn test_short_refs_json_no_short_seqs() {
+    fn test_reference_metadata_json_no_short_seqs() {
         let dir = std::env::temp_dir().join("piscem_rs_test_build");
         std::fs::create_dir_all(&dir).unwrap();
         let json_path = dir.join("test_no_short_refs.json");
@@ -668,21 +695,89 @@ mod tests {
         let json = r#"{"parameters info": {"k": 31}}"#;
         std::fs::write(&json_path, json).unwrap();
 
-        let mut names = Vec::new();
-        let mut lens = Vec::new();
-        let mut max_len = 0u64;
+        let metadata = parse_reference_metadata(json_path.to_str().unwrap()).unwrap();
+        assert!(metadata.short_refs.is_empty());
+        assert!(metadata.untiled_refs.is_empty());
 
-        parse_short_refs(
+        std::fs::remove_file(&json_path).ok();
+    }
+
+    #[test]
+    fn test_first_pass_cf_seq_preserves_empty_tiles_field() {
+        let dir = tempdir().unwrap();
+        let cf_seq_path = dir.path().join("empty_tiles.cf_seq");
+        let json_path = dir.path().join("empty_tiles.json");
+
+        std::fs::write(&cf_seq_path, "Reference:N_Sequence:all_n\t\n").unwrap();
+        std::fs::write(&json_path, r#"{"untiled seqs":[["all_n",337]]}"#).unwrap();
+
+        let mut id_to_info = HashMap::new();
+        let (names, lens, max_ref_len) = first_pass_cf_seq(
+            cf_seq_path.to_str().unwrap(),
             json_path.to_str().unwrap(),
-            &mut names,
-            &mut lens,
-            &mut max_len,
+            31,
+            &mut id_to_info,
         )
         .unwrap();
 
-        assert!(names.is_empty());
+        assert_eq!(names, vec!["all_n".to_string()]);
+        assert_eq!(lens, vec![337]);
+        assert_eq!(max_ref_len, 337);
+    }
 
-        std::fs::remove_file(&json_path).ok();
+    #[test]
+    fn test_first_pass_cf_seq_rejects_empty_tiles_without_metadata() {
+        let dir = tempdir().unwrap();
+        let cf_seq_path = dir.path().join("missing_untiled_metadata.cf_seq");
+        let json_path = dir.path().join("missing_untiled_metadata.json");
+
+        std::fs::write(&cf_seq_path, "Reference:N_Sequence:all_n\t\n").unwrap();
+        std::fs::write(&json_path, "{}").unwrap();
+
+        let mut id_to_info = HashMap::new();
+        let err = first_pass_cf_seq(
+            cf_seq_path.to_str().unwrap(),
+            json_path.to_str().unwrap(),
+            31,
+            &mut id_to_info,
+        )
+        .unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("untiled seqs"));
+    }
+
+    #[test]
+    fn test_second_pass_cf_seq_counts_empty_tiles_reference() {
+        let dir = tempdir().unwrap();
+        let cf_seq_path = dir.path().join("empty_tiles_then_segment.cf_seq");
+
+        std::fs::write(
+            &cf_seq_path,
+            "Reference:N_Sequence:all_n\t\nReference:N_Sequence:segmented\t7+\n",
+        )
+        .unwrap();
+
+        let mut id_to_info = HashMap::new();
+        id_to_info.insert(
+            7,
+            SegmentInfo {
+                rank: 0,
+                len: 35,
+                count: 1,
+            },
+        );
+
+        let mut builder = ContigTableDirectBuilder::new(&[1], 64, 2);
+        second_pass_cf_seq(cf_seq_path.to_str().unwrap(), 31, &id_to_info, &mut builder).unwrap();
+        let contig_table = builder.build();
+        let encoding = contig_table.encoding();
+        let entries: Vec<u64> = contig_table.contig_entries(0).iter().collect();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(encoding.transcript_id(entries[0]), 1);
+        assert_eq!(encoding.pos(entries[0]), 0);
+        assert!(encoding.orientation(entries[0]));
     }
 
     #[test]
