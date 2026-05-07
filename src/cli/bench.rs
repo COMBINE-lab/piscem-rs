@@ -172,8 +172,8 @@ fn run_point_bench<const K: usize>(
                 found += 1;
                 if let Some(proj_hits) = ri.resolve_lookup(&result) {
                     for entry in proj_hits.ref_range().iter() {
-                        let _ref_pos = proj_hits.decode_hit(entry, &encoding);
-                        decoded += 1;
+                        let ref_pos = proj_hits.decode_hit(entry, &encoding);
+                        decoded += ref_pos.pos as u64;
                     }
                 }
             }
