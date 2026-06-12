@@ -36,6 +36,11 @@ pub struct MappingCache<S: SketchHitInfo> {
     pub attempt_occ_recover: bool,
     /// Maximum number of accepted mappings before discarding the read.
     pub max_read_occ: usize,
+    /// Lower bound of the accepted paired fragment-length window in
+    /// `merge_se_mappings` (the upper bound is fixed at 2000). Default `-32`
+    /// (piscem's small-dovetail tolerance); set to a more negative value
+    /// (e.g. `-read_len`) to admit dovetailed fragments (salmon `--allowDovetail`).
+    pub min_frag_len: i32,
     /// K-mer size.
     pub k: usize,
     /// Maximum equivalence class cardinality for ambiguous hit filtering.
@@ -65,6 +70,7 @@ impl<S: SketchHitInfo> MappingCache<S> {
             max_hit_occ_recover,
             attempt_occ_recover: max_hit_occ_recover > max_hit_occ,
             max_read_occ: 2500,
+            min_frag_len: -32,
             k,
             max_ec_card: 4096,
             has_matching_kmers: false,

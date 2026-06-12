@@ -21,6 +21,10 @@ use crate::mapping::hits::{MappingType, SimpleHit, SketchHitInfo};
 /// 5. Output: `MappedPair`, `MappedFirstOrphan`, `MappedSecondOrphan`, or `Unmapped`
 ///
 /// Port of C++ `merge_se_mappings()`.
+/// The accepted fragment-length window lower bound is taken from
+/// `cache_left.min_frag_len` (default `-32`, piscem's small-dovetail tolerance);
+/// set it to a more negative value (e.g. `-read_len`) to admit dovetailed
+/// fragments, matching salmon's `--allowDovetail`. The upper bound is 2000.
 pub fn merge_se_mappings<S: SketchHitInfo>(
     cache_left: &mut MappingCache<S>,
     cache_right: &mut MappingCache<S>,
@@ -32,6 +36,7 @@ pub fn merge_se_mappings<S: SketchHitInfo>(
 
     let had_matching_kmers_left = cache_left.has_matching_kmers;
     let had_matching_kmers_right = cache_right.has_matching_kmers;
+    let min_frag_len = cache_left.min_frag_len;
 
     let num_accepted_left = cache_left.accepted_hits.len();
     let num_accepted_right = cache_right.accepted_hits.len();
@@ -69,6 +74,7 @@ pub fn merge_se_mappings<S: SketchHitInfo>(
             right_rc,
             left_len,
             right_len,
+            min_frag_len,
             &mut cache_out.accepted_hits,
         );
 
@@ -78,6 +84,7 @@ pub fn merge_se_mappings<S: SketchHitInfo>(
             right_fw,
             left_len,
             right_len,
+            min_frag_len,
             &mut cache_out.accepted_hits,
         );
 
@@ -349,6 +356,7 @@ fn merge_lists(
     list2: &[SimpleHit],
     left_len: i32,
     right_len: i32,
+    min_frag_len: i32,
     out: &mut Vec<SimpleHit>,
 ) {
     let mut i1 = 0;
@@ -371,7 +379,7 @@ fn merge_lists(
                 };
                 let frag_len = pos_rc - pos_fw;
 
-                if frag_len > -32 && frag_len < 2000 {
+                if frag_len > min_frag_len && frag_len < 2000 {
                     let right_is_rc = !list2[i2].is_fw;
                     let tlen = if right_is_rc {
                         (list2[i2].pos + right_len - list1[i1].pos) + 1
