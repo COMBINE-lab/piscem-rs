@@ -37,6 +37,10 @@ pub fn merge_se_mappings<S: SketchHitInfo>(
     let had_matching_kmers_left = cache_left.has_matching_kmers;
     let had_matching_kmers_right = cache_right.has_matching_kmers;
     let min_frag_len = cache_left.min_frag_len;
+    // When `relaxed_orphans` is set, the `!had_matching_kmers` gate below is
+    // bypassed: a pair is orphaned whenever exactly one mate has an accepted
+    // target (default `false` preserves piscem's strict rule).
+    let relaxed_orphans = cache_left.relaxed_orphans;
 
     let num_accepted_left = cache_left.accepted_hits.len();
     let num_accepted_right = cache_right.accepted_hits.len();
@@ -93,14 +97,14 @@ pub fn merge_se_mappings<S: SketchHitInfo>(
         } else {
             MappingType::Unmapped
         };
-    } else if num_accepted_left > 0 && !had_matching_kmers_right {
+    } else if num_accepted_left > 0 && (relaxed_orphans || !had_matching_kmers_right) {
         std::mem::swap(&mut cache_left.accepted_hits, &mut cache_out.accepted_hits);
         cache_out.map_type = if !cache_out.accepted_hits.is_empty() {
             MappingType::MappedFirstOrphan
         } else {
             MappingType::Unmapped
         };
-    } else if num_accepted_right > 0 && !had_matching_kmers_left {
+    } else if num_accepted_right > 0 && (relaxed_orphans || !had_matching_kmers_left) {
         std::mem::swap(&mut cache_right.accepted_hits, &mut cache_out.accepted_hits);
         cache_out.map_type = if !cache_out.accepted_hits.is_empty() {
             MappingType::MappedSecondOrphan

@@ -41,6 +41,12 @@ pub struct MappingCache<S: SketchHitInfo> {
     /// (piscem's small-dovetail tolerance); set to a more negative value
     /// (e.g. `-read_len`) to admit dovetailed fragments (salmon `--allowDovetail`).
     pub min_frag_len: i32,
+    /// Orphan policy for `merge_se_mappings`. Default `false` = piscem's strict
+    /// rule (orphan a pair only when the other mate had *no matching k-mers*).
+    /// `true` orphans whenever exactly one mate has an accepted target,
+    /// regardless of the other mate's k-mers (used by salmon's sketch path,
+    /// where it improves agreement with selective alignment).
+    pub relaxed_orphans: bool,
     /// K-mer size.
     pub k: usize,
     /// Maximum equivalence class cardinality for ambiguous hit filtering.
@@ -71,6 +77,7 @@ impl<S: SketchHitInfo> MappingCache<S> {
             attempt_occ_recover: max_hit_occ_recover > max_hit_occ,
             max_read_occ: 2500,
             min_frag_len: -32,
+            relaxed_orphans: false,
             k,
             max_ec_card: 4096,
             has_matching_kmers: false,
