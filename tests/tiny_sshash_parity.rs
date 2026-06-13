@@ -62,7 +62,10 @@ impl From<&LookupResult> for CompareFields {
 fn tiny_sshash_lookup_parity_on_test_reads() {
     let index_prefix = index_prefix();
     if !index_prefix.with_extension("ssi").exists() {
-        eprintln!("Skipping: sshash index not found at {}", index_prefix.display());
+        eprintln!(
+            "Skipping: sshash index not found at {}",
+            index_prefix.display()
+        );
         return;
     }
     let index_prefix = index_prefix.as_path();
@@ -137,7 +140,10 @@ fn tiny_sshash_lookup_parity_on_test_reads() {
 fn tiny_sshash_contig_entries_parity() {
     let index_prefix = index_prefix();
     if !index_prefix.with_extension("ssi").exists() {
-        eprintln!("Skipping: sshash index not found at {}", index_prefix.display());
+        eprintln!(
+            "Skipping: sshash index not found at {}",
+            index_prefix.display()
+        );
         return;
     }
     let index_prefix = index_prefix.as_path();

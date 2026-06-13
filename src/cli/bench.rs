@@ -113,7 +113,11 @@ fn run_streaming_bench<const K: usize>(
     let ns_per_kmer = elapsed.as_nanos() as f64 / num_kmers as f64;
     let stats = engine.stats();
 
-    let label = if locate { "streaming lookup+locate" } else { "streaming lookup" };
+    let label = if locate {
+        "streaming lookup+locate"
+    } else {
+        "streaming lookup"
+    };
     println!("==== {} report (piscem-rs):", label);
     println!("num_kmers = {}", num_kmers);
     println!(
@@ -202,8 +206,7 @@ fn run_point_bench<const K: usize>(
 pub fn run(args: LookupBenchArgs) -> Result<()> {
     let prefix = PathBuf::from(&args.index);
     info!("Loading index from {}", prefix.display());
-    let ri: ReferenceIndex<Dictionary, ContigTable> =
-        ReferenceIndex::load(&prefix, false, false)?;
+    let ri: ReferenceIndex<Dictionary, ContigTable> = ReferenceIndex::load(&prefix, false, false)?;
     let k = ri.k();
     info!("Index loaded: k={}, {} contigs", k, ri.num_contigs());
 

@@ -8,8 +8,8 @@
 
 use anyhow::{Context, Result};
 use sshash_lib::{Dictionary, Kmer, KmerBits, KmerDictionary};
-use tiny_dict::TinyDictionary;
 use std::path::{Path, PathBuf};
+use tiny_dict::TinyDictionary;
 use tracing::{info, warn};
 
 use super::contig_table::{ContigTable, ContigTableLike, EntryEncoding, TinyContigTable};
@@ -413,14 +413,20 @@ impl ReferenceIndex<Dictionary, ContigTable> {
         Kmer<K>: KmerBits,
     {
         let tdct_path = with_ext(prefix, TDCT_EXT);
-        info!("Building and saving TinyDictionary to {}", tdct_path.display());
+        info!(
+            "Building and saving TinyDictionary to {}",
+            tdct_path.display()
+        );
         let tiny_dict = TinyDictionary::from_sshash::<K>(&self.dict);
         tiny_dict
             .save(&tdct_path)
             .map_err(|e| anyhow::anyhow!("failed to save {}: {e}", tdct_path.display()))?;
 
         let tct_path = with_ext(prefix, TCT_EXT);
-        info!("Building and saving TinyContigTable to {}", tct_path.display());
+        info!(
+            "Building and saving TinyContigTable to {}",
+            tct_path.display()
+        );
         let tiny_ctab = TinyContigTable::from_contig_table(&self.contig_table);
         let tct_file = std::fs::File::create(&tct_path)
             .with_context(|| format!("failed to create {}", tct_path.display()))?;
@@ -678,7 +684,6 @@ where
             contig_id, contig_pos, is_forward, contig_len, global_pos, k, ref_range,
         ))
     }
-
 }
 
 impl<D, C> std::fmt::Debug for ReferenceIndex<D, C>

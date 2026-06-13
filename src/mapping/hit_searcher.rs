@@ -49,7 +49,6 @@ pub(crate) enum KmerMatchType {
     TwinMatch,
 }
 
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -69,7 +68,6 @@ pub(crate) fn is_homopolymer(kmer: &[u8]) -> bool {
     let first = kmer[0];
     kmer.iter().all(|&b| b == first)
 }
-
 
 // ---------------------------------------------------------------------------
 // ReadKmerIter
@@ -499,8 +497,7 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
         // the associated const `PREFERS_BITS` is false and LLVM const-folds
         // away all the rolling/canonicalization work after monomorphization.
         #[allow(non_snake_case)]
-        let PREFERS_BITS: bool =
-            <D::Query<'_, K> as sshash_lib::KmerStreamingQuery>::PREFERS_BITS;
+        let PREFERS_BITS: bool = <D::Query<'_, K> as sshash_lib::KmerStreamingQuery>::PREFERS_BITS;
         let mut fw_opt: Option<Kmer<K>> = None;
 
         while !iter.is_exhausted() {

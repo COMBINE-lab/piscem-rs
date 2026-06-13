@@ -4,7 +4,7 @@ exclude = ["sshash-rs"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.91"
 version = "0.5.0"
 authors = ["SSHash Contributors"]
 license-file = "LICENSE"
@@ -28,7 +28,7 @@ seq-macro = "0.3"
 
 [package]
 name = "piscem-rs"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.91"
 license = "BSD-3-Clause"

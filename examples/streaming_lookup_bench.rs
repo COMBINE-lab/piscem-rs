@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use piscem_rs::index::reference_index::ReferenceIndex;
-use sshash_lib::{dispatch_on_k, Kmer, KmerBits, KmerDictionary, KmerStreamingQuery};
+use sshash_lib::{Kmer, KmerBits, KmerDictionary, KmerStreamingQuery, dispatch_on_k};
 
 fn run_bench<const K: usize, D: KmerDictionary>(dict: &D, sequences: &[Vec<u8>], k: usize)
 where

@@ -25,7 +25,9 @@ use crate::index::contig_table::ContigTableLike;
 
 use super::DictKind;
 use crate::index::reference_index::{ReferenceIndex, tiny_artifacts_exist};
-use crate::io::fastx::{Collection, CollectionType, open_with_decompression, reader_with_batch_size};
+use crate::io::fastx::{
+    Collection, CollectionType, open_with_decompression, reader_with_batch_size,
+};
 use crate::io::map_info::{MapInfoParams, write_map_info};
 use crate::io::rad::write_rad_header_atac;
 use crate::io::threads::{MappingStats, OutputInfo};
@@ -365,15 +367,15 @@ where
                 .map_err(|e| anyhow::anyhow!("failed to open {}: {}", bio_paths[i].display(), e))?,
         );
         readers.push(
-            reader_with_batch_size(open_with_decompression(&barcode_paths[i])?).map_err(
-                |e| anyhow::anyhow!("failed to open {}: {}", barcode_paths[i].display(), e),
-            )?,
+            reader_with_batch_size(open_with_decompression(&barcode_paths[i])?).map_err(|e| {
+                anyhow::anyhow!("failed to open {}: {}", barcode_paths[i].display(), e)
+            })?,
         );
         if is_paired {
             readers.push(
-                reader_with_batch_size(open_with_decompression(&read2_paths[i])?).map_err(
-                    |e| anyhow::anyhow!("failed to open {}: {}", read2_paths[i].display(), e),
-                )?,
+                reader_with_batch_size(open_with_decompression(&read2_paths[i])?).map_err(|e| {
+                    anyhow::anyhow!("failed to open {}: {}", read2_paths[i].display(), e)
+                })?,
             );
         }
     }

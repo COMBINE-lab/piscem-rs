@@ -321,7 +321,6 @@ impl ContigTable {
         ContigSpan::packed(&self.ctg_entries, start, end - start)
     }
 
-
     /// Approximate size in bytes of the in-memory representation.
     pub fn size_bytes(&self) -> usize {
         let ef_bytes = self.ctg_offsets.mem_size(SizeFlags::default());
@@ -815,8 +814,7 @@ impl ContigTableLike for TinyContigTable {
     #[inline]
     fn size_bytes(&self) -> usize {
         let info = self.unitig_ref_info.len() * std::mem::size_of::<u64>();
-        let overflow_slots =
-            self.overflow.len() * std::mem::size_of::<Vec<u64>>();
+        let overflow_slots = self.overflow.len() * std::mem::size_of::<Vec<u64>>();
         let overflow_entries: usize = self
             .overflow
             .iter()

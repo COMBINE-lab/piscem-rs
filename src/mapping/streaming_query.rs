@@ -175,7 +175,9 @@ where
         }
         self.prev_query_pos = read_pos;
 
-        if self.cache_end && let Some(cache) = self.cache {
+        if self.cache_end
+            && let Some(cache) = self.cache
+        {
             let canonical_hash = CanonicalKmer::new(canonical_bits);
             if let Some(result) = cache.get(canonical_hash, fw_is_canonical) {
                 self.num_cache_hits += 1;
@@ -188,9 +190,14 @@ where
         let was_cache_end = self.cache_end;
         self.cache_end = false;
 
-        let result = self.engine.lookup_bits(canonical_bits, fw_is_canonical, fw_bytes);
+        let result = self
+            .engine
+            .lookup_bits(canonical_bits, fw_is_canonical, fw_bytes);
 
-        if was_cache_end && result.is_found() && let Some(cache) = self.cache {
+        if was_cache_end
+            && result.is_found()
+            && let Some(cache) = self.cache
+        {
             let canonical_hash = CanonicalKmer::new(canonical_bits);
             cache.insert(canonical_hash, &result, fw_is_canonical);
         }

@@ -299,8 +299,12 @@ where
 }
 
 // Safety: all shared fields are `Copy` references; `state` is always `None` at clone time.
-unsafe impl<const K: usize, S: SketchHitInfo + Send + 'static, D: KmerDictionary, C: ContigTableLike> Send
-    for BulkProcessor<'_, K, S, D, C>
+unsafe impl<
+    const K: usize,
+    S: SketchHitInfo + Send + 'static,
+    D: KmerDictionary,
+    C: ContigTableLike,
+> Send for BulkProcessor<'_, K, S, D, C>
 where
     Kmer<K>: KmerBits,
 {
@@ -774,8 +778,12 @@ where
 }
 
 // Safety: all shared fields are `Copy` references; `state` is always `None` at clone time.
-unsafe impl<const K: usize, S: SketchHitInfo + Send + 'static, D: KmerDictionary, C: ContigTableLike> Send
-    for ScrnaProcessor<'_, K, S, D, C>
+unsafe impl<
+    const K: usize,
+    S: SketchHitInfo + Send + 'static,
+    D: KmerDictionary,
+    C: ContigTableLike,
+> Send for ScrnaProcessor<'_, K, S, D, C>
 where
     Kmer<K>: KmerBits,
 {
@@ -811,19 +819,21 @@ where
         let is_multi_bc = protocol.is_multi_barcode();
         let bc_descs = protocol.barcode_descs();
 
-        let st = self.state.get_or_insert_with(|| ScrnaThreadState::<K, S, D, C> {
-            common: CommonThreadState::new(index, end_cache, &self.opts),
-            local_rlen_samples: Vec::new(),
-            unmapped_bc_counts: if is_multi_bc {
-                let bc_lens = protocol.barcode_descs().iter().map(|d| d.len).collect();
-                UnmappedBcCounts::new_multi(bc_lens)
-            } else {
-                UnmappedBcCounts::new_single(bc_len)
-            },
-            normalization: normalization_plan
-                .any_normalization
-                .then(TechNormalizationState::new),
-        });
+        let st = self
+            .state
+            .get_or_insert_with(|| ScrnaThreadState::<K, S, D, C> {
+                common: CommonThreadState::new(index, end_cache, &self.opts),
+                local_rlen_samples: Vec::new(),
+                unmapped_bc_counts: if is_multi_bc {
+                    let bc_lens = protocol.barcode_descs().iter().map(|d| d.len).collect();
+                    UnmappedBcCounts::new_multi(bc_lens)
+                } else {
+                    UnmappedBcCounts::new_single(bc_len)
+                },
+                normalization: normalization_plan
+                    .any_normalization
+                    .then(TechNormalizationState::new),
+            });
         let s = &mut st.common;
         s.ensure_chunk_started();
 
@@ -1169,7 +1179,8 @@ pub struct ScatacProcessor<
     state: Option<ScatacThreadState<'a, K, D, C>>,
 }
 
-impl<'a, const K: usize, D: KmerDictionary + 'a, C: ContigTableLike + 'a> ScatacProcessor<'a, K, D, C>
+impl<'a, const K: usize, D: KmerDictionary + 'a, C: ContigTableLike + 'a>
+    ScatacProcessor<'a, K, D, C>
 where
     Kmer<K>: KmerBits,
 {
@@ -1226,8 +1237,10 @@ where
     }
 }
 
-unsafe impl<const K: usize, D: KmerDictionary, C: ContigTableLike> Send for ScatacProcessor<'_, K, D, C> where
-    Kmer<K>: KmerBits
+unsafe impl<const K: usize, D: KmerDictionary, C: ContigTableLike> Send
+    for ScatacProcessor<'_, K, D, C>
+where
+    Kmer<K>: KmerBits,
 {
 }
 

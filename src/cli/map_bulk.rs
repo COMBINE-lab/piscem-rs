@@ -16,7 +16,9 @@ use crate::index::contig_table::ContigTableLike;
 
 use super::DictKind;
 use crate::index::reference_index::{ReferenceIndex, tiny_artifacts_exist};
-use crate::io::fastx::{Collection, CollectionType, open_with_decompression, reader_with_batch_size};
+use crate::io::fastx::{
+    Collection, CollectionType, open_with_decompression, reader_with_batch_size,
+};
 use crate::io::map_info::{MapInfoParams, write_map_info};
 use crate::io::rad::write_rad_header_bulk;
 use crate::io::threads::{MappingStats, OutputInfo};
