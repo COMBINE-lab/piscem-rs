@@ -106,8 +106,16 @@ LOCKFILE="Cargo.lock"
 [[ -f "$CARGO_TOML" ]] || die "not found: $CARGO_TOML"
 [[ -f "$LOCKFILE" ]] || die "not found: $LOCKFILE"
 
-CURRENT_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$CARGO_TOML" | head -1)"
-[[ -n "$CURRENT_VERSION" ]] || die "could not determine current crate version from $CARGO_TOML"
+# Read the version from the [package] section specifically. The crate's
+# Cargo.toml may begin with a [workspace.package] block whose `version` is
+# unrelated to (and can lag) the published crate version, so matching the
+# first `version =` line in the file would bump the wrong key.
+pkg_version() {
+    awk -F'"' '/^\[package\]/{p=1; next} /^\[/{p=0} p && /^version[[:space:]]*=/{print $2; exit}' "$1"
+}
+
+CURRENT_VERSION="$(pkg_version "$CARGO_TOML")"
+[[ -n "$CURRENT_VERSION" ]] || die "could not determine [package] version from $CARGO_TOML"
 
 if [[ "$CURRENT_VERSION" == "$VERSION" ]]; then
     die "crate version is already $VERSION"
@@ -142,11 +150,18 @@ echo "Updating $CARGO_TOML"
 echo "  version: $CURRENT_VERSION -> $VERSION"
 
 if [[ "$DRY_RUN" == false ]]; then
-    sed -i.bak "1,/^version = /s/^version = \".*\"/version = \"${VERSION}\"/" "$CARGO_TOML"
-    rm -f "${CARGO_TOML}.bak"
+    # Rewrite only the `version =` line inside the [package] section.
+    awk -v ver="$VERSION" '
+        /^\[package\]/ { in_pkg = 1 }
+        in_pkg && !done && /^version[[:space:]]*=/ {
+            sub(/"[^"]*"/, "\"" ver "\""); done = 1
+        }
+        /^\[/ && !/^\[package\]/ { in_pkg = 0 }
+        { print }
+    ' "$CARGO_TOML" > "${CARGO_TOML}.tmp" && mv "${CARGO_TOML}.tmp" "$CARGO_TOML"
 fi
 
-UPDATED_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$CARGO_TOML" | head -1)"
+UPDATED_VERSION="$(pkg_version "$CARGO_TOML")"
 
 if [[ "$DRY_RUN" == false ]]; then
     [[ "$UPDATED_VERSION" == "$VERSION" ]] || die "crate version update failed"
