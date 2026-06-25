@@ -606,6 +606,7 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
                             direction,
                             neighbor_dist,
                             &mut c_curr_pos,
+                            &phit,
                             raw_hits,
                             false, // don't add hit
                         );
@@ -649,6 +650,7 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
                             direction,
                             skip_dist,
                             &mut c_curr_pos,
+                            &phit,
                             raw_hits,
                             true, // add hit if successful
                         );
@@ -922,6 +924,7 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
         direction: i32,
         dist: i32,
         c_curr_pos: &mut i64,
+        anchor: &ProjectedHits<'idx>,
         raw_hits: &mut Vec<(i32, ProjectedHits<'idx>)>,
         add_hit: bool,
     ) -> bool
@@ -934,18 +937,23 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
         // Read reference k-mer from SPSS at the new position.
         let ref_kmer: Kmer<K> = index.dict().kmer_at_pos(*c_curr_pos as usize);
 
-        // Get the previous hit's orientation for consistency check.
-        let prev_phit = &raw_hits.last().unwrap().1;
-        let prev_hit_fw = prev_phit.hit_fw_on_contig();
+        // The projected hit is the *anchor* advanced by `inc_offset` along its
+        // contig — NOT `raw_hits.last()`. `dist`/`skip_dist` and `c_curr_pos` are
+        // all expressed relative to the anchor, so projecting any other hit (e.g.
+        // a prior skip-hit that happens to be `raw_hits.last()` with a larger
+        // `contig_pos`) yields a position past the contig end — an out-of-range
+        // `contig_pos` for the contig's length (issue #1038). Using the anchor
+        // keeps `contig_pos + k <= contig_len`, since `skip_dist` was bounded by
+        // the anchor's distance to the contig end.
+        let prev_hit_fw = anchor.hit_fw_on_contig();
 
-        // Prepare the projected hit (copy of previous, with offset applied).
+        // Prepare the projected hit (anchor with offset applied).
         // We'll only use this if add_hit is true and the match succeeds.
-        let mut direct_phit = prev_phit.clone();
+        let mut direct_phit = anchor.clone();
         if add_hit {
             direct_phit.set_resulted_from_open_search(false);
-            direct_phit.set_global_pos((direct_phit.global_pos() as i64 + inc_offset) as u64);
-            direct_phit
-                .set_contig_pos((direct_phit.contig_pos() as i32 + inc_offset as i32) as u32);
+            direct_phit.set_global_pos((anchor.global_pos() as i64 + inc_offset) as u64);
+            direct_phit.set_contig_pos((anchor.contig_pos() as i32 + inc_offset as i32) as u32);
         }
 
         // Compare read k-mer to ref k-mer using rolling words (O(1)).
@@ -957,6 +965,11 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
         if matches && (hit_fw == prev_hit_fw) {
             if add_hit {
                 direct_phit.set_contig_orientation(hit_fw);
+                debug_assert!(
+                    direct_phit.contig_pos() + index.k() as u32 <= direct_phit.contig_len(),
+                    "projected hit escapes contig: contig_pos={} k={} contig_len={}",
+                    direct_phit.contig_pos(), index.k(), direct_phit.contig_len()
+                );
                 raw_hits.push((iter.pos(), direct_phit));
             }
             true
