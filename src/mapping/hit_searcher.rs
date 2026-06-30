@@ -118,16 +118,40 @@ impl<'a> ReadKmerIter<'a> {
     }
 
     /// Build fw/rc words from scratch at the current position.
+    ///
+    /// `fw` is packed in a single forward pass over the window subslice (which
+    /// lets the bounds check hoist out of the loop). `rc` is then *derived* from
+    /// `fw` rather than re-read base-by-base from the read: the reverse
+    /// complement is the per-2-bit-group reversal of `fw` with each group
+    /// complemented, which is a single `reverse_bits` (RBIT) plus a few masks
+    /// instead of a second k-length pass of loads/encodes. Bit-identical to the
+    /// per-base construction (verified by `test_build_words_rc_matches_per_base`).
     fn build_kmer_words(&mut self) {
         let start = self.pos as usize;
-        self.fw = 0;
-        self.rc = 0;
-        for i in 0..self.k {
-            let b = Self::encode(self.read[start + i]);
-            self.fw |= b << (2 * i);
-            let comp = Self::complement(Self::encode(self.read[start + self.k - 1 - i]));
-            self.rc |= comp << (2 * i);
+        let window = &self.read[start..start + self.k];
+        let mut fw = 0u64;
+        for (i, &b) in window.iter().enumerate() {
+            fw |= Self::encode(b) << (2 * i);
         }
+        self.fw = fw;
+        self.rc = Self::reverse_complement_word(fw, self.k);
+    }
+
+    /// Reverse-complement a 2-bit-packed forward k-mer word of `k` bases.
+    ///
+    /// Reverses the order of the `k` low 2-bit groups (via `reverse_bits` plus
+    /// an intra-group bit swap) and complements each group (`^ 0b10`).
+    #[inline(always)]
+    fn reverse_complement_word(fw: u64, k: usize) -> u64 {
+        let two_k = 2 * k;
+        let r = fw.reverse_bits();
+        // Undo the within-group bit swap introduced by the full bit reversal.
+        let r = ((r & 0x5555_5555_5555_5555) << 1) | ((r >> 1) & 0x5555_5555_5555_5555);
+        // Drop the high padding so the k groups land in the low 2k bits.
+        let r = r >> (64 - two_k);
+        // Complement every 2-bit base (A<->T, C<->G) across the low 2k bits.
+        let comp_mask = 0xAAAA_AAAA_AAAA_AAAA_u64 >> (64 - two_k);
+        r ^ comp_mask
     }
 
     /// Create a new iterator. Positions at the first valid k-mer window.
@@ -142,14 +166,10 @@ impl<'a> ReadKmerIter<'a> {
             fw_shift: (2 * (k - 1)) as u32,
             rc_mask: (1u64 << (2 * k)) - 1,
         };
-        // Scan the first k-1 bases for invalid characters.
-        let scan_end = k.saturating_sub(1).min(read.len());
-        for (i, &base) in read.iter().enumerate().take(scan_end) {
-            if !is_valid_base(base) {
-                iter.last_invalid = i as i32;
-            }
-        }
-        // Find the first valid window (scan rightmost base and beyond).
+        // Find the first valid window. `find_next_valid` scans the entire
+        // initial window `[0, k-1]` from `last_invalid + 1 == 0`, so a separate
+        // pre-scan of the first k-1 bases would just re-read the same bytes
+        // (the window was traversed twice per read). It is omitted here.
         iter.find_next_valid();
         // Build k-mer words at the first valid position.
         if !iter.is_exhausted() {
@@ -988,6 +1008,42 @@ mod tests {
     use super::*;
 
     // ---- ReadKmerIter tests ----
+
+    /// The derived `rc` (reverse_bits-based) must equal the straightforward
+    /// per-base construction for every window, across k and case-mixed bases.
+    #[test]
+    fn test_build_words_rc_matches_per_base() {
+        fn per_base(read: &[u8], start: usize, k: usize) -> (u64, u64) {
+            let (mut fw, mut rc) = (0u64, 0u64);
+            for i in 0..k {
+                fw |= ReadKmerIter::encode(read[start + i]) << (2 * i);
+                let comp = ReadKmerIter::complement(ReadKmerIter::encode(read[start + k - 1 - i]));
+                rc |= comp << (2 * i);
+            }
+            (fw, rc)
+        }
+        let bases = [b'A', b'C', b'G', b'T', b'a', b'c', b'g', b't'];
+        let mut st = 0x1234_5678_9abc_def1u64;
+        let mut rng = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        for k in [15usize, 19, 23, 27, 31] {
+            for _ in 0..5000 {
+                let len = k + (rng() % 6) as usize;
+                let read: Vec<u8> = (0..len).map(|_| bases[(rng() % 8) as usize]).collect();
+                let mut it = ReadKmerIter::new(&read, k);
+                while !it.is_exhausted() {
+                    let (fw, rc) = per_base(&read, it.pos() as usize, k);
+                    assert_eq!(it.fw_word(), fw, "fw k={k} pos={}", it.pos());
+                    assert_eq!(it.rc_word(), rc, "rc k={k} pos={}", it.pos());
+                    it.advance();
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_kmer_iter_all_valid() {
