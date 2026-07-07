@@ -92,13 +92,13 @@ value-traits = "0.2"
 mem_dbg = "0.4.1"
 
 # RAD file parsing — optional, enabled by parity-test feature
-libradicl = { version = "0.12", optional = true }
+libradicl = { version = "0.14", optional = true }
 mimalloc = { version = "0.1.48", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
-libradicl = "0.12"
+libradicl = "0.14"
 
 # Examples that need optional features (excluded from publish but needed locally).
 [[example]]
