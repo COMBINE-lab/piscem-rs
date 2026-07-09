@@ -988,7 +988,9 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
                 debug_assert!(
                     direct_phit.contig_pos() + index.k() as u32 <= direct_phit.contig_len(),
                     "projected hit escapes contig: contig_pos={} k={} contig_len={}",
-                    direct_phit.contig_pos(), index.k(), direct_phit.contig_len()
+                    direct_phit.contig_pos(),
+                    index.k(),
+                    direct_phit.contig_len()
                 );
                 raw_hits.push((iter.pos(), direct_phit));
             }

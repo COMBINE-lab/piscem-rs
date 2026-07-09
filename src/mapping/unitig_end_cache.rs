@@ -51,7 +51,7 @@ impl UnitigEndCache {
     ) -> Option<LookupResult> {
         self.map.get(&canonical_hash).map(|entry| {
             let cached = entry.value();
-            let mut result = cached.result.clone();
+            let mut result = cached.result;
             if fw_is_canonical != cached.fw_was_canonical {
                 // Flip orientation: forward ↔ reverse complement
                 result.kmer_orientation = -result.kmer_orientation;
@@ -75,7 +75,7 @@ impl UnitigEndCache {
         self.map.insert(
             canonical_hash,
             CachedLookup {
-                result: result.clone(),
+                result: *result,
                 fw_was_canonical: fw_is_canonical,
             },
         );
