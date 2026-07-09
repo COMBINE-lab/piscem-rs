@@ -48,6 +48,15 @@ pub struct BuildConfig {
     /// `None` means "auto" — decide based on the canonical-k-mer count
     /// against [`crate::cli::AUTO_TINY_KMER_THRESHOLD`].
     pub emit_tiny: Option<bool>,
+    /// Directory sshash uses for its external minimizer-sort scratch files.
+    /// `None` keeps sshash's default (`sshash_tmp`, relative to the current
+    /// working directory); `Some(dir)` redirects it so the caller controls the
+    /// location and cleanup. The directory is created by sshash if absent.
+    pub tmp_dir: Option<PathBuf>,
+    /// RAM ceiling, in GiB, for sshash's external minimizer sort (the dominant
+    /// build-time memory/disk trade-off). `None` keeps sshash's default (8 GiB);
+    /// a smaller value spills to disk sooner (less RAM, more I/O).
+    pub ram_limit_gib: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +164,12 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
     build_cfg.seed = config.seed;
     build_cfg.num_threads = config.num_threads;
     build_cfg.partitioned_mphf = !config.single_mphf;
+    if let Some(dir) = &config.tmp_dir {
+        build_cfg.tmp_dirname = dir.clone();
+    }
+    if let Some(gib) = config.ram_limit_gib {
+        build_cfg.ram_limit_gib = gib;
+    }
 
     let dict_builder = DictionaryBuilder::new(build_cfg)
         .map_err(|e| anyhow::anyhow!("failed to create dictionary builder: {e}"))?;
@@ -795,6 +810,8 @@ mod tests {
             seed: 1,
             single_mphf: false,
             emit_tiny: Some(false),
+            tmp_dir: None,
+            ram_limit_gib: None,
         };
 
         build_index(&config).expect("build_index failed");

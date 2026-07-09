@@ -41,6 +41,14 @@ pub struct BuildArgs {
     /// sshash→tiny conversion.
     #[arg(long, value_enum, default_value_t = DictKind::Auto)]
     pub dict: DictKind,
+    /// Directory for sshash's external minimizer-sort scratch files.
+    /// Unset keeps sshash's default (`sshash_tmp` in the current directory).
+    #[arg(long)]
+    pub tmp_dir: Option<PathBuf>,
+    /// RAM ceiling, in GiB, for sshash's external minimizer sort. Unset keeps
+    /// sshash's default (8 GiB); a smaller value spills to disk sooner.
+    #[arg(long)]
+    pub ram_limit_gib: Option<usize>,
 }
 
 pub fn run(args: BuildArgs) -> Result<()> {
@@ -59,6 +67,8 @@ pub fn run(args: BuildArgs) -> Result<()> {
             DictKind::Sshash => Some(false),
             DictKind::Auto => None,
         },
+        tmp_dir: args.tmp_dir,
+        ram_limit_gib: args.ram_limit_gib,
     };
     build_index(&config)
 }
