@@ -17,7 +17,7 @@ use crate::index::contig_table::ContigTableLike;
 use super::DictKind;
 use crate::index::reference_index::{ReferenceIndex, tiny_artifacts_exist};
 use crate::io::fastx::{
-    Collection, CollectionType, open_with_decompression, reader_with_batch_size,
+    Collection, CollectionType, reader_with_batch_size,
 };
 use crate::io::map_info::{MapInfoParams, write_map_info};
 use crate::io::rad::write_rad_header_bulk;
@@ -349,39 +349,84 @@ where
     let mut processor =
         BulkProcessor::<K, S, D, C>::new(index, None, output, stats, strat, opts, progress);
 
-    if is_paired {
-        let mut readers = Vec::with_capacity(read1_paths.len() * 2);
-        for (r1_path, r2_path) in read1_paths.iter().zip(read2_paths.iter()) {
-            readers.push(
-                reader_with_batch_size(open_with_decompression(r1_path)?)
-                    .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r1_path.display(), e))?,
-            );
-            readers.push(
-                reader_with_batch_size(open_with_decompression(r2_path)?)
-                    .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r2_path.display(), e))?,
-            );
-        }
-        let collection = Collection::new(readers, CollectionType::Paired)
-            .map_err(|e| anyhow::anyhow!("failed to create collection: {}", e))?;
-        collection
-            .process_parallel_paired(&mut processor, num_threads, None)
-            .map_err(|e| anyhow::anyhow!("mapping failed: {}", e))?;
+    // Same decode/map budget split as the scRNA path; see `plan_thread_budget`.
+    let num_input_files = if is_paired {
+        read1_paths.len() * 2
     } else {
-        let mut readers = Vec::with_capacity(read1_paths.len());
+        read1_paths.len()
+    };
+    let plan = crate::io::fastx::plan_thread_budget(num_threads, num_input_files);
+    #[allow(unused_mut)]
+    let mut handles = Vec::new();
+
+    let mut readers = Vec::with_capacity(num_input_files);
+    if is_paired {
+        for (r1_path, r2_path) in read1_paths.iter().zip(read2_paths.iter()) {
+            for path in [r1_path, r2_path] {
+                let o = crate::io::fastx::open_input(
+                    path,
+                    plan.per_file_ceiling,
+                    plan.initial_per_file,
+                )?;
+                #[cfg(feature = "rapidgzip")]
+                handles.extend(o.handle.clone());
+                readers.push(
+                    reader_with_batch_size(o.reader).map_err(|e| {
+                        anyhow::anyhow!("failed to open {}: {}", path.display(), e)
+                    })?,
+                );
+            }
+        }
+    } else {
         for r1_path in read1_paths {
+            let o = crate::io::fastx::open_input(
+                r1_path,
+                plan.per_file_ceiling,
+                plan.initial_per_file,
+            )?;
+            #[cfg(feature = "rapidgzip")]
+            handles.extend(o.handle.clone());
             readers.push(
-                reader_with_batch_size(open_with_decompression(r1_path)?)
+                reader_with_batch_size(o.reader)
                     .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r1_path.display(), e))?,
             );
         }
-        let collection = Collection::new(readers, CollectionType::Single)
-            .map_err(|e| anyhow::anyhow!("failed to create collection: {}", e))?;
-        collection
-            .process_parallel(&mut processor, num_threads, None)
-            .map_err(|e| anyhow::anyhow!("mapping failed: {}", e))?;
     }
 
-    Ok(())
+    #[cfg(feature = "rapidgzip")]
+    let budget = crate::io::decode_budget::DecodeBudget::spawn(handles, plan.decode_budget);
+
+    let result = if is_paired {
+        Collection::new(readers, CollectionType::Paired)
+            .map_err(|e| anyhow::anyhow!("failed to create collection: {}", e))
+            .and_then(|c| {
+                c.process_parallel_paired(&mut processor, num_threads, None)
+                    .map_err(|e| anyhow::anyhow!("mapping failed: {}", e))
+            })
+    } else {
+        Collection::new(readers, CollectionType::Single)
+            .map_err(|e| anyhow::anyhow!("failed to create collection: {}", e))
+            .and_then(|c| {
+                c.process_parallel(&mut processor, num_threads, None)
+                    .map_err(|e| anyhow::anyhow!("mapping failed: {}", e))
+            })
+    };
+
+    #[cfg(feature = "rapidgzip")]
+    if let Some(budget) = budget {
+        let report = budget.finish();
+        tracing::info!(
+            "decoder threads: peak {} worker + {} auxiliary (budget {}); peak busy {}; \
+             calibration settled at {:?}",
+            report.peak_worker_threads,
+            report.peak_auxiliary_threads,
+            plan.decode_budget,
+            report.peak_busy_workers,
+            report.converged_workers,
+        );
+    }
+
+    result
 }
 
 /// Create a progress bar for mapping (shared across all CLI commands).

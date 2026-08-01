@@ -17,7 +17,7 @@ use crate::index::contig_table::ContigTableLike;
 use super::DictKind;
 use crate::index::reference_index::{ReferenceIndex, tiny_artifacts_exist};
 use crate::io::fastx::{
-    Collection, CollectionType, open_with_decompression, reader_with_batch_size,
+    Collection, CollectionType, reader_with_batch_size,
 };
 use crate::io::map_info::{MapInfoParams, write_map_info};
 use crate::io::rad::{write_rad_header_sc, write_rad_header_sc_multi_bc};
@@ -451,14 +451,32 @@ where
         progress,
     );
 
+    // Split the user's thread budget between mapping and decompression.
+    //
+    // `num_threads` here is already the mapping allotment; `decode_budget`
+    // is what the decoders may collectively spend on top of it. Both derive
+    // from the same user-supplied `-t`, see `plan_thread_budget`.
+    let plan = crate::io::fastx::plan_thread_budget(num_threads, read1_paths.len() * 2);
+
     let mut pairs = Vec::with_capacity(read1_paths.len());
+    #[allow(unused_mut)]
+    let mut handles = Vec::new();
     for (r1_path, r2_path) in read1_paths.iter().zip(read2_paths.iter()) {
-        let r1 = reader_with_batch_size(open_with_decompression(r1_path)?)
+        let o1 = crate::io::fastx::open_input(r1_path, plan.per_file_ceiling, plan.initial_per_file)?;
+        let o2 = crate::io::fastx::open_input(r2_path, plan.per_file_ceiling, plan.initial_per_file)?;
+        #[cfg(feature = "rapidgzip")]
+        handles.extend([o1.handle.clone(), o2.handle.clone()].into_iter().flatten());
+        let r1 = reader_with_batch_size(o1.reader)
             .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r1_path.display(), e))?;
-        let r2 = reader_with_batch_size(open_with_decompression(r2_path)?)
+        let r2 = reader_with_batch_size(o2.reader)
             .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r2_path.display(), e))?;
         pairs.push((r1, r2));
     }
+
+    // Supervise the decoders under one shared budget. Upstream adapts within a
+    // decoder; this bounds the sum across them, which is the part it does not do.
+    #[cfg(feature = "rapidgzip")]
+    let budget = crate::io::decode_budget::DecodeBudget::spawn(handles, plan.decode_budget);
 
     let mut readers = Vec::with_capacity(pairs.len() * 2);
     for (r1, r2) in pairs {
@@ -467,11 +485,26 @@ where
     }
     let collection = Collection::new(readers, CollectionType::Paired)
         .map_err(|e| anyhow::anyhow!("failed to create collection: {}", e))?;
-    collection
+    let result = collection
         .process_parallel_paired(&mut processor, num_threads, None)
-        .map_err(|e| anyhow::anyhow!("mapping failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("mapping failed: {}", e));
 
-    Ok(())
+    #[cfg(feature = "rapidgzip")]
+    if let Some(budget) = budget {
+        let report = budget.finish();
+        tracing::info!(
+            "decoder threads: peak {} worker + {} auxiliary (budget {}, unused {}); \
+             peak busy {}; calibration settled at {:?}",
+            report.peak_worker_threads,
+            report.peak_auxiliary_threads,
+            plan.decode_budget,
+            report.unused_budget,
+            report.peak_busy_workers,
+            report.converged_workers,
+        );
+    }
+
+    result
 }
 
 /// Compute the mode (most frequent value) of a u32 slice.

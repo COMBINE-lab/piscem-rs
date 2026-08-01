@@ -57,6 +57,9 @@ exclude = [
 [features]
 default = ["mimalloc"]
 parity-test = ["dep:libradicl"]
+# Parallel gzip decoding via the pure-Rust COMBINE-lab/rapidgzip-rust.
+# No C++ toolchain required. See RESULTS.md.
+rapidgzip = ["dep:rapidgzip-core"]
 
 [dependencies]
 seq_geom_parser = { version = "1.1.0", path = "crates/seq_geom_parser" }
@@ -94,6 +97,7 @@ mem_dbg = "0.4.1"
 # RAD file parsing — optional, enabled by parity-test feature
 libradicl = { version = "0.14", optional = true }
 mimalloc = { version = "0.1.48", optional = true }
+rapidgzip-core = { version = "0.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -117,12 +121,22 @@ required-features = ["parity-test"]
 lto = "thin"
 codegen-units = 1
 opt-level = 3
+# Line tables only: no codegen impact, but without this `perf` cannot attribute
+# samples to source lines and inlined frames vanish entirely under thin-LTO.
+debug = 1
 
 [profile.bench]
 inherits = "release"
 debug = true
 
 [patch.crates-io]
-# Uncomment to use local sshash-rs checkout for development:
-# sshash-lib = { path = "sshash-rs/crates/sshash-lib" }
-# tiny-dict = { path = "sshash-rs/crates/tiny-dict" }
+# Local sshash-rs checkout for development.
+#
+# NOTE: the checkout must live *outside* this crate's directory tree. A nested
+# `./sshash-rs/` is still bound to *this* workspace for `version.workspace`
+# inheritance despite `[workspace] exclude`, so its crates resolve to this
+# workspace's 0.5.0 rather than sshash-rs's own version, silently failing the
+# `"0.6"` requirement and leaving the patch unused.
+# sshash-lib = { path = "../sshash-rs-dev/crates/sshash-lib" }
+# tiny-dict = { path = "../sshash-rs-dev/crates/tiny-dict" }
+# rapidgzip-core = { path = "../rapidgzip-rust/crates/rapidgzip-core" }
