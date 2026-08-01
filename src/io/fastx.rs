@@ -114,8 +114,12 @@ pub(crate) fn open_input(
 ) -> Result<OpenedInput> {
     let path = path.as_ref();
 
+    // `ceiling == 0` selects the serial path explicitly (see
+    // `SERIAL_GZIP_FILE_THRESHOLD`), independent of whether the feature is on.
     #[cfg(feature = "rapidgzip")]
-    if let Some(opened) = open_gz_rapidgzip(path, ceiling, initial_limit)? {
+    if ceiling > 0
+        && let Some(opened) = open_gz_rapidgzip(path, ceiling, initial_limit)?
+    {
         return Ok(opened);
     }
     #[cfg(not(feature = "rapidgzip"))]
@@ -149,6 +153,13 @@ pub(crate) fn default_decoder_ceiling() -> usize {
         .unwrap_or(16)
 }
 
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 /// How a run intends to spend threads on decompression.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ThreadBudget {
@@ -160,7 +171,32 @@ pub(crate) struct ThreadBudget {
     /// Runtime limit each decoder starts at, so the budget holds from the very
     /// first batch rather than after the supervisor's first sample.
     pub initial_per_file: usize,
+    /// Whether to use the parallel gzip decoder at all. When false, gzip input
+    /// takes the serial niffler path and no decoder threads are spawned.
+    pub parallel_gzip: bool,
 }
+
+/// Input files at or above which serial per-file decoding already saturates
+/// mapping, making the parallel decoder counterproductive.
+///
+/// Supply scales with the number of inflate *streams*, and niffler gets one per
+/// file — so this counts files, not pairs (8 files = 4 paired sets, or 8
+/// single-end inputs).
+///
+/// Measured with total data held constant, medians of 2 reps, `-t 32`:
+///
+/// | pairs | single-member niffler / rgz | multi-member niffler / rgz |
+/// |---|---|---|
+/// | 1 | 19.43 / **17.53** | 9.71 / **3.24** |
+/// | 2 | 9.75 / **9.22**   | 5.09 / **3.03** |
+/// | 4 | **5.71** / 6.12   | **2.92** / 3.13 |
+/// | 8 | **5.54** / 6.16   | **2.89** / 3.18 |
+///
+/// The crossover is 2-4 pairs in *both* member structures; density changes how
+/// much the parallel decoder wins below it (1.1x vs 3.0x at one pair), not where
+/// the crossing happens. Past it the parallel decoder costs 21-26% more CPU to
+/// run slower, because its per-file workers compete with mapping for cores.
+const SERIAL_GZIP_FILE_THRESHOLD: usize = 8;
 
 /// Decide the decompression share of the thread budget.
 ///
@@ -197,10 +233,21 @@ pub(crate) fn plan_thread_budget(map_threads: usize, num_files: usize) -> Thread
             decode_budget: per_file.saturating_mul(num_files.max(1)).max(1),
             per_file_ceiling: per_file.max(1),
             initial_per_file: per_file.max(1),
+            parallel_gzip: true,
         };
     }
 
     let files = num_files.max(1);
+
+    // Enough files that serial per-file streams already saturate mapping.
+    if files >= SERIAL_GZIP_FILE_THRESHOLD {
+        return ThreadBudget {
+            decode_budget: 0,
+            per_file_ceiling: 0,
+            initial_per_file: 0,
+            parallel_gzip: false,
+        };
+    }
     // Half the mapping allotment, i.e. a third of the combined footprint.
     let decode_budget = (map_threads / 2).clamp(1, 64);
     // Ceiling per decoder is deliberately above the fair share: a decoder that
@@ -211,12 +258,19 @@ pub(crate) fn plan_thread_budget(map_threads: usize, num_files: usize) -> Thread
     ThreadBudget {
         decode_budget,
         per_file_ceiling,
-        // Start below every knee measured so far (Flex 16/file, bulk 4, PBMC 0)
-        // and let the supervisor buy growth with evidence. Over-provisioning
-        // decode costs threads but never time; under-provisioning costs 22-48%,
-        // but that is recoverable within about a second of ramping, whereas
-        // threads held for a whole run are not recoverable at all.
-        initial_per_file: 2.min(per_file_ceiling),
+        parallel_gzip: true,
+        // Start at one worker per decoder — cost-equivalent to the serial path
+        // — and let the supervisor buy growth with demonstrated starvation.
+        // This removes any need to predict decode demand up front, which is
+        // machine- and index-specific: measured per-mapping-thread consumption
+        // ranged 0.064 GB/s (96.3 M-k-mer transcriptome) to 0.43 GB/s (1.5 M
+        // probe panel), a 6.7x spread no constant could span.
+        //
+        // Verified not to regress the worst case: on the full Flex archive
+        // (single pair, knee at 16 workers/file, where under-provisioning had
+        // cost 48%), starting at 1 reached peak 16 and ran 114.29 s versus
+        // 117.81 s starting at 2.
+        initial_per_file: env_usize("PISCEM_DECODE_INITIAL", 1).min(per_file_ceiling).max(1),
     }
 }
 
