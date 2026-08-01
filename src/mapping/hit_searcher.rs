@@ -53,10 +53,25 @@ pub(crate) enum KmerMatchType {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// 256-bit membership bitmap for `A, C, G, T, a, c, g, t`.
+///
+/// `VALID_BASE[b >> 6] >> (b & 63)` replaces an 8-way `matches!` chain in the
+/// per-position hot path (`ReadKmerIter::advance` was ~8.5% of mapping cycles).
+static VALID_BASE: [u64; 4] = {
+    let mut t = [0u64; 4];
+    let mut i = 0;
+    while i < 8 {
+        let b = [b'A', b'C', b'G', b'T', b'a', b'c', b'g', b't'][i];
+        t[(b >> 6) as usize] |= 1u64 << (b & 63);
+        i += 1;
+    }
+    t
+};
+
 /// Check if a byte is a valid DNA base (A, C, G, T, case-insensitive).
-#[inline]
+#[inline(always)]
 fn is_valid_base(b: u8) -> bool {
-    matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't')
+    (VALID_BASE[(b >> 6) as usize] >> (b & 63)) & 1 != 0
 }
 
 /// Check if a k-mer byte slice is a homopolymer (all bases identical).
@@ -94,6 +109,11 @@ pub(crate) struct ReadKmerIter<'a> {
     fw_shift: u32,
     /// Precomputed: (1 << 2k) - 1, mask for keeping only k bases in RC.
     rc_mask: u64,
+    /// Precomputed: `read.len() - k`, the last position with a full window.
+    /// Negative when the read is shorter than `k`, which reads as "exhausted"
+    /// for the initial `pos == 0`. Lets `is_exhausted` be a single compare
+    /// instead of reloading `read.len()` and redoing the addition every call.
+    max_pos: i32,
 }
 
 impl<'a> ReadKmerIter<'a> {
@@ -165,6 +185,7 @@ impl<'a> ReadKmerIter<'a> {
             rc: 0,
             fw_shift: (2 * (k - 1)) as u32,
             rc_mask: (1u64 << (2 * k)) - 1,
+            max_pos: read.len() as i32 - k as i32,
         };
         // Find the first valid window. `find_next_valid` scans the entire
         // initial window `[0, k-1]` from `last_invalid + 1 == 0`, so a separate
@@ -179,9 +200,11 @@ impl<'a> ReadKmerIter<'a> {
     }
 
     /// Whether the iterator is past the last valid k-mer position.
-    #[inline]
+    ///
+    /// Equivalent to `pos + k > read.len()`, precomputed as `pos > read.len() - k`.
+    #[inline(always)]
     pub fn is_exhausted(&self) -> bool {
-        self.pos as usize + self.k > self.read.len()
+        self.pos > self.max_pos
     }
 
     /// Current k-mer start position on the read.
@@ -512,13 +535,12 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
         let k = k_usize as i32;
         let read_len = read.len() as i32;
         let mut iter = ReadKmerIter::new(read, k_usize);
-        // Rolling canonical k-mer state, only maintained when the dictionary
-        // prefers pre-parsed bits (tiny-dict). For byte-oriented dicts (sshash)
-        // the associated const `PREFERS_BITS` is false and LLVM const-folds
-        // away all the rolling/canonicalization work after monomorphization.
+        // Dictionaries that prefer pre-parsed bits (tiny-dict) are fed straight
+        // from the iterator's rolling words; byte-oriented dicts (sshash) have
+        // `PREFERS_BITS == false` and LLVM const-folds that branch away after
+        // monomorphization.
         #[allow(non_snake_case)]
         let PREFERS_BITS: bool = <D::Query<'_, K> as sshash_lib::KmerStreamingQuery>::PREFERS_BITS;
-        let mut fw_opt: Option<Kmer<K>> = None;
 
         while !iter.is_exhausted() {
             let kmer_bytes = iter.kmer_bytes();
@@ -526,14 +548,7 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
 
             // Skip homopolymers.
             if is_homopolymer(kmer_bytes) {
-                let dist = iter.advance();
-                if PREFERS_BITS {
-                    fw_opt = if dist == 1 && !iter.is_exhausted() {
-                        fw_opt.map(|f| f.roll_right_base((iter.kmer_bytes()[K - 1] >> 1) & 3))
-                    } else {
-                        None
-                    };
-                }
+                iter.advance();
                 continue;
             }
 
@@ -541,39 +556,31 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
             // auto-detects non-consecutive jumps and resets the engine,
             // while allowing the fast incremental path for stride-1 lookups.
             //
-            // For dictionaries that prefer pre-parsed bits (tiny), maintain
-            // a rolling `fw_kmer` and call `lookup_at_bits`. For byte-oriented
-            // dictionaries (sshash), skip that bookkeeping and just call
-            // `lookup_at` — both branches are monomorphized away.
-            let result;
-            // fw_kmer is only defined and used on the PREFERS_BITS path.
-            let fw_kmer: Kmer<K> = if PREFERS_BITS {
-                let fk = match fw_opt {
-                    Some(k) => k,
-                    None => Kmer::<K>::from_ascii_unchecked(kmer_bytes),
+            // For dictionaries that prefer pre-parsed bits (tiny), feed the
+            // iterator's rolling words straight through. `ReadKmerIter` already
+            // maintains both the forward and reverse-complement 2-bit words in
+            // exactly sshash's packing, so the canonical k-mer is `min(fw, rc)`
+            // — no re-parse of the ASCII window and no second reverse
+            // complement. For byte-oriented dictionaries (sshash) this branch
+            // is monomorphized away.
+            let result = if PREFERS_BITS {
+                let fw_bits = iter.fw_word();
+                let rc_bits = iter.rc_word();
+                // `Kmer::canonical()` is `min(fw, rc)` and reports
+                // `fw_is_canonical` as `fw == canonical`, i.e. `fw <= rc`.
+                let (canon_bits, fw_is_canonical) = if fw_bits <= rc_bits {
+                    (fw_bits, true)
+                } else {
+                    (rc_bits, false)
                 };
-                let canonical = fk.canonical();
-                let fw_bits = <Kmer<K> as KmerBits>::to_u64(fk.bits());
-                let canon_bits = <Kmer<K> as KmerBits>::to_u64(canonical.bits());
-                let fw_is_canonical = fw_bits == canon_bits;
-                result = query.lookup_at_bits(canon_bits, fw_is_canonical, kmer_bytes, read_pos);
-                fk
+                query.lookup_at_bits(canon_bits, fw_is_canonical, kmer_bytes, read_pos)
             } else {
-                result = query.lookup_at(kmer_bytes, read_pos);
-                // Dead on this branch; DCE'd after monomorph.
-                Kmer::<K>::from_ascii_unchecked(kmer_bytes)
+                query.lookup_at(kmer_bytes, read_pos)
             };
 
             if let Some(phit) = index.resolve_lookup(&result) {
                 if phit.is_empty() {
-                    let dist = iter.advance();
-                    if PREFERS_BITS {
-                        fw_opt = if dist == 1 && !iter.is_exhausted() {
-                            Some(fw_kmer.roll_right_base((iter.kmer_bytes()[K - 1] >> 1) & 3))
-                        } else {
-                            None
-                        };
-                    }
+                    iter.advance();
                     continue;
                 }
 
@@ -604,9 +611,9 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
                 let skip_dist = std::cmp::min(dist_to_read_end, dist_to_contig_end) as i32;
 
                 if skip_dist > 1 {
-                    // Complex skip paths below may jump, restore, or walk safely;
-                    // invalidate rolling state across all of them.
-                    fw_opt = None;
+                    // The skip paths below may jump, restore, or walk safely.
+                    // `ReadKmerIter` rebuilds its own words on every jump, so
+                    // there is no separate rolling state left to invalidate.
                     // Save backup iterator and contig position.
                     let backup_iter = iter.clone();
                     let backup_cpos = c_curr_pos_initial;
@@ -776,24 +783,10 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
                 }
 
                 // skip_dist <= 1: just advance by 1.
-                let dist = iter.advance();
-                if PREFERS_BITS {
-                    fw_opt = if dist == 1 && !iter.is_exhausted() {
-                        Some(fw_kmer.roll_right_base((iter.kmer_bytes()[K - 1] >> 1) & 3))
-                    } else {
-                        None
-                    };
-                }
+                iter.advance();
             } else {
                 // Miss: advance by 1.
-                let dist = iter.advance();
-                if PREFERS_BITS {
-                    fw_opt = if dist == 1 && !iter.is_exhausted() {
-                        Some(fw_kmer.roll_right_base((iter.kmer_bytes()[K - 1] >> 1) & 3))
-                    } else {
-                        None
-                    };
-                }
+                iter.advance();
             }
         }
     }
