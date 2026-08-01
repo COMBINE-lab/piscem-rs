@@ -459,8 +459,10 @@ where
     let plan = crate::io::fastx::plan_thread_budget(num_threads, read1_paths.len() * 2);
 
     let mut pairs = Vec::with_capacity(read1_paths.len());
-    #[allow(unused_mut)]
-    let mut handles = Vec::new();
+    // Only exists on the rapidgzip path; without it there is nothing to
+    // supervise and the type would be uninferable.
+    #[cfg(feature = "rapidgzip")]
+    let mut handles: Vec<rapidgzip_core::DecoderHandle> = Vec::new();
     for (r1_path, r2_path) in read1_paths.iter().zip(read2_paths.iter()) {
         let o1 = crate::io::fastx::open_input(r1_path, plan.per_file_ceiling, plan.initial_per_file)?;
         let o2 = crate::io::fastx::open_input(r2_path, plan.per_file_ceiling, plan.initial_per_file)?;

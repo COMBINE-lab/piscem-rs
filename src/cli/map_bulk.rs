@@ -356,8 +356,10 @@ where
         read1_paths.len()
     };
     let plan = crate::io::fastx::plan_thread_budget(num_threads, num_input_files);
-    #[allow(unused_mut)]
-    let mut handles = Vec::new();
+    // Only exists on the rapidgzip path; without it there is nothing to
+    // supervise and the type would be uninferable.
+    #[cfg(feature = "rapidgzip")]
+    let mut handles: Vec<rapidgzip_core::DecoderHandle> = Vec::new();
 
     let mut readers = Vec::with_capacity(num_input_files);
     if is_paired {
