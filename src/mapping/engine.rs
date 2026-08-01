@@ -9,9 +9,8 @@
 //! 5. Optionally applies EC-based ambiguous hit filtering
 //! 6. Produces the final accepted hit list
 
-use std::collections::HashMap;
 
-use ahash::AHashMap;
+use crate::hash::{fixed_map, FixedMap};
 use sshash_lib::{Kmer, KmerBits, KmerDictionary};
 
 use crate::index::contig_table::ContigTableLike;
@@ -129,7 +128,7 @@ where
             let mut min_cardinality_index: u32 = 0;
             let mut visited: usize = 0;
 
-            let visit_ec = |hit_map: &mut AHashMap<u32, S>, ent: u64, fw_on_contig: bool| {
+            let visit_ec = |hit_map: &mut FixedMap<u32, S>, ent: u64, fw_on_contig: bool| {
                 let tid = ec_entry_transcript_id(ent);
                 if let Some(target) = hit_map.get_mut(&tid) {
                     let ori = ent & 0x3;
@@ -303,7 +302,7 @@ where
         let thr = binning.thr();
 
         // Bin-keyed hit map: bin_id → BinnedHitEntry
-        let mut bin_hit_map: HashMap<u64, BinnedHitEntry<S>> = HashMap::new();
+        let mut bin_hit_map: FixedMap<u64, BinnedHitEntry<S>> = fixed_map();
         let mut num_valid_hits: u32 = 0;
         let mut min_occ: u64 = u64::MAX;
         let mao_first_pass = (cache.max_hit_occ - 1) as u64;
@@ -369,7 +368,7 @@ where
             // C++ visit_ec: uses (ent >> 2) as key, which is tid, not bin_id.
             // In bin-keyed map this is mostly a no-op, but we match C++ exactly.
             let visit_ec =
-                |hit_map: &mut HashMap<u64, BinnedHitEntry<S>>, ent: u64, fw_on_contig: bool| {
+                |hit_map: &mut FixedMap<u64, BinnedHitEntry<S>>, ent: u64, fw_on_contig: bool| {
                     let tid_as_key = ec_entry_transcript_id(ent) as u64;
                     if let Some(target) = hit_map.get_mut(&tid_as_key) {
                         let ori = ent & 0x3;
@@ -488,7 +487,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn collect_mappings_from_hits_binned<S: SketchHitInfo, D: KmerDictionary, C: ContigTableLike>(
     raw_hits: &[(i32, ProjectedHits<'_>)],
-    bin_hit_map: &mut HashMap<u64, BinnedHitEntry<S>>,
+    bin_hit_map: &mut FixedMap<u64, BinnedHitEntry<S>>,
     num_valid_hits: &mut u32,
     min_occ: &mut u64,
     max_allowed_occ: u64,
@@ -588,7 +587,7 @@ fn collect_mappings_from_hits_binned<S: SketchHitInfo, D: KmerDictionary, C: Con
 #[allow(clippy::too_many_arguments)]
 fn collect_mappings_from_hits<S: SketchHitInfo, D: KmerDictionary, C: ContigTableLike>(
     raw_hits: &[(i32, ProjectedHits<'_>)],
-    hit_map: &mut AHashMap<u32, S>,
+    hit_map: &mut FixedMap<u32, S>,
     num_valid_hits: &mut u32,
     min_occ: &mut u64,
     max_allowed_occ: u64,
@@ -657,7 +656,7 @@ mod tests {
     #[test]
     fn test_collect_empty_hits() {
         let raw_hits: Vec<(i32, ProjectedHits<'_>)> = Vec::new();
-        let mut hit_map: AHashMap<u32, SketchHitInfoSimple> = AHashMap::new();
+        let mut hit_map: FixedMap<u32, SketchHitInfoSimple> = fixed_map();
         let num_valid = 0u32;
         let mut min_occ = u64::MAX;
         let mut ambig: Vec<u32> = Vec::new();

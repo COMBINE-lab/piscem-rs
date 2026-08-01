@@ -11,7 +11,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
-use ahash::AHashMap;
+use crate::hash::{fixed_map, FixedMap};
 use indicatif::ProgressBar;
 use paraseq::Record;
 use paraseq::parallel::{MultiParallelProcessor, PairedParallelProcessor, ParallelProcessor};
@@ -490,12 +490,12 @@ where
 enum UnmappedBcCounts {
     /// Single barcode field — zero overhead compared to pre-multi-barcode code.
     Single {
-        counts: AHashMap<u64, u32>,
+        counts: FixedMap<u64, u32>,
         bc_len: u16,
     },
     /// Multiple barcode fields — stores per-field values.
     Multi {
-        counts: AHashMap<SmallVec<[u64; 2]>, u32>,
+        counts: FixedMap<SmallVec<[u64; 2]>, u32>,
         bc_lens: SmallVec<[u16; 2]>,
     },
 }
@@ -524,14 +524,14 @@ impl TechNormalizationState {
 impl UnmappedBcCounts {
     fn new_single(bc_len: u16) -> Self {
         UnmappedBcCounts::Single {
-            counts: AHashMap::new(),
+            counts: fixed_map(),
             bc_len,
         }
     }
 
     fn new_multi(bc_lens: SmallVec<[u16; 2]>) -> Self {
         UnmappedBcCounts::Multi {
-            counts: AHashMap::default(),
+            counts: fixed_map(),
             bc_lens,
         }
     }
@@ -1150,7 +1150,7 @@ struct ScatacThreadState<
     Kmer<K>: KmerBits,
 {
     common: CommonThreadState<'a, K, SketchHitInfoSimple, D, C>,
-    unmapped_bc_counts: AHashMap<u64, u32>,
+    unmapped_bc_counts: FixedMap<u64, u32>,
 }
 
 /// Parallel processor for scATAC-seq mapping.
@@ -1265,7 +1265,7 @@ where
 
         let st = self.state.get_or_insert_with(|| ScatacThreadState {
             common: CommonThreadState::new(index, end_cache, &self.opts),
-            unmapped_bc_counts: AHashMap::new(),
+            unmapped_bc_counts: fixed_map(),
         });
         let s = &mut st.common;
         s.ensure_chunk_started();

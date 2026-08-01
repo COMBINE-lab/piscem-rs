@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod hash;
 pub mod index;
 pub mod io;
 pub mod mapping;
