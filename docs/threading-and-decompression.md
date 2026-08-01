@@ -131,7 +131,44 @@ matters.
 **If the remaining 19.4% is worth attacking, the lever is fewer filter probes
 (the skip machinery issuing fewer searches), not a faster probe.**
 
-## 4. Environment overrides (measurement only)
+## 4. Sub-1% A/B differences between binaries are not trustworthy
+
+Two separately-built binaries differ in code and data layout, and that shows up
+as a **systematic** offset -- stable across runs, so extra repetitions do not
+average it away and it reads exactly like a real effect.
+
+Measured directly. Two builds differing only in the sshash SPSS decode, a
+function the tiny backend never calls, were compared on the k=23 probe panel
+(150M read pairs, `--dict auto` -> tiny, so the differing code cannot execute):
+
+| | mean CPU | pairs lost |
+|---|---|---|
+| build A | 263.62 s | -- |
+| build B | 265.54 s (+0.73%) | 4 of 5 |
+
+An earlier round of the same comparison gave +0.77%, 3 of 4. So the floor for
+between-binary comparison on this workload is around **1%**, and it is
+directional and repeatable.
+
+Within a single binary, repetition is fine -- the spread is ~0.5% -- so this is
+a layout artifact, not run-to-run noise.
+
+Consequences for reading anything else here:
+
+- Effects **above ~3%** are safe to attribute (bucket memoization at -11.6%,
+  the k=31 spill fold at -3.2%).
+- Effects **near 1%** are not attributable to the code under test without
+  building each variant several times with perturbed layout. A tiny-dict decode
+  change measured -1.2% on gencode and +1.4% on Flex; both are inside this floor
+  and neither number survives. It was reverted (`a0640b8`) on the grounds that
+  no benefit was demonstrated, not because a regression was proven.
+- The larger input helps precision but **not** this bias: it shrinks run-to-run
+  spread while leaving the layout offset untouched.
+
+Use `-t 1` byte-identical RAD output to confirm correctness, and reserve
+performance claims for effects several times the floor.
+
+## 5. Environment overrides (measurement only)
 
 | variable | effect |
 |---|---|
