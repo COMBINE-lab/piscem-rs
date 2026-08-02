@@ -13,6 +13,12 @@ Reference workloads used throughout:
 | **PBMC** | gencode v49 | 96.3 M | 91 bp | multi-member, ~12 KB |
 | **bulk** | gencode v49 | 96.3 M | 150 bp | single-member |
 
+The bulk set was ERR3239276, which **maps at only 11%** against gencode v49
+(measured at two different offsets in the file, so not a head artifact). It is
+fine for I/O and threading work, where only the byte volume matters, but it is
+the wrong choice for anything that depends on lookup outcomes. Use
+`SRR21186103` instead: 150 bp, **88.8%** mapping rate on the same index.
+
 Machine: AMD EPYC 9575F, 2 sockets x 64 cores.
 
 ## 1. Decompression is usually the constraint, not mapping
@@ -131,7 +137,50 @@ matters.
 **If the remaining 19.4% is worth attacking, the lever is fewer filter probes
 (the skip machinery issuing fewer searches), not a faster probe.**
 
-## 4. Sub-1% A/B differences between binaries are not trustworthy
+## 4. A negative prefilter does not pay on the sshash backend
+
+Tried and **reverted**. The motivation looked strong: dictionary seeds are
+overwhelmingly misses, because a hit is absorbed into a within-unitig extension
+run while every miss costs its own seed.
+
+| workload | mapping rate | seeds / 500K reads | seed miss rate |
+|---|---|---|---|
+| 10x Flex R1 | 97.2% | 46.3 M | 97.7% |
+| ERR3239276 | 11.1% | 53.7 M | 96.9% |
+| SRR21186103 | 88.8% | 10.0 M | 82.2% |
+
+A blocked Bloom filter over the k-mer set, probed before the seed chain, was
+built and swept over 1/2/4/8/16 bits per key. Output stayed byte-identical at
+every size. It lost everywhere, badly:
+
+| bits/key | filter size | SRR21186103 CPU | Flex R1 CPU |
+|---|---|---|---|
+| off | -- | **30.52 s** | **48.82 s** |
+| 1 | 16 MB | -- | 77.73 s |
+| 2 | 32 MB | 47.85 s | 87.59 s |
+| 8 | 128 MB | 43.15 s | 78.65 s |
+| 16 | 256 MB | 47.87 s | -- |
+
+Construction was not the cost -- it parallelizes to 0.09-0.12 s. Three reasons
+it fails, and they compound:
+
+- **The bucket cache already removed the work it was meant to avoid.** 71% of
+  seeds now resolve their bucket from a cached value. The filter adds a probe in
+  front of a chain that is no longer expensive.
+- **Hashing destroys locality.** Consecutive seeds within a read touch nearby
+  unitig positions, so the offsets and string reads have real locality. A Bloom
+  probe is uniformly random by construction, so it is a guaranteed miss with no
+  reuse -- it *adds* an access pattern strictly worse than the one it replaces.
+- **Gate A already said so.** The tiny-dict filter caps at 8 MB on cache
+  residency grounds. Over 96.3 M k-mers even 1 bit/key is 16 MB, so that gate
+  would have rejected every configuration here. The prefilter works on a 1.5 M
+  k-mer probe panel (2 MB, L2-resident) and does not generalize upward.
+
+The lesson generalizes past Bloom filters: on this path, adding *any*
+hash-addressed side structure trades a local access for a random one, and the
+existing chain is local enough that the trade loses.
+
+## 5. Sub-1% A/B differences between binaries are not trustworthy
 
 Two separately-built binaries differ in code and data layout, and that shows up
 as a **systematic** offset -- stable across runs, so extra repetitions do not
@@ -168,7 +217,7 @@ Consequences for reading anything else here:
 Use `-t 1` byte-identical RAD output to confirm correctness, and reserve
 performance claims for effects several times the floor.
 
-## 5. Environment overrides (measurement only)
+## 6. Environment overrides (measurement only)
 
 | variable | effect |
 |---|---|
