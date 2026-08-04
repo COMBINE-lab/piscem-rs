@@ -120,26 +120,32 @@ the 0.064 GB/s measured by a completely different route.
 Cost, measured end-to-end on Flex at one pair: wall 3.46 s versus 3.33 s without
 the probe, CPU 100.32 s versus 102.50 s -- inside the noise floor either way.
 
-Two caveats, both biasing the same, cheap direction:
+The probe measures **producer against consumer**, following paraseq's own
+split: `RecordSet::fill` decodes *and parses* under the per-file mutex, so it is
+the producer and is serialized per file; mapping the filled batch is the
+consumer and runs on every thread. Supply is therefore decode+parse throughput,
+not raw inflate — raw serial decode measures 2.24-2.49 GB/s here, and reporting
+that as supply would overstate it by whatever parsing costs, biasing toward the
+serial decoder, which is the expensive error.
 
-- The probe times **one** thread, so it overstates the per-thread rate a full
-  run achieves under memory contention, inflating demand.
-- Its decode rate still understates supply: 0.85 GB/s measured against the
-  1.45 GB/s a warm stream sustains. The sample is ~1.5 MB, too little to reach
-  steady state, and per-record allocation is charged to the decode phase.
-  `decide` caps the measured rate at the constant, so this can only
-  under-report supply.
+Record sets are kept whole and mapped in place, matching the zero-copy path the
+processors take. An earlier version copied every record out with `to_vec`,
+charging the producer thousands of allocations the real pipeline never performs;
+removing it moved the consumer estimate from 0.081 to **0.064 GB/s**, exactly
+reproducing the figure obtained independently from whole-run CPU accounting.
 
-The probe runs in **two phases** — decode the whole sample into memory, timing
-that, then map all of it, timing that — rather than interleaving them. An
-earlier interleaved version measured "decode while also mapping" and paid two
-clock reads per record. Separating them moved the mapping estimate from 0.060 to
-0.081 GB/s while the decode estimate barely shifted (0.83 -> 0.85), so the
-interleaving was distorting the mapping side, not the decode side as expected.
-A warm-up prefix (an eighth of the sample, capped at 1,000 records) is pulled
-but not timed, excluding file open and first-block decode.
+Page-cache state turned out not to matter: whole-file decode measured 2.24 GB/s
+cold and 2.22 warm on one input, 2.46 and 2.49 on another. Coldness was worth
+checking and is not a factor at these sizes.
 
-Both push toward the parallel decoder, which is the cheap error (-4.9% wall /
+A warm-up record set is pulled but not timed, excluding file open and
+first-block decode.
+
+One caveat remains, biasing the cheap direction: the probe times **one** thread,
+so it overstates the per-thread rate a full run achieves under memory
+contention, inflating demand.
+
+That pushes toward the parallel decoder, which is the cheap error (-4.9% wall /
 +2.1% CPU when unnecessary, against up to 3x wall when wrongly skipped).
 
 For paired chemistries the probe reads **read 2**: read 1 is the technical read
