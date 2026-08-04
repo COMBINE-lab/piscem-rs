@@ -235,6 +235,73 @@ pub const DEFAULT_MARGIN: f64 = 0.8;
 /// unconditionally whenever the answer is not forced.
 pub const DEFAULT_PROBE_RECORDS: usize = 5_000;
 
+/// Pull records from a serial reader and time mapping each one.
+///
+/// The generic bridge between this module and a mapping kernel: `map_one`
+/// receives a record's sequence and does whatever the caller calls mapping.
+/// Records come from a *serial* reader — the decoder that is always available
+/// before any decision has been made — which is why probing never presupposes
+/// its own answer.
+///
+/// Uses `paraseq` so the probe parses exactly like the real pipeline; a
+/// hand-rolled FASTQ splitter here would measure a different thing.
+pub fn probe_path<M>(
+    path: &std::path::Path,
+    sample: usize,
+    mut map_one: M,
+) -> anyhow::Result<Option<InputRates>>
+where
+    M: FnMut(&[u8]),
+{
+    use paraseq::fastx;
+    use paraseq::prelude::*;
+
+    // Serial open: no decoder threads, works on every input kind.
+    let (reader, _fmt) = niffler::send::from_path(path)?;
+    let mut reader = fastx::Reader::new(reader)?;
+    let mut rset = reader.new_record_set();
+
+    let mut pending: Vec<Vec<u8>> = Vec::new();
+    let mut cursor = 0usize;
+
+    let rates = probe(
+        sample,
+        || {
+            loop {
+                if cursor < pending.len() {
+                    let seq = std::mem::take(&mut pending[cursor]);
+                    cursor += 1;
+                    let len = seq.len() as u64;
+                    // Stash for `map_one`, which runs outside this closure.
+                    LAST_SEQ.with(|c| *c.borrow_mut() = seq);
+                    return Some(len);
+                }
+                pending.clear();
+                cursor = 0;
+                match rset.fill(&mut reader) {
+                    Ok(true) => {
+                        for rec in rset.iter().filter_map(Result::ok) {
+                            pending.push(rec.seq().to_vec());
+                        }
+                        if pending.is_empty() {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        },
+        || LAST_SEQ.with(|c| map_one(&c.borrow())),
+    );
+    Ok(rates)
+}
+
+thread_local! {
+    /// Hands the current record from the byte-pulling closure to the mapping
+    /// closure without threading a lifetime through `probe`'s signature.
+    static LAST_SEQ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

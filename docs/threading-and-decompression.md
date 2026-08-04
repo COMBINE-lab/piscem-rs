@@ -87,6 +87,53 @@ probe panel), so the *correct* ratio is index-dependent: about 3.5 threads/file
 for cheap mapping, about 37 for expensive. The ratio rule uses the cheap-mapping
 figure and accepts the small loss on expensive indices, per the asymmetry above.
 
+### Calibration: measure the ambiguous cases
+
+`io::calibrate` decides in two tiers, and is deliberately independent of the
+mapping kernel (the probe takes a closure) so downstream consumers that map
+through this crate can share it.
+
+**Tier 0, `forced_choice`** — logical forcings, no measurement. Non-regular
+input; a single mapping thread; or fewer than 3 threads per file, where serial
+supply already exceeds what those threads consume at the *fastest* per-thread
+rate ever measured here (0.43 GB/s), so no measurement could change the answer.
+
+**Tier 1, `probe` + `decide`** — otherwise, map 5,000 records from the first
+input on one thread through the real kernel and compare demand against supply.
+There is deliberately **no index-size prior**: per-thread consumption spans
+0.064-0.43 GB/s across two measured indices, and two points do not justify
+fitting a curve against a proxy that has not been validated.
+
+Observed decisions, and why each is right:
+
+| workload | files | -t | measured GB/s per thread | decision |
+|---|---|---|---|---|
+| gencode | 1 | 32 | 0.051 | parallel |
+| Flex panel | 2 | 32 | 0.069 | parallel (ratchets to 8-16 workers) |
+| gencode | 8 | 32 | 0.050 | **serial** |
+
+The last row is the point of Tier 1: 8 files at `-t 32` is 4 threads/file, which
+the ratio rule passes, but supply (8 x 0.64) swamps demand (32 x 0.050), and the
+measurement says so. The probe's 0.051 GB/s for gencode independently reproduces
+the 0.064 GB/s measured by a completely different route.
+
+Cost, measured end-to-end on Flex at one pair: wall 3.46 s versus 3.33 s without
+the probe, CPU 100.32 s versus 102.50 s -- inside the noise floor either way.
+
+Two caveats, both biasing the same, cheap direction:
+
+- The probe times **one** thread, so it overstates the per-thread rate a full
+  run achieves under memory contention, inflating demand.
+- Its decode rate is measured over a very short prefix where open and
+  first-block latency dominate: 0.57-0.66 GB/s against the 1.45 GB/s a warm
+  stream sustains. That understates supply.
+
+Both push toward the parallel decoder, which is the cheap error (-4.9% wall /
++2.1% CPU when unnecessary, against up to 3x wall when wrongly skipped).
+
+For paired chemistries the probe reads **read 2**: read 1 is the technical read
+(barcode + UMI), so timing it would measure the wrong sequence.
+
 ### Non-regular inputs (FIFOs, process substitution)
 
 `rapidgzip` gates its parallel path on `file_type().is_file()` and falls back to

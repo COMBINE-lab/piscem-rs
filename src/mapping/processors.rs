@@ -84,7 +84,7 @@ impl Default for MappingOpts {
 
 impl MappingOpts {
     /// Apply these opts to a `MappingCache`, overriding its defaults.
-    fn apply_to<S: crate::mapping::hits::SketchHitInfo>(
+    pub(crate) fn apply_to<S: crate::mapping::hits::SketchHitInfo>(
         &self,
         cache: &mut crate::mapping::cache::MappingCache<S>,
     ) {

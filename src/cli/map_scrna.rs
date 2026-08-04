@@ -411,6 +411,67 @@ where
     Ok(())
 }
 
+/// Run the Tier 1 calibration probe when nothing forces the decoder choice.
+///
+/// Maps a small prefix of the first input on one thread through the real
+/// kernel, so the measured per-thread rate is the rate this index and these
+/// reads actually achieve — not a guess from index size, which two data points
+/// could not support.
+///
+/// Returns `None` when the choice was already forced, when there is no input,
+/// or when the probe itself fails; every one of those falls back to the
+/// ratio rule in `plan_thread_budget`, which is what ran before this existed.
+#[allow(clippy::too_many_arguments)]
+fn calibrate_decoder<const K: usize, S: SketchHitInfo, D: KmerDictionary, C: ContigTableLike>(
+    first_path: Option<&std::path::PathBuf>,
+    num_files: usize,
+    num_threads: usize,
+    index: &ReferenceIndex<D, C>,
+    opts: &crate::mapping::processors::MappingOpts,
+    strat: SkippingStrategy,
+) -> Option<crate::io::calibrate::Decision>
+where
+    Kmer<K>: KmerBits,
+{
+    use crate::io::calibrate;
+
+    let path = first_path?;
+    let kind = calibrate::classify_input(path);
+    if let Some(forced) = calibrate::forced_choice(kind, num_files, num_threads) {
+        tracing::debug!("decoder choice forced: {:?}", forced.reason);
+        return Some(forced);
+    }
+
+    // Ambiguous: measure. One thread's worth of mapping state, matching what a
+    // worker would build.
+    let mut query =
+        crate::mapping::streaming_query::PiscemStreamingQuery::<K, D>::new(index.dict());
+    let mut hs = crate::mapping::hit_searcher::HitSearcher::new(index);
+    let mut cache = crate::mapping::cache::MappingCache::<S>::new(K);
+    opts.apply_to(&mut cache);
+    let mut poison = crate::mapping::filters::PoisonState::new(index.poison_table());
+
+    let rates = calibrate::probe_path(path, calibrate::DEFAULT_PROBE_RECORDS, |seq| {
+        crate::mapping::engine::map_read::<K, S, D, C>(
+            seq, &mut cache, &mut hs, &mut query, index, &mut poison, strat,
+        );
+    })
+    .ok()
+    .flatten()?;
+
+    let decision = calibrate::decide(&rates, num_files, num_threads, calibrate::DEFAULT_MARGIN);
+    tracing::info!(
+        "decoder calibration: {} records, {:.3} GB/s per stream, {:.3} GB/s per mapping thread -> {} ({:?})",
+        rates.records_sampled,
+        rates.decode_gbps_per_stream,
+        rates.map_gbps_per_thread,
+        if decision.parallel { "parallel" } else { "serial" },
+        decision.reason
+    );
+    Some(decision)
+}
+
+
 #[allow(clippy::too_many_arguments)]
 fn run_scrna_pipeline<
     const K: usize,
@@ -456,7 +517,24 @@ where
     // `num_threads` here is already the mapping allotment; `decode_budget`
     // is what the decoders may collectively spend on top of it. Both derive
     // from the same user-supplied `-t`, see `plan_thread_budget`.
-    let plan = crate::io::fastx::plan_thread_budget(num_threads, read1_paths.len() * 2);
+    let mut plan = crate::io::fastx::plan_thread_budget(num_threads, read1_paths.len() * 2);
+    // Tier 1: when nothing forces the choice, measure instead of assuming.
+    if let Some(decision) = calibrate_decoder::<K, S, D, C>(
+        // Probe read 2: in every supported chemistry read 1 is the technical
+        // read (barcode + UMI), so mapping it would time the wrong sequence.
+        read2_paths.first(),
+        read1_paths.len() * 2,
+        num_threads,
+        index,
+        &opts,
+        strat,
+    ) && !decision.parallel
+    {
+        plan.parallel_gzip = false;
+        plan.decode_budget = 0;
+        plan.per_file_ceiling = 0;
+        plan.initial_per_file = 0;
+    }
 
     let mut pairs = Vec::with_capacity(read1_paths.len());
     // Only exists on the rapidgzip path; without it there is nothing to
