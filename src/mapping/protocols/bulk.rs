@@ -21,6 +21,11 @@ impl Protocol for BulkProtocol {
         "bulk"
     }
 
+    fn bio_read_file(&self) -> usize {
+        // Bulk reads are biological from the first file onward.
+        0
+    }
+
     fn is_bio_paired_end(&self) -> bool {
         self.is_paired
     }

@@ -66,6 +66,16 @@ pub struct MapBulkArgs {
     /// Number of mapping threads
     #[arg(short = 't', long, default_value = "16")]
     pub threads: usize,
+    /// Gzip decoder selection: `auto`, `serial`, `parallel`, or `parallel=N`.
+    ///
+    /// `auto` (the default) decides from the input: forced rules first, then a
+    /// brief measurement of decode and mapping rates. Override it when you know
+    /// something the probe cannot — a slow network filesystem, a shared node
+    /// where spending cores on decode is antisocial, or to reproduce a
+    /// measurement. `parallel` still yields on inputs that are not regular
+    /// files, where the parallel decoder degrades to sequential anyway.
+    #[arg(long, default_value = "auto", value_name = "MODE")]
+    pub decoder: String,
     /// K-mer skipping strategy (permissive or strict)
     #[arg(long, default_value = "permissive")]
     pub skipping_strategy: String,
@@ -234,7 +244,10 @@ where
 
     let k = index.k();
     let num_threads = args.threads.max(1);
+    let decoder_pref = crate::io::calibrate::DecoderPreference::parse(&args.decoder)
+        .map_err(|e| anyhow::anyhow!("invalid --decoder value: {e}"))?;
     let opts = MappingOpts {
+        decoder: decoder_pref,
         max_hit_occ: args.max_hit_occ,
         max_hit_occ_recover: args.max_hit_occ_recover,
         max_read_occ: args.max_read_occ,
@@ -337,6 +350,7 @@ where
 /// ratio rule in `plan_thread_budget`, which is what ran before this existed.
 #[allow(clippy::too_many_arguments)]
 fn calibrate_decoder<const K: usize, S: SketchHitInfo, D: KmerDictionary, C: ContigTableLike>(
+    pref: crate::io::calibrate::DecoderPreference,
     first_path: Option<&std::path::PathBuf>,
     num_files: usize,
     num_threads: usize,
@@ -351,6 +365,16 @@ where
 
     let path = first_path?;
     let kind = calibrate::classify_input(path);
+    // An explicit request outranks measurement, but not the forcings: a
+    // preference cannot make a pipe seekable.
+    if let Some(chosen) = calibrate::preference_choice(pref, kind) {
+        tracing::info!(
+            "decoder selected by request: {} ({:?})",
+            if chosen.parallel { "parallel" } else { "serial" },
+            chosen.reason
+        );
+        return Some(chosen);
+    }
     if let Some(forced) = calibrate::forced_choice(kind, num_files, num_threads) {
         tracing::debug!("decoder choice forced: {:?}", forced.reason);
         return Some(forced);
@@ -419,18 +443,30 @@ where
     let mut plan = crate::io::fastx::plan_thread_budget(num_threads, num_input_files);
     // Tier 1: when nothing forces the choice, measure instead of assuming.
     if let Some(decision) = calibrate_decoder::<K, S, D, C>(
+        opts.decoder,
         read1_paths.first(),
         num_input_files,
         num_threads,
         index,
         &opts,
         strat,
-    ) && !decision.parallel
-    {
-        plan.parallel_gzip = false;
-        plan.decode_budget = 0;
-        plan.per_file_ceiling = 0;
-        plan.initial_per_file = 0;
+    ) {
+        if !decision.parallel {
+            plan.parallel_gzip = false;
+            plan.decode_budget = 0;
+            plan.per_file_ceiling = 0;
+            plan.initial_per_file = 0;
+        } else if let crate::io::calibrate::DecoderPreference::Parallel {
+            workers_per_file: Some(w),
+        } = opts.decoder
+        {
+            // An explicit worker count is a ceiling *and* a starting point:
+            // someone naming a number wants it used, not ratcheted up to.
+            plan.parallel_gzip = true;
+            plan.per_file_ceiling = w;
+            plan.initial_per_file = w;
+            plan.decode_budget = w.saturating_mul(num_input_files).max(1);
+        }
     }
     // Only exists on the rapidgzip path; without it there is nothing to
     // supervise and the type would be uninferable.

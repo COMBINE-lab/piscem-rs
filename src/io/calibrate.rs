@@ -95,6 +95,8 @@ pub enum Reason {
     MeasuredDecodeBound,
     /// Measured supply covers measured demand.
     MeasuredConsumerBound,
+    /// The user asked for this decoder explicitly.
+    UserRequested,
 }
 
 /// Decisions that follow from the input alone, before any measurement.
@@ -162,18 +164,38 @@ where
 {
     use std::time::Instant;
 
+    // Warm window: the first records pay to open the file, fault in buffers and
+    // decode the first block, which has nothing to do with steady-state
+    // throughput. Timing from record zero measured 0.57-0.66 GB/s against the
+    // 1.45 GB/s a warm stream sustains -- a 2.2x understatement of supply.
+    // These records are still pulled and mapped, just not timed.
+    let warmup = (sample / 8).clamp(1, WARMUP_RECORDS_MAX);
+
     let mut bytes = 0u64;
     let mut records = 0usize;
     let mut map_elapsed = std::time::Duration::ZERO;
-    let decode_start = Instant::now();
+    let mut decode_start = Instant::now();
 
     while records < sample {
         let Some(len) = next_record() else { break };
-        bytes += len;
-        records += 1;
         let t = Instant::now();
         map_one();
-        map_elapsed += t.elapsed();
+        let this_map = t.elapsed();
+
+        if records < warmup {
+            // Discard everything accumulated so far and restart the clocks, so
+            // the measured window begins warm.
+            records += 1;
+            if records == warmup {
+                bytes = 0;
+                map_elapsed = std::time::Duration::ZERO;
+                decode_start = Instant::now();
+            }
+            continue;
+        }
+        bytes += len;
+        records += 1;
+        map_elapsed += this_map;
     }
 
     if records == 0 || bytes == 0 {
@@ -225,8 +247,79 @@ pub fn decide(
     }
 }
 
+/// A user's explicit instruction about decoder selection.
+///
+/// The escape hatch for someone who knows their machine better than a 5,000
+/// record probe does — an NFS mount where decode is unusually slow, a shared
+/// node where spending cores on decode is antisocial, or simply reproducing a
+/// measurement. `Auto` is the default and nothing changes for users who do not
+/// reach for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecoderPreference {
+    /// Decide by forcing rules, then measurement.
+    #[default]
+    Auto,
+    /// Always use the serial (libz-rs) path.
+    Serial,
+    /// Use the parallel decoder wherever it is possible at all, with an
+    /// optional per-file worker ceiling.
+    ///
+    /// Still yields to [`Reason::NonSeekableInput`]: on a pipe the parallel
+    /// decoder degrades to sequential decoding, so honouring the request
+    /// literally would spend coordinator threads to obtain nothing. A
+    /// preference cannot make an input seekable.
+    Parallel { workers_per_file: Option<usize> },
+}
+
+impl DecoderPreference {
+    /// Resolve `s` as given on a command line: `auto`, `serial`, `parallel`, or
+    /// `parallel=N`.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        let (head, tail) = match s.split_once('=') {
+            Some((h, t)) => (h, Some(t)),
+            None => (s, None),
+        };
+        match (head.to_ascii_lowercase().as_str(), tail) {
+            ("auto", None) => Ok(Self::Auto),
+            ("serial" | "libz" | "libdeflate", None) => Ok(Self::Serial),
+            ("parallel" | "rapidgzip", None) => Ok(Self::Parallel { workers_per_file: None }),
+            ("parallel" | "rapidgzip", Some(n)) => n
+                .parse::<usize>()
+                .map(|w| Self::Parallel { workers_per_file: Some(w.max(1)) })
+                .map_err(|_| format!("`{n}` is not a worker count")),
+            _ => Err(format!(
+                "expected `auto`, `serial`, `parallel`, or `parallel=N`, got `{s}`"
+            )),
+        }
+    }
+}
+
+/// Apply an explicit preference, if it settles the question.
+///
+/// Returns `None` for [`DecoderPreference::Auto`], and for a parallel request
+/// on an input that cannot support it, so the caller falls through to the
+/// normal path in both cases.
+pub fn preference_choice(pref: DecoderPreference, kind: InputKind) -> Option<Decision> {
+    match pref {
+        DecoderPreference::Auto => None,
+        DecoderPreference::Serial => {
+            Some(Decision { parallel: false, reason: Reason::UserRequested })
+        }
+        DecoderPreference::Parallel { .. } if kind == InputKind::Stream => {
+            Some(Decision { parallel: false, reason: Reason::NonSeekableInput })
+        }
+        DecoderPreference::Parallel { .. } => {
+            Some(Decision { parallel: true, reason: Reason::UserRequested })
+        }
+    }
+}
+
 /// Default bias for [`decide`].
 pub const DEFAULT_MARGIN: f64 = 0.8;
+
+/// Upper bound on the untimed warm-up prefix. See [`probe`].
+const WARMUP_RECORDS_MAX: usize = 1_000;
 
 /// Records to sample when probing.
 ///
@@ -370,6 +463,85 @@ mod tests {
     }
 
     #[test]
+    fn preference_parses_its_command_line_forms() {
+        use DecoderPreference as P;
+        assert_eq!(P::parse("auto").unwrap(), P::Auto);
+        assert_eq!(P::parse("serial").unwrap(), P::Serial);
+        assert_eq!(P::parse("PARALLEL").unwrap(), P::Parallel { workers_per_file: None });
+        assert_eq!(
+            P::parse("parallel=8").unwrap(),
+            P::Parallel { workers_per_file: Some(8) }
+        );
+        // A zero worker request is a parallel request, not a serial one.
+        assert_eq!(
+            P::parse("parallel=0").unwrap(),
+            P::Parallel { workers_per_file: Some(1) }
+        );
+        assert!(P::parse("sometimes").is_err());
+        assert!(P::parse("parallel=lots").is_err());
+    }
+
+    #[test]
+    fn a_preference_cannot_make_a_pipe_seekable() {
+        // Honouring `parallel` on a FIFO would spend coordinator threads to get
+        // sequential decoding, so the forcing still wins.
+        let d = preference_choice(
+            DecoderPreference::Parallel { workers_per_file: Some(8) },
+            InputKind::Stream,
+        )
+        .unwrap();
+        assert!(!d.parallel);
+        assert_eq!(d.reason, Reason::NonSeekableInput);
+
+        // On a regular file it is honoured.
+        let d = preference_choice(
+            DecoderPreference::Parallel { workers_per_file: None },
+            InputKind::Regular,
+        )
+        .unwrap();
+        assert!(d.parallel);
+        assert_eq!(d.reason, Reason::UserRequested);
+    }
+
+    #[test]
+    fn auto_defers_to_the_normal_path() {
+        assert!(preference_choice(DecoderPreference::Auto, InputKind::Regular).is_none());
+        assert!(preference_choice(DecoderPreference::Auto, InputKind::Stream).is_none());
+    }
+
+    /// The warm-up prefix must not be counted, or a slow first block drags the
+    /// decode rate down and biases every decision.
+    #[test]
+    fn warmup_records_are_excluded_from_the_measurement() {
+        let mut n = 0;
+        let rates = probe(
+            80,
+            move || {
+                n += 1;
+                if n > 80 {
+                    return None;
+                }
+                // The first records are pathologically slow, as a cold open is.
+                if n <= 10 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Some(1_000_000)
+            },
+            || {},
+        )
+        .unwrap();
+        // 80/8 = 10 warm-up records, so only the fast 70 are measured.
+        assert_eq!(rates.records_sampled, 80);
+        assert_eq!(rates.bytes_sampled, 70_000_000);
+        // Had the slow prefix counted, this would be far lower.
+        assert!(
+            rates.decode_gbps_per_stream > 1.0,
+            "decode rate {} still dragged by the cold prefix",
+            rates.decode_gbps_per_stream
+        );
+    }
+
+    #[test]
     fn probe_reports_none_on_empty_input() {
         assert!(probe(100, || None, || {}).is_none());
     }
@@ -391,7 +563,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rates.records_sampled, 10);
-        assert_eq!(rates.bytes_sampled, 10_000_000);
+        // One record is spent warming up (10/8, floored, clamped to >= 1).
+        assert_eq!(rates.bytes_sampled, 9_000_000);
         // Mapping got ~4x the time, so its rate must be the lower of the two.
         assert!(
             rates.map_gbps_per_thread < rates.decode_gbps_per_stream,

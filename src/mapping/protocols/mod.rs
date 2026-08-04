@@ -58,6 +58,19 @@ pub trait Protocol: Send + Sync {
     /// Whether the biological read is paired-end for mapping purposes.
     fn is_bio_paired_end(&self) -> bool;
 
+    /// Which input file carries the first mappable (biological) sequence:
+    /// `0` for read 1, `1` for read 2.
+    ///
+    /// Used by decoder calibration to time the read that actually gets mapped.
+    /// Every current single-cell chemistry puts the biological sequence in read
+    /// 2 and technical sequence (barcode + UMI) in read 1, so that is the
+    /// default — but it is a property of the geometry, not a law, and
+    /// [`custom::CustomProtocol`] derives it from where `r` appears in the
+    /// user's geometry string rather than assuming.
+    fn bio_read_file(&self) -> usize {
+        1
+    }
+
     /// Extract all sequences (barcodes, UMI, biological reads) from a read pair.
     ///
     /// Returns an [`ExtractedSeqs`] containing:

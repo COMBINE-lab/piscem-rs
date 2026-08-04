@@ -124,15 +124,31 @@ Two caveats, both biasing the same, cheap direction:
 
 - The probe times **one** thread, so it overstates the per-thread rate a full
   run achieves under memory contention, inflating demand.
-- Its decode rate is measured over a very short prefix where open and
-  first-block latency dominate: 0.57-0.66 GB/s against the 1.45 GB/s a warm
-  stream sustains. That understates supply.
+- Its decode rate still understates supply. The probe discards a warm-up prefix
+  (an eighth of the sample, capped at 1,000 records) before starting its clocks,
+  which moved the measured rate from 0.63 to 0.83 GB/s — but a warm stream
+  sustains 1.45 GB/s. The residue is structural: the probe alternates decode and
+  mapping on one thread, so decode never runs ahead the way it does in the real
+  pipeline. `decide` caps the measured rate at the constant, so the error can
+  only under-report supply.
 
 Both push toward the parallel decoder, which is the cheap error (-4.9% wall /
 +2.1% CPU when unnecessary, against up to 3x wall when wrongly skipped).
 
 For paired chemistries the probe reads **read 2**: read 1 is the technical read
 (barcode + UMI), so timing it would measure the wrong sequence.
+
+### Overriding the choice
+
+`--decoder <auto|serial|parallel|parallel=N>`, defaulting to `auto`. For someone
+who knows something the probe cannot: a slow network filesystem, a shared node
+where spending cores on decode is antisocial, or reproducing a measurement.
+`parallel=N` sets the per-file worker count as both ceiling and starting point —
+naming a number means wanting it used, not ratcheted toward.
+
+A preference outranks measurement but **not** the forcings: `parallel` on a FIFO
+still yields, because the parallel decoder degrades to sequential there and a
+preference cannot make an input seekable.
 
 ### Non-regular inputs (FIFOs, process substitution)
 

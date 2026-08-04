@@ -22,6 +22,10 @@ use super::{BarcodeDesc, BarcodeRole, ExtractedSeqs, Protocol};
 #[derive(Debug, Clone)]
 pub struct CustomProtocol {
     compiled: CompiledGeom,
+    /// Which input file the geometry's first `r` piece lives in. Derived from
+    /// the parsed geometry rather than assumed, so an unusual layout such as
+    /// `1{r:}2{b[16]u[12]x:}` calibrates against the right read.
+    bio_read_file: usize,
 }
 
 impl CustomProtocol {
@@ -45,6 +49,10 @@ impl CustomProtocol {
 impl Protocol for CustomProtocol {
     fn name(&self) -> &str {
         "custom"
+    }
+
+    fn bio_read_file(&self) -> usize {
+        self.bio_read_file
     }
 
     fn is_bio_paired_end(&self) -> bool {
@@ -134,7 +142,19 @@ pub fn parse_custom_geometry(geom: &str) -> Result<CustomProtocol> {
     let compiled = CompiledGeom::from_fragment_geom(&fragment_geom)
         .map_err(|e| anyhow::anyhow!("Failed to compile geometry '{}': {}", geom, e))?;
 
-    Ok(CustomProtocol { compiled })
+    // Which read carries mappable sequence. Read 1 wins when both do, matching
+    // the order `extract` returns them in.
+    let has_read = |rg: &sgp::ReadGeom| {
+        rg.parts
+            .iter()
+            .any(|p| matches!(p.tag, sgp::GeoTagType::Read))
+    };
+    let bio_read_file = if has_read(&fragment_geom.read1) { 0 } else { 1 };
+
+    Ok(CustomProtocol {
+        compiled,
+        bio_read_file,
+    })
 }
 
 // ---------------------------------------------------------------------------
