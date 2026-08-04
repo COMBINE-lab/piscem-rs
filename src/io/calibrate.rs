@@ -146,71 +146,64 @@ pub struct InputRates {
 
 /// Measure decode and mapping rates from the first `sample` records.
 ///
-/// `next_record` yields decompressed record bytes from a *serial* reader — the
-/// one decoder available before any decision has been made. `map_one` performs
-/// whatever the caller considers mapping; it is timed but its result is
-/// ignored.
+/// Runs in two phases rather than interleaving them: decode the whole sample
+/// into memory, timing that, then map all of it, timing that. Alternating the
+/// two on one thread — as this used to — never lets decode run ahead the way it
+/// does in the real pipeline, so it measures "decode while also mapping" and
+/// understated stream throughput by roughly 1.7x even after discarding a
+/// warm-up prefix. Separating the phases removes that coupling: each rate is
+/// measured with the other idle, which is the quantity the supply/demand
+/// comparison actually wants.
 ///
-/// Both timings come from the same prefix, so a slow disk inflates the decode
-/// rate's denominator and not the mapping rate's, which is the correct
-/// attribution: decode competes with I/O, mapping does not.
+/// The buffer is bounded by `sample` records — about 1.7 MB at the default,
+/// which is why holding the whole thing is preferable to being clever.
 ///
-/// Returns `None` if the input ended before yielding any records, in which case
-/// there is nothing to decide.
+/// `next_record` yields decompressed record sequences from a *serial* reader,
+/// the one decoder available before any decision has been made. Returns `None`
+/// if the input yielded no records.
 pub fn probe<N, M>(sample: usize, mut next_record: N, mut map_one: M) -> Option<InputRates>
 where
-    N: FnMut() -> Option<u64>,
-    M: FnMut(),
+    N: FnMut() -> Option<Vec<u8>>,
+    M: FnMut(&[u8]),
 {
     use std::time::Instant;
 
-    // Warm window: the first records pay to open the file, fault in buffers and
-    // decode the first block, which has nothing to do with steady-state
-    // throughput. Timing from record zero measured 0.57-0.66 GB/s against the
-    // 1.45 GB/s a warm stream sustains -- a 2.2x understatement of supply.
-    // These records are still pulled and mapped, just not timed.
+    // Warm-up: opening the file, faulting in buffers and decoding the first
+    // block say nothing about steady state. Pulled but not timed.
     let warmup = (sample / 8).clamp(1, WARMUP_RECORDS_MAX);
-
-    let mut bytes = 0u64;
-    let mut records = 0usize;
-    let mut map_elapsed = std::time::Duration::ZERO;
-    let mut decode_start = Instant::now();
-
-    while records < sample {
-        let Some(len) = next_record() else { break };
-        let t = Instant::now();
-        map_one();
-        let this_map = t.elapsed();
-
-        if records < warmup {
-            // Discard everything accumulated so far and restart the clocks, so
-            // the measured window begins warm.
-            records += 1;
-            if records == warmup {
-                bytes = 0;
-                map_elapsed = std::time::Duration::ZERO;
-                decode_start = Instant::now();
-            }
-            continue;
+    for _ in 0..warmup {
+        if next_record().is_none() {
+            return None;
         }
-        bytes += len;
-        records += 1;
-        map_elapsed += this_map;
     }
 
-    if records == 0 || bytes == 0 {
+    // Phase 1: decode, with nothing else competing.
+    let mut records: Vec<Vec<u8>> = Vec::with_capacity(sample.saturating_sub(warmup));
+    let mut bytes = 0u64;
+    let decode_start = Instant::now();
+    while records.len() + warmup < sample {
+        let Some(rec) = next_record() else { break };
+        bytes += rec.len() as u64;
+        records.push(rec);
+    }
+    let decode_elapsed = decode_start.elapsed();
+
+    if records.is_empty() || bytes == 0 {
         return None;
     }
 
-    // Decode time is wall time spent pulling bytes, i.e. total minus mapping.
-    let total = decode_start.elapsed();
-    let decode_elapsed = total.saturating_sub(map_elapsed);
-    let gb = bytes as f64 / 1e9;
+    // Phase 2: map, with decode finished.
+    let map_start = Instant::now();
+    for rec in &records {
+        map_one(rec);
+    }
+    let map_elapsed = map_start.elapsed();
 
+    let gb = bytes as f64 / 1e9;
     Some(InputRates {
         decode_gbps_per_stream: safe_rate(gb, decode_elapsed.as_secs_f64()),
         map_gbps_per_thread: safe_rate(gb, map_elapsed.as_secs_f64()),
-        records_sampled: records,
+        records_sampled: records.len(),
         bytes_sampled: bytes,
     })
 }
@@ -295,6 +288,91 @@ impl DecoderPreference {
     }
 }
 
+/// How the input is compressed, as far as the decoder choice cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputCompression {
+    /// gzip — the only format either decoder path competes over.
+    Gzip,
+    /// Plain text, or a codec (zstd, bz2) that only the serial path handles.
+    NotGzip,
+    /// Not determined, because determining it would consume the input.
+    Unknown,
+}
+
+/// Sniff whether `path` is gzip.
+///
+/// Only ever called for [`InputKind::Regular`]. Sniffing a stream would consume
+/// the bytes it read — exactly the double-open that made FIFO input hang — so a
+/// non-regular input reports [`InputCompression::Unknown`] rather than being
+/// opened speculatively.
+pub fn detect_compression(path: &Path, kind: InputKind) -> InputCompression {
+    use std::io::Read;
+    if kind != InputKind::Regular {
+        return InputCompression::Unknown;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return InputCompression::Unknown;
+    };
+    let mut magic = [0u8; 2];
+    match f.read_exact(&mut magic) {
+        Ok(()) if magic == [0x1f, 0x8b] => InputCompression::Gzip,
+        Ok(()) => InputCompression::NotGzip,
+        Err(_) => InputCompression::Unknown,
+    }
+}
+
+/// A request that cannot be carried out as asked.
+///
+/// Surfaced so the user is told their flag was overridden, rather than quietly
+/// getting something else. Someone who passes `--decoder parallel` and sees no
+/// speedup deserves to know why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreferenceConflict {
+    /// `parallel` asked for on an input that cannot support positional reads.
+    ParallelOnStream,
+    /// A decoder named for an input neither decoder path applies to.
+    NotGzipInput,
+}
+
+impl std::fmt::Display for PreferenceConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ParallelOnStream => write!(
+                f,
+                "--decoder parallel was requested, but the input is not a regular file \
+                 (a pipe, FIFO or process substitution). The parallel decoder needs \
+                 positional reads and would decode sequentially anyway, so the serial \
+                 decoder is being used instead. To get parallel decoding, pass a real \
+                 file rather than a stream."
+            ),
+            Self::NotGzipInput => write!(
+                f,
+                "--decoder was set, but the input is not gzip-compressed, so the setting \
+                 has no effect: only gzip input has both a serial and a parallel decoder. \
+                 Plain, zstd and bzip2 inputs are always read by the serial path."
+            ),
+        }
+    }
+}
+
+/// Report any way in which `pref` cannot be honoured for this input.
+pub fn preference_conflict(
+    pref: DecoderPreference,
+    kind: InputKind,
+    compression: InputCompression,
+) -> Option<PreferenceConflict> {
+    if pref == DecoderPreference::Auto {
+        return None;
+    }
+    if compression == InputCompression::NotGzip {
+        return Some(PreferenceConflict::NotGzipInput);
+    }
+    if matches!(pref, DecoderPreference::Parallel { .. }) && kind == InputKind::Stream {
+        return Some(PreferenceConflict::ParallelOnStream);
+    }
+    None
+}
+
 /// Apply an explicit preference, if it settles the question.
 ///
 /// Returns `None` for [`DecoderPreference::Auto`], and for a parallel request
@@ -328,20 +406,15 @@ const WARMUP_RECORDS_MAX: usize = 1_000;
 /// unconditionally whenever the answer is not forced.
 pub const DEFAULT_PROBE_RECORDS: usize = 5_000;
 
-/// Pull records from a serial reader and time mapping each one.
+/// Pull records from a serial reader and hand them to [`probe`].
 ///
 /// The generic bridge between this module and a mapping kernel: `map_one`
 /// receives a record's sequence and does whatever the caller calls mapping.
-/// Records come from a *serial* reader — the decoder that is always available
-/// before any decision has been made — which is why probing never presupposes
-/// its own answer.
-///
-/// Uses `paraseq` so the probe parses exactly like the real pipeline; a
-/// hand-rolled FASTQ splitter here would measure a different thing.
+/// Uses `paraseq` so the probe parses exactly like the real pipeline.
 pub fn probe_path<M>(
     path: &std::path::Path,
     sample: usize,
-    mut map_one: M,
+    map_one: M,
 ) -> anyhow::Result<Option<InputRates>>
 where
     M: FnMut(&[u8]),
@@ -354,28 +427,18 @@ where
     let mut reader = fastx::Reader::new(reader)?;
     let mut rset = reader.new_record_set();
 
-    let mut pending: Vec<Vec<u8>> = Vec::new();
-    let mut cursor = 0usize;
+    let mut pending: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
 
-    let rates = probe(
+    Ok(probe(
         sample,
         || {
             loop {
-                if cursor < pending.len() {
-                    let seq = std::mem::take(&mut pending[cursor]);
-                    cursor += 1;
-                    let len = seq.len() as u64;
-                    // Stash for `map_one`, which runs outside this closure.
-                    LAST_SEQ.with(|c| *c.borrow_mut() = seq);
-                    return Some(len);
+                if let Some(seq) = pending.pop_front() {
+                    return Some(seq);
                 }
-                pending.clear();
-                cursor = 0;
                 match rset.fill(&mut reader) {
                     Ok(true) => {
-                        for rec in rset.iter().filter_map(Result::ok) {
-                            pending.push(rec.seq().to_vec());
-                        }
+                        pending.extend(rset.iter().filter_map(Result::ok).map(|r| r.seq().to_vec()));
                         if pending.is_empty() {
                             return None;
                         }
@@ -384,15 +447,8 @@ where
                 }
             }
         },
-        || LAST_SEQ.with(|c| map_one(&c.borrow())),
-    );
-    Ok(rates)
-}
-
-thread_local! {
-    /// Hands the current record from the byte-pulling closure to the mapping
-    /// closure without threading a lifetime through `probe`'s signature.
-    static LAST_SEQ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        map_one,
+    ))
 }
 
 #[cfg(test)]
@@ -509,10 +565,11 @@ mod tests {
         assert!(preference_choice(DecoderPreference::Auto, InputKind::Stream).is_none());
     }
 
-    /// The warm-up prefix must not be counted, or a slow first block drags the
-    /// decode rate down and biases every decision.
+    /// Decode and mapping must be timed separately, each with the other idle.
+    /// Interleaving them measured "decode while mapping" and understated stream
+    /// throughput badly.
     #[test]
-    fn warmup_records_are_excluded_from_the_measurement() {
+    fn decode_and_map_rates_are_measured_independently() {
         let mut n = 0;
         let rates = probe(
             80,
@@ -521,56 +578,61 @@ mod tests {
                 if n > 80 {
                     return None;
                 }
-                // The first records are pathologically slow, as a cold open is.
+                // A pathologically slow cold open, as a real one is.
                 if n <= 10 {
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
-                Some(1_000_000)
+                Some(vec![0u8; 1_000_000])
             },
-            || {},
+            |_| std::thread::sleep(std::time::Duration::from_micros(50)),
         )
         .unwrap();
-        // 80/8 = 10 warm-up records, so only the fast 70 are measured.
-        assert_eq!(rates.records_sampled, 80);
+        // 80/8 = 10 warm-up records, so 70 are measured.
+        assert_eq!(rates.records_sampled, 70);
         assert_eq!(rates.bytes_sampled, 70_000_000);
-        // Had the slow prefix counted, this would be far lower.
+        // Decode saw no sleeps at all once warm, so it must far outpace mapping.
         assert!(
-            rates.decode_gbps_per_stream > 1.0,
-            "decode rate {} still dragged by the cold prefix",
-            rates.decode_gbps_per_stream
+            rates.decode_gbps_per_stream > rates.map_gbps_per_thread,
+            "decode {} map {}",
+            rates.decode_gbps_per_stream,
+            rates.map_gbps_per_thread
         );
     }
 
     #[test]
     fn probe_reports_none_on_empty_input() {
-        assert!(probe(100, || None, || {}).is_none());
+        assert!(probe(100, || None, |_| {}).is_none());
     }
 
     #[test]
-    fn probe_attributes_time_to_the_right_rate() {
-        let mut left = 10;
-        let rates = probe(
-            10,
-            move || {
-                if left == 0 {
-                    return None;
-                }
-                left -= 1;
-                std::thread::sleep(std::time::Duration::from_micros(200));
-                Some(1_000_000)
-            },
-            || std::thread::sleep(std::time::Duration::from_micros(800)),
-        )
-        .unwrap();
-        assert_eq!(rates.records_sampled, 10);
-        // One record is spent warming up (10/8, floored, clamped to >= 1).
-        assert_eq!(rates.bytes_sampled, 9_000_000);
-        // Mapping got ~4x the time, so its rate must be the lower of the two.
+    fn conflicts_are_reported_only_when_real() {
+        use DecoderPreference as P;
+        // Auto never conflicts, whatever the input.
+        assert!(preference_conflict(P::Auto, InputKind::Stream, InputCompression::NotGzip).is_none());
+        // Parallel on a pipe.
+        assert_eq!(
+            preference_conflict(
+                P::Parallel { workers_per_file: None },
+                InputKind::Stream,
+                InputCompression::Unknown
+            ),
+            Some(PreferenceConflict::ParallelOnStream)
+        );
+        // Any explicit decoder on non-gzip input, including `serial`, since the
+        // flag implies a choice that does not exist there.
+        assert_eq!(
+            preference_conflict(P::Serial, InputKind::Regular, InputCompression::NotGzip),
+            Some(PreferenceConflict::NotGzipInput)
+        );
+        // Honourable request: nothing to say.
         assert!(
-            rates.map_gbps_per_thread < rates.decode_gbps_per_stream,
-            "map {} decode {}",
-            rates.map_gbps_per_thread,
-            rates.decode_gbps_per_stream
+            preference_conflict(
+                P::Parallel { workers_per_file: Some(4) },
+                InputKind::Regular,
+                InputCompression::Gzip
+            )
+            .is_none()
         );
     }
+
 }

@@ -124,13 +124,20 @@ Two caveats, both biasing the same, cheap direction:
 
 - The probe times **one** thread, so it overstates the per-thread rate a full
   run achieves under memory contention, inflating demand.
-- Its decode rate still understates supply. The probe discards a warm-up prefix
-  (an eighth of the sample, capped at 1,000 records) before starting its clocks,
-  which moved the measured rate from 0.63 to 0.83 GB/s — but a warm stream
-  sustains 1.45 GB/s. The residue is structural: the probe alternates decode and
-  mapping on one thread, so decode never runs ahead the way it does in the real
-  pipeline. `decide` caps the measured rate at the constant, so the error can
-  only under-report supply.
+- Its decode rate still understates supply: 0.85 GB/s measured against the
+  1.45 GB/s a warm stream sustains. The sample is ~1.5 MB, too little to reach
+  steady state, and per-record allocation is charged to the decode phase.
+  `decide` caps the measured rate at the constant, so this can only
+  under-report supply.
+
+The probe runs in **two phases** — decode the whole sample into memory, timing
+that, then map all of it, timing that — rather than interleaving them. An
+earlier interleaved version measured "decode while also mapping" and paid two
+clock reads per record. Separating them moved the mapping estimate from 0.060 to
+0.081 GB/s while the decode estimate barely shifted (0.83 -> 0.85), so the
+interleaving was distorting the mapping side, not the decode side as expected.
+A warm-up prefix (an eighth of the sample, capped at 1,000 records) is pulled
+but not timed, excluding file open and first-block decode.
 
 Both push toward the parallel decoder, which is the cheap error (-4.9% wall /
 +2.1% CPU when unnecessary, against up to 3x wall when wrongly skipped).
@@ -149,6 +156,12 @@ naming a number means wanting it used, not ratcheted toward.
 A preference outranks measurement but **not** the forcings: `parallel` on a FIFO
 still yields, because the parallel decoder degrades to sequential there and a
 preference cannot make an input seekable.
+
+**A request that cannot be honoured warns**, at `WARN`, visible without setting
+`RUST_LOG` — the subscriber floors at `warn` when the variable is unset, since a
+message saying a flag was overridden is useless if only visible to someone who
+already suspected a problem. Two cases: `parallel` on a non-regular input, and
+any explicit decoder on input that is not gzip, where neither path competes.
 
 ### Non-regular inputs (FIFOs, process substitution)
 

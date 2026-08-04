@@ -365,6 +365,13 @@ where
 
     let path = first_path?;
     let kind = calibrate::classify_input(path);
+    // Tell the user when their flag cannot be carried out, rather than quietly
+    // doing something else.
+    let compression = calibrate::detect_compression(path, kind);
+    if let Some(conflict) = calibrate::preference_conflict(pref, kind, compression) {
+        tracing::warn!("{}", conflict);
+    }
+
     // An explicit request outranks measurement, but not the forcings: a
     // preference cannot make a pipe seekable.
     if let Some(chosen) = calibrate::preference_choice(pref, kind) {
