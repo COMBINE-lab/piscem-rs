@@ -87,6 +87,23 @@ probe panel), so the *correct* ratio is index-dependent: about 3.5 threads/file
 for cheap mapping, about 37 for expensive. The ratio rule uses the cheap-mapping
 figure and accepts the small loss on expensive indices, per the asymmetry above.
 
+### Non-regular inputs (FIFOs, process substitution)
+
+`rapidgzip` gates its parallel path on `file_type().is_file()` and falls back to
+*sequential* decoding otherwise, so it has nothing to offer on a pipe. Such
+inputs take the serial path unconditionally (`calibrate::Reason::NonSeekableInput`).
+
+This also fixes a hang. `open_gz_rapidgzip` sniffs the gzip magic by opening the
+path, reading two bytes, and closing it, then calls `decoder.open(path)` which
+opens it *again*. On a FIFO the sniff consumes those bytes and closes the read
+end, and the re-open blocks forever waiting for a writer that has exited — so
+`-r <(zcat ...)` hung indefinitely with the `rapidgzip` feature enabled, while
+the serial build handled it fine.
+
+Confirmed to be ours and not upstream: `rapidgzip-core` alone, opening the same
+FIFO with no prior open of the path, decompresses it correctly and byte-for-byte
+identically to the regular file. Nothing was reported upstream.
+
 ## 3. Thread budget: how `-t` is split
 
 `plan_thread_budget` splits the user's budget between mapping and decoding, and

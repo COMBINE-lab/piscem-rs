@@ -116,8 +116,17 @@ pub(crate) fn open_input(
 
     // `ceiling == 0` selects the serial path explicitly (see
     // `MIN_THREADS_PER_FILE_FOR_PARALLEL`), independent of whether the feature is on.
+    //
+    // Non-regular inputs are excluded here rather than left to the decoder.
+    // `rapidgzip` gates its parallel path on `file_type().is_file()` and falls
+    // back to sequential decoding otherwise, so it has nothing to offer on a
+    // FIFO -- and reaching it is actively harmful, because the magic sniff
+    // below opens the path, consumes two bytes, and closes it, after which
+    // re-opening a FIFO blocks forever waiting for a writer that has gone.
+    // Process substitution (`-r <(zcat ...)`) hits exactly this.
     #[cfg(feature = "rapidgzip")]
     if ceiling > 0
+        && crate::io::calibrate::classify_input(path) == crate::io::calibrate::InputKind::Regular
         && let Some(opened) = open_gz_rapidgzip(path, ceiling, initial_limit)?
     {
         return Ok(opened);
@@ -255,6 +264,9 @@ pub(crate) fn plan_thread_budget(map_threads: usize, num_files: usize) -> Thread
     let files = num_files.max(1);
 
     // Serial per-file streams already supply enough for the mapping threads.
+    // This mirrors `calibrate::forced_choice`'s `AmpleSerialSupply` arm; the
+    // per-file `InputKind` check lives in `open_input`, since a run can mix
+    // regular files and FIFOs.
     if map_threads / files < MIN_THREADS_PER_FILE_FOR_PARALLEL {
         return ThreadBudget {
             decode_budget: 0,
