@@ -40,11 +40,17 @@ use std::path::Path;
 
 /// Decompressed GB/s obtainable from one serial inflate stream.
 ///
-/// Deliberately the conservative (multi-member) figure: measured 2.40 GB/s on
-/// single-member archives and 1.45 GB/s on multi-member ones. Underestimating
-/// supply biases toward the parallel decoder, which is the cheap error — see
-/// [`decide`].
-const SERIAL_GBPS_PER_STREAM: f64 = 1.45;
+/// A ceiling on the measured producer rate, not an estimate of it.
+///
+/// Whole-file serial decode measures 2.24 GB/s (single-member) and 2.49 GB/s
+/// (multi-member) on this hardware, cold and warm alike — page-cache state made
+/// no measurable difference. The producer also parses, so its real rate is
+/// below this; the constant exists only to stop an anomalous probe from
+/// inventing supply that no stream can deliver.
+///
+/// Set to the lower of the two measured ceilings. Underestimating supply biases
+/// toward the parallel decoder, which is the cheap error — see [`decide`].
+const SERIAL_GBPS_PER_STREAM: f64 = 2.24;
 
 /// What kind of input this is, which decides whether a restart is even possible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,49 +412,86 @@ const WARMUP_RECORDS_MAX: usize = 1_000;
 /// unconditionally whenever the answer is not forced.
 pub const DEFAULT_PROBE_RECORDS: usize = 5_000;
 
-/// Pull records from a serial reader and hand them to [`probe`].
+/// Measure the producer and consumer sides of the pipeline on a prefix.
 ///
-/// The generic bridge between this module and a mapping kernel: `map_one`
-/// receives a record's sequence and does whatever the caller calls mapping.
-/// Uses `paraseq` so the probe parses exactly like the real pipeline.
+/// The split follows `paraseq`'s own: `RecordSet::fill` performs decode **and**
+/// parsing under the per-file mutex, so it is the *producer* and is serialized
+/// per input file; mapping the filled batch is the *consumer* and runs on every
+/// thread. Supply is therefore decode+parse throughput, not raw inflate.
+///
+/// That distinction matters and is easy to get backwards. Raw serial inflate
+/// measures 2.2-2.5 GB/s on these inputs, but a probe reporting that as supply
+/// would overstate it by whatever parsing costs, biasing toward the serial
+/// decoder -- the expensive error. Parsing has to be charged to the producer
+/// because that is where the real pipeline pays it.
+///
+/// Record sets are kept whole and mapped in place, matching the zero-copy path
+/// the processors take. An earlier version copied each record out with
+/// `to_vec`, charging thousands of allocations to the producer that the real
+/// pipeline never performs.
 pub fn probe_path<M>(
     path: &std::path::Path,
     sample: usize,
-    map_one: M,
+    mut map_one: M,
 ) -> anyhow::Result<Option<InputRates>>
 where
     M: FnMut(&[u8]),
 {
     use paraseq::fastx;
     use paraseq::prelude::*;
+    use std::time::Instant;
 
     // Serial open: no decoder threads, works on every input kind.
     let (reader, _fmt) = niffler::send::from_path(path)?;
     let mut reader = fastx::Reader::new(reader)?;
-    let mut rset = reader.new_record_set();
 
-    let mut pending: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+    // Warm-up: one set, pulled and discarded, so opening the file and decoding
+    // the first block are not charged to steady state.
+    let mut warm = reader.new_record_set();
+    if !warm.fill(&mut reader).unwrap_or(false) {
+        return Ok(None);
+    }
+    drop(warm);
 
-    Ok(probe(
-        sample,
-        || {
-            loop {
-                if let Some(seq) = pending.pop_front() {
-                    return Some(seq);
-                }
-                match rset.fill(&mut reader) {
-                    Ok(true) => {
-                        pending.extend(rset.iter().filter_map(Result::ok).map(|r| r.seq().to_vec()));
-                        if pending.is_empty() {
-                            return None;
-                        }
-                    }
-                    _ => return None,
-                }
-            }
-        },
-        map_one,
-    ))
+    // Producer: decode + parse, nothing else running.
+    let mut sets: Vec<fastx::RecordSet> = Vec::new();
+    let mut records = 0usize;
+    let mut bytes = 0u64;
+    let produce_start = Instant::now();
+    while records < sample {
+        let mut rs = reader.new_record_set();
+        match rs.fill(&mut reader) {
+            Ok(true) => {}
+            _ => break,
+        }
+        for rec in rs.iter().filter_map(Result::ok) {
+            records += 1;
+            bytes += rec.seq().as_ref().len() as u64;
+        }
+        sets.push(rs);
+    }
+    let produce_elapsed = produce_start.elapsed();
+
+    if records == 0 || bytes == 0 {
+        return Ok(None);
+    }
+
+    // Consumer: map in place, producer finished.
+    let consume_start = Instant::now();
+    for rs in &sets {
+        for rec in rs.iter().filter_map(Result::ok) {
+            map_one(rec.seq().as_ref());
+        }
+    }
+    let consume_elapsed = consume_start.elapsed();
+
+    let gb = bytes as f64 / 1e9;
+    Ok(Some(InputRates {
+        decode_gbps_per_stream: safe_rate(gb, produce_elapsed.as_secs_f64()),
+        map_gbps_per_thread: safe_rate(gb, consume_elapsed.as_secs_f64()),
+        records_sampled: records,
+        bytes_sampled: bytes,
+    }))
 }
 
 #[cfg(test)]
