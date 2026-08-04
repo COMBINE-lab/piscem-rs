@@ -115,7 +115,7 @@ pub(crate) fn open_input(
     let path = path.as_ref();
 
     // `ceiling == 0` selects the serial path explicitly (see
-    // `SERIAL_GZIP_FILE_THRESHOLD`), independent of whether the feature is on.
+    // `MIN_THREADS_PER_FILE_FOR_PARALLEL`), independent of whether the feature is on.
     #[cfg(feature = "rapidgzip")]
     if ceiling > 0
         && let Some(opened) = open_gz_rapidgzip(path, ceiling, initial_limit)?
@@ -176,27 +176,40 @@ pub(crate) struct ThreadBudget {
     pub parallel_gzip: bool,
 }
 
-/// Input files at or above which serial per-file decoding already saturates
-/// mapping, making the parallel decoder counterproductive.
+/// Minimum mapping threads per input file before the parallel decoder is worth
+/// its overhead.
 ///
-/// Supply scales with the number of inflate *streams*, and niffler gets one per
-/// file — so this counts files, not pairs (8 files = 4 paired sets, or 8
-/// single-end inputs).
+/// The serial path opens exactly one inflate stream per file, so its supply is
+/// `files x per-stream rate` and does not respond to `-t` at all. Demand is
+/// `map_threads x per-thread consumption`. The parallel decoder therefore pays
+/// off on the *ratio*, not on file count -- which the previous file-count
+/// threshold got right only at the `-t 32` it was calibrated at.
 ///
-/// Measured with total data held constant, medians of 2 reps, `-t 32`:
+/// Measured (10x Flex probe panel, multi-member archives, wall-clock speedup of
+/// the parallel decoder over the serial one):
 ///
-/// | pairs | single-member niffler / rgz | multi-member niffler / rgz |
-/// |---|---|---|
-/// | 1 | 19.43 / **17.53** | 9.71 / **3.24** |
-/// | 2 | 9.75 / **9.22**   | 5.09 / **3.03** |
-/// | 4 | **5.71** / 6.12   | **2.92** / 3.13 |
-/// | 8 | **5.54** / 6.16   | **2.89** / 3.18 |
+/// | files | threads/file | speedup |
+/// |------:|-------------:|--------:|
+/// |     2 |            4 |   1.09x |
+/// |     2 |            8 |   1.92x |
+/// |     2 |           16 |   3.05x |
+/// |     4 |            4 |   1.07x |
+/// |     4 |            8 |   1.54x |
+/// |     4 |           16 |   2.08x |
+/// |     8 |            4 |   0.92x |
+/// |     8 |            8 |   1.20x |
 ///
-/// The crossover is 2-4 pairs in *both* member structures; density changes how
-/// much the parallel decoder wins below it (1.1x vs 3.0x at one pair), not where
-/// the crossing happens. Past it the parallel decoder costs 21-26% more CPU to
-/// run slower, because its per-file workers compete with mapping for cores.
-const SERIAL_GZIP_FILE_THRESHOLD: usize = 8;
+/// The old `files >= 8` rule left 1.20x on the table at 8 files / 64 threads,
+/// and switched on at 8 files / 32 threads where the parallel decoder loses.
+///
+/// Set at 4 rather than 8 because the payoff is sharply asymmetric. Enabling it
+/// when it is not needed costs a few percent: on a 96.3 M-k-mer transcriptome,
+/// where mapping is so slow that decode never binds, the parallel path measured
+/// -3.7% wall and +1.7% CPU. Not enabling it when it is needed costs up to 3x
+/// wall. The dynamic supervisor absorbs the rest: decoders start at one worker
+/// and grow only on demonstrated starvation, so an unnecessary parallel path
+/// degenerates to roughly the serial cost rather than to its ceiling.
+const MIN_THREADS_PER_FILE_FOR_PARALLEL: usize = 4;
 
 /// Decide the decompression share of the thread budget.
 ///
@@ -223,7 +236,9 @@ const SERIAL_GZIP_FILE_THRESHOLD: usize = 8;
 ///
 /// `num_files` matters because throughput on the serial path scales with file
 /// count (one inflate stream per file), so many inputs already supply
-/// parallelism and need proportionally less help per file.
+/// parallelism and need proportionally less help per file. Whether the parallel
+/// decoder is used at all is decided by the threads-per-file ratio; see
+/// [`MIN_THREADS_PER_FILE_FOR_PARALLEL`].
 pub(crate) fn plan_thread_budget(map_threads: usize, num_files: usize) -> ThreadBudget {
     if let Ok(v) = std::env::var("PISCEM_RAPIDGZIP_THREADS")
         && let Ok(per_file) = v.parse::<usize>()
@@ -239,8 +254,8 @@ pub(crate) fn plan_thread_budget(map_threads: usize, num_files: usize) -> Thread
 
     let files = num_files.max(1);
 
-    // Enough files that serial per-file streams already saturate mapping.
-    if files >= SERIAL_GZIP_FILE_THRESHOLD {
+    // Serial per-file streams already supply enough for the mapping threads.
+    if map_threads / files < MIN_THREADS_PER_FILE_FOR_PARALLEL {
         return ThreadBudget {
             decode_budget: 0,
             per_file_ceiling: 0,

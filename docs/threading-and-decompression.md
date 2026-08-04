@@ -36,7 +36,58 @@ parallel, lifting the ceiling without changing paraseq's structure:
 Non-gzip input (plain, zstd, bz2) keeps the niffler path and allocates no
 decoder threads.
 
-## 2. Thread budget: how `-t` is split
+## 2. Choosing the decoder: threads per file, not file count
+
+The serial (niffler/libz-rs) path opens exactly one inflate stream per input
+file, so its supply is `files x per-stream rate` and does **not** respond to
+`-t`. Demand is `map_threads x per-thread consumption`. The parallel decoder
+therefore pays off on the *ratio*, and a file-count threshold is only right at
+the thread count it was calibrated at.
+
+Measured on the 10x Flex probe panel (multi-member archives), wall-clock
+speedup of the parallel decoder over the serial one:
+
+| files | threads/file | speedup |
+|------:|-------------:|--------:|
+| 2 | 4 | 1.09x |
+| 2 | 8 | 1.92x |
+| 2 | 16 | 3.05x |
+| 4 | 4 | 1.07x |
+| 4 | 8 | 1.54x |
+| 4 | 16 | 2.08x |
+| 8 | 4 | 0.92x |
+| 8 | 8 | 1.20x |
+
+The serial path's wall clock floors at a level set purely by file count -- ~9.8 s
+at one pair, ~5.0 s at two, ~3.0 s at four, regardless of `-t` -- and the
+parallel decoder wins exactly where threads push demand past that floor.
+
+The previous rule (`files >= 8` -> serial) switched on at 8 files / 32 threads
+where the parallel decoder *loses* (0.92x), and off at 8 files / 64 threads
+where it wins (1.20x). Replaced by `map_threads / files >= 4`. Verified:
+
+| pairs | -t | ratio | serial | old rule | new rule |
+|---|---|---|---|---|---|
+| 2 | 32 | 8 | 5.05 | 3.22 | 3.22 |
+| 2 | 64 | 16 | 5.21 | 2.53 | 2.51 |
+| 4 | 16 | 2 | 5.23 | 5.23 | 5.27 |
+| 4 | 64 | 8 | 2.95 | 2.93 | **2.55** |
+
+**The threshold is set low (4) because the payoff is asymmetric.** Enabling the
+parallel decoder when it is not needed is cheap: on a 96.3 M-k-mer
+transcriptome, where mapping is slow enough that decode never binds, it measured
+-4.9% wall and +2.1% CPU. Not enabling it when it *is* needed costs up to 3x
+wall. The supervisor absorbs the rest -- decoders start at one worker and grow
+only on demonstrated starvation, so an unnecessary parallel path degenerates to
+roughly serial cost rather than to its ceiling.
+
+**Mapping cost is the remaining term, and it is not modelled.** Per-thread
+consumption ranged 0.064 GB/s (96.3 M-k-mer transcriptome) to 0.43 GB/s (1.5 M
+probe panel), so the *correct* ratio is index-dependent: about 3.5 threads/file
+for cheap mapping, about 37 for expensive. The ratio rule uses the cheap-mapping
+figure and accepts the small loss on expensive indices, per the asymmetry above.
+
+## 3. Thread budget: how `-t` is split
 
 `plan_thread_budget` splits the user's budget between mapping and decoding, and
 `io::decode_budget` supervises the decoders under one shared ceiling. Upstream
@@ -73,7 +124,7 @@ demand nearly vanishes. Hence evidence-driven growth rather than a fixed ratio.
 Measured (`-t 32`): Flex 111.74 s, PBMC 17.48 s, bulk 87.09 s — within 1-3% of
 the best hand-tuned setting on each, with no tuning knob exposed.
 
-## 3. The tiny-dict prefilter
+## 4. The tiny-dict prefilter
 
 A blocked Bloom filter in front of the hashbrown probe, gated on two properties.
 See `tiny-dict/src/prefilter.rs` and the `FilterGate` in `tiny-dict/src/lib.rs`.
@@ -137,7 +188,7 @@ matters.
 **If the remaining 19.4% is worth attacking, the lever is fewer filter probes
 (the skip machinery issuing fewer searches), not a faster probe.**
 
-## 4. A negative prefilter does not pay on the sshash backend
+## 5. A negative prefilter does not pay on the sshash backend
 
 Tried and **reverted**. The motivation looked strong: dictionary seeds are
 overwhelmingly misses, because a hit is absorbed into a within-unitig extension
@@ -180,7 +231,7 @@ The lesson generalizes past Bloom filters: on this path, adding *any*
 hash-addressed side structure trades a local access for a random one, and the
 existing chain is local enough that the trade loses.
 
-## 5. Sub-1% A/B differences between binaries are not trustworthy
+## 6. Sub-1% A/B differences between binaries are not trustworthy
 
 Two separately-built binaries differ in code and data layout, and that shows up
 as a **systematic** offset -- stable across runs, so extra repetitions do not
@@ -217,7 +268,7 @@ Consequences for reading anything else here:
 Use `-t 1` byte-identical RAD output to confirm correctness, and reserve
 performance claims for effects several times the floor.
 
-## 6. Environment overrides (measurement only)
+## 7. Environment overrides (measurement only)
 
 | variable | effect |
 |---|---|
