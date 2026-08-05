@@ -47,7 +47,7 @@ pub fn reader_with_batch_size<R: std::io::Read>(
 ///
 /// The handle must be taken *before* the reader is moved into paraseq (which
 /// consumes it as `impl Read`), so it is surfaced here rather than fetched later.
-pub(crate) struct OpenedInput {
+pub struct OpenedInput {
     pub reader: Box<dyn std::io::Read + Send>,
     #[cfg(feature = "rapidgzip")]
     pub handle: Option<rapidgzip_core::DecoderHandle>,
@@ -107,7 +107,7 @@ fn open_gz_rapidgzip(
 
 /// Open a single file with automatic decompression, surfacing the decoder
 /// control handle when the parallel gzip path is taken.
-pub(crate) fn open_input(
+pub fn open_input(
     path: impl AsRef<Path>,
     ceiling: usize,
     initial_limit: usize,
@@ -171,7 +171,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 
 /// How a run intends to spend threads on decompression.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ThreadBudget {
+pub struct ThreadBudget {
     /// Total decoder workers all files may hold at once.
     pub decode_budget: usize,
     /// Immutable per-decoder ceiling. Generous on purpose: it is a lazy cap,
@@ -221,7 +221,38 @@ use crate::io::calibrate::MIN_THREADS_PER_FILE;
 /// parallelism and need proportionally less help per file. Whether the parallel
 /// decoder is used at all is decided by the threads-per-file ratio; see
 /// [`MIN_THREADS_PER_FILE`].
-pub(crate) fn plan_thread_budget(map_threads: usize, num_files: usize) -> ThreadBudget {
+pub fn plan_thread_budget(map_threads: usize, num_files: usize) -> ThreadBudget {
+    plan_thread_budget_for(map_threads, num_files, ConsumerCost::Unknown)
+}
+
+/// How expensive one read is to consume, which decides how hungry the mapping
+/// threads are for decoded bytes.
+///
+/// Callers that map the same reads two ways need this: salmon's selective
+/// alignment consumes roughly a quarter of what sketch mode does per unit time
+/// -- measured at 256 s of mapping-only CPU against 60 s for the same 8M reads
+/// -- so the same input and thread count can be decode-bound in one mode and
+/// comfortably fed in the other. Passing the mode lets them land differently
+/// instead of sharing one answer that is wrong for one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConsumerCost {
+    /// No hint; the threads-per-file rule alone decides. What piscem's own
+    /// mapping paths use, since they have only one mode.
+    #[default]
+    Unknown,
+    /// Cheap per read, so decode is reached sooner -- pseudoalignment/sketch.
+    Light,
+    /// Expensive per read, so serial decode keeps up further -- selective
+    /// alignment, or mapping against a very large index.
+    Heavy,
+}
+
+/// [`plan_thread_budget`] with a hint about how costly consumption is.
+pub fn plan_thread_budget_for(
+    map_threads: usize,
+    num_files: usize,
+    consumer_cost: ConsumerCost,
+) -> ThreadBudget {
     if let Ok(v) = std::env::var("PISCEM_RAPIDGZIP_THREADS")
         && let Ok(per_file) = v.parse::<usize>()
     {
@@ -236,11 +267,20 @@ pub(crate) fn plan_thread_budget(map_threads: usize, num_files: usize) -> Thread
 
     let files = num_files.max(1);
 
+    // Heavy consumers reach decode-bound later, so require proportionally more
+    // threads per file before paying for the parallel decoder; light ones reach
+    // it sooner. `Unknown` leaves the measured threshold alone.
+    let threshold = match consumer_cost {
+        ConsumerCost::Unknown => MIN_THREADS_PER_FILE,
+        ConsumerCost::Light => MIN_THREADS_PER_FILE,
+        ConsumerCost::Heavy => MIN_THREADS_PER_FILE * 2,
+    };
+
     // Serial per-file streams already supply enough for the mapping threads.
     // This mirrors `calibrate::forced_choice`'s `AmpleSerialSupply` arm; the
     // per-file `InputKind` check lives in `open_input`, since a run can mix
     // regular files and FIFOs.
-    if map_threads / files < MIN_THREADS_PER_FILE {
+    if map_threads / files < threshold {
         return ThreadBudget {
             decode_budget: 0,
             per_file_ceiling: 0,
@@ -248,8 +288,16 @@ pub(crate) fn plan_thread_budget(map_threads: usize, num_files: usize) -> Thread
             parallel_gzip: false,
         };
     }
-    // Half the mapping allotment, i.e. a third of the combined footprint.
-    let decode_budget = (map_threads / 2).clamp(1, 64);
+    // Half the mapping allotment, i.e. a third of the combined footprint --
+    // but never more than the cores this process can actually run on.
+    // `-t` is a request, not a guarantee: under a cpuset or a cgroup CPU quota
+    // the process may hold far fewer cores than `-t` names, and budgeting
+    // decode threads against the larger number just oversubscribes what is
+    // left for mapping. (Bound suggested by salmon PR #1072.)
+    let usable_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(map_threads);
+    let decode_budget = (map_threads / 2).clamp(1, 64).min(usable_cores.max(1));
     // Ceiling per decoder is deliberately above the fair share: a decoder that
     // is genuinely starved may exceed its slice when its peers are idle, and
     // the supervisor claws it back. Capped because past ~16 the knee is flat.

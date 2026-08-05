@@ -479,15 +479,13 @@ where
         strat,
         decoder_pref,
     ) {
-        // Only an explicit user request may force serial. The measured
-        // supply/demand comparison is logged but does NOT override the
-        // threads-per-file rule: validated against the crossover surface it got
-        // 4 of 8 points wrong, every one of them predicting serial where the
-        // parallel decoder measurably won (by up to 1.92x), while the ratio
-        // rule got 7 of 8. See `calibrate` for why margin tuning cannot fix it.
-        if !decision.parallel
-            && decision.reason != crate::io::calibrate::Reason::MeasuredConsumerBound
-        {
+        // The measured verdict decides. It was previously discarded, on the
+        // record of an earlier rate-comparison probe that scored 4 of 8; that
+        // probe was replaced by `probe_starvation` and the guard was never
+        // revisited, so a better measurement sat behind a worse one's excuse
+        // while still costing its 150 ms. See `calibrate::probe_starvation` for
+        // the record that justifies acting on it.
+        if !decision.parallel {
             plan.parallel_gzip = false;
             plan.decode_budget = 0;
             plan.per_file_ceiling = 0;
