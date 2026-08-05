@@ -360,31 +360,58 @@ where
         progress,
     );
 
-    let mut readers = Vec::with_capacity(bio_paths.len() * if is_paired { 3 } else { 2 });
+    let arity = if is_paired { 3 } else { 2 };
+    let num_input_files = bio_paths.len() * arity;
+
+    // Same decode/map split the bulk and scRNA paths use. scATAC opens `arity`
+    // files per sample -- biological read, barcode read, and mate when paired --
+    // so it reaches the threads-per-file bound sooner than a paired run does,
+    // and a multi-sample scATAC run is usually served by serial streams alone.
+    let plan = crate::io::fastx::plan_thread_budget(num_threads, num_input_files);
+    #[cfg(feature = "rapidgzip")]
+    let mut handles: Vec<rapidgzip_core::DecoderHandle> = Vec::new();
+
+    let mut open = |path: &std::path::Path| -> Result<_> {
+        let opened =
+            crate::io::fastx::open_input(path, plan.per_file_ceiling, plan.initial_per_file)?;
+        #[cfg(feature = "rapidgzip")]
+        if let Some(h) = opened.handle {
+            handles.push(h);
+        }
+        reader_with_batch_size(opened.reader)
+            .map_err(|e| anyhow::anyhow!("failed to open {}: {}", path.display(), e))
+    };
+
+    let mut readers = Vec::with_capacity(num_input_files);
     for i in 0..bio_paths.len() {
-        readers.push(
-            reader_with_batch_size(open_with_decompression(&bio_paths[i])?)
-                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", bio_paths[i].display(), e))?,
-        );
-        readers.push(
-            reader_with_batch_size(open_with_decompression(&barcode_paths[i])?).map_err(|e| {
-                anyhow::anyhow!("failed to open {}: {}", barcode_paths[i].display(), e)
-            })?,
-        );
+        readers.push(open(&bio_paths[i])?);
+        readers.push(open(&barcode_paths[i])?);
         if is_paired {
-            readers.push(
-                reader_with_batch_size(open_with_decompression(&read2_paths[i])?).map_err(|e| {
-                    anyhow::anyhow!("failed to open {}: {}", read2_paths[i].display(), e)
-                })?,
-            );
+            readers.push(open(&read2_paths[i])?);
         }
     }
-    let arity = if is_paired { 3 } else { 2 };
+    drop(open);
+
+    #[cfg(feature = "rapidgzip")]
+    let budget = crate::io::decode_budget::DecodeBudget::spawn(handles, plan.decode_budget);
+
     let collection = Collection::new(readers, CollectionType::Multi { arity })
         .map_err(|e| anyhow::anyhow!("failed to create collection: {}", e))?;
     collection
         .process_parallel_multi(&mut processor, num_threads, None)
         .map_err(|e| anyhow::anyhow!("mapping failed: {}", e))?;
+
+    #[cfg(feature = "rapidgzip")]
+    if let Some(budget) = budget {
+        let report = budget.finish();
+        tracing::info!(
+            "decoder threads: peak {} worker + {} auxiliary (budget {}); peak busy {}",
+            report.peak_worker_threads,
+            report.peak_auxiliary_threads,
+            plan.decode_budget,
+            report.peak_busy_workers,
+        );
+    }
 
     Ok(())
 }
