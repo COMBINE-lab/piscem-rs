@@ -120,23 +120,41 @@ the 0.064 GB/s measured by a completely different route.
 Cost, measured end-to-end on Flex at one pair: wall 3.46 s versus 3.33 s without
 the probe, CPU 100.32 s versus 102.50 s -- inside the noise floor either way.
 
-The probe measures **producer against consumer**, following paraseq's own
-split: `RecordSet::fill` decodes *and parses* under the per-file mutex, so it is
-the producer and is serialized per file; mapping the filled batch is the
-consumer and runs on every thread. Supply is therefore decode+parse throughput,
-not raw inflate — raw serial decode measures 2.24-2.49 GB/s here, and reporting
-that as supply would overstate it by whatever parsing costs, biasing toward the
-serial decoder, which is the expensive error.
+The probe measures **producer against consumer**, following paraseq's own split:
+`RecordSet::fill` decodes *and parses* under the per-file mutex, so it is the
+producer and is serialized per file; mapping the filled batch is the consumer.
 
-Record sets are kept whole and mapped in place, matching the zero-copy path the
-processors take. An earlier version copied every record out with `to_vec`,
-charging the producer thousands of allocations the real pipeline never performs;
-removing it moved the consumer estimate from 0.081 to **0.064 GB/s**, exactly
-reproducing the figure obtained independently from whole-run CPU accounting.
+**Both rates are accurate; the model built on them is not.** Measured in the
+same binary against a whole-file run of identical work, the producer estimate is
+0.843 GB/s versus 0.822 (+2.6%), and the consumer 0.066 versus the 0.064
+obtained independently from whole-run CPU accounting (+3%).
 
-Page-cache state turned out not to matter: whole-file decode measured 2.24 GB/s
-cold and 2.22 warm on one input, 2.46 and 2.49 on another. Coldness was worth
-checking and is not a factor at these sizes.
+But validated against the crossover surface, `decide` got **4 of 8 points
+wrong** — every one predicting serial where the parallel decoder measurably won,
+by up to 1.92x — while the plain threads-per-file rule got 7 of 8. The
+comparison is therefore **advisory**: logged, but only an explicit `--decoder`
+request may force the serial path.
+
+The model treats supply as `files x rate-measured-alone`. The producer never
+gets a whole core: the thread holding the per-file mutex also maps, and competes
+with every other thread for bandwidth. Achieved supply falls as `-t` rises —
+exactly where the parallel decoder matters — so the model is most optimistic
+where it is most wrong. Margin tuning cannot fix it: the false-serial points
+need a margin below 0.38, the one true-serial point above it.
+
+Fixing it properly means measuring the ratio directly — running a producer and
+a consumer concurrently and seeing which starves — rather than inferring it from
+two isolated rates.
+
+Two measurement traps found here, both worth remembering:
+
+- An early "ground truth" of 0.43-0.52 GB/s was an artifact of the reference
+  harness being a separate crate built without `lto`/`codegen-units=1`. The same
+  work in-binary runs at 0.82. **Never benchmark a reference implementation
+  under different compiler settings than the thing it judges.** The hidden
+  `probe-bench` subcommand exists to make that mistake impossible.
+- Retaining every `RecordSet` for the consumer phase cost ~20% of the producer
+  rate (0.70 vs 0.88). Only the sets the consumer maps are kept now.
 
 A warm-up record set is pulled but not timed, excluding file open and
 first-block decode.
