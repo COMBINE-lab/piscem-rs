@@ -251,28 +251,27 @@ pub struct Starvation {
     pub stopped_because: &'static str,
 }
 
-/// Validated against the same crossover surface that broke the rate model.
-/// Consumers are given the share of mapping threads *one file* must feed
-/// (`map_threads / num_files`), because a real run fills every file
-/// concurrently:
+/// Validated against the crossover surface that broke the rate model, with
+/// consumers given the share of mapping threads *one file* must feed
+/// (`map_threads / num_files`), since a real run fills every file concurrently:
 ///
 /// | threads/file | consumer wait | measured parallel speedup |
 /// |---:|---:|---|
-/// | 4 | 0.5-0.6% | 1.09x, 1.07x, 0.92x |
-/// | 8 | 41.8-44.2% | 1.92x, 1.54x, 1.20x |
-/// | 16 | 67.4-69.3% | 3.05x, 2.08x |
+/// | 4 | 1.7-1.9% | 1.09x, 1.07x, 0.92x |
+/// | 8 | 44.4-46.2% | 1.92x, 1.54x, 1.20x |
+/// | 16 | 57.2-58.6% | 3.05x, 2.08x |
 ///
 /// The wait fraction is monotonic in threads-per-file and consistent *across
 /// different file counts*, which is what makes it a measurement rather than a
 /// restatement of the input. Six of eight points come out right; both misses
-/// are in the 4 threads/file band, where the outcomes themselves average 1.03x
-/// and the regime is genuinely a wash. No threshold can rank within that band —
-/// all three points sit at 0.5-0.6% wait — and none needs to.
+/// are in the 4 threads/file band, whose own outcomes average 1.03x. No
+/// threshold can rank within that band, and none needs to.
 ///
-/// This is the property the fitted constant lacks. `MIN_THREADS_PER_FILE = 3`
-/// scores 7 of 8 here, but it was fit on one CPU, one disk and one memory
-/// system, and supply and demand move independently across hardware. The
-/// starvation fraction is measured on whatever machine is running.
+/// A fitted threads-per-file constant scored 7 of 8 on the same surface, but
+/// only by winning those two near-ties, and only on the machine it was fit to:
+/// supply and demand move independently across CPUs, disks and memory systems.
+/// The starvation fraction is measured wherever the code runs, which is why it
+/// replaced the constant outright rather than supplementing it.
 ///
 /// Consumer-wait fraction above which the parallel decoder is worth its cost.
 ///
