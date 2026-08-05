@@ -25,6 +25,29 @@ piscem-rs build -i cuttlefish_prefix -o index_prefix -k 31 -m 19
 piscem-rs build -i cuttlefish_prefix -o index_prefix -k 31 -m 19 --build-ec-table
 ```
 
+#### Build-time memory
+
+sshash sorts minimizers in memory when the estimated footprint
+(`total_kmers × 48` bytes) fits its RAM budget, and otherwise spills to a
+slower disk-backed external merge sort.
+
+By default that budget is auto-detected: half of the memory this process may
+actually use, never below 8 GiB on a machine that has that much. "Usable" is
+the smallest of physical RAM, `RLIMIT_AS`, and any cgroup memory limit, so a
+job confined by a scheduler or container gets the confined figure rather than
+the machine's installed total. The resolved value is logged at `info` level.
+
+```bash
+# Force the budget (0 = unlimited, i.e. always sort in memory)
+piscem-rs build -i cuttlefish_prefix -o index_prefix -k 31 -m 19 --ram-limit-gib 64
+
+# Redirect the external-sort scratch away from a CWD-relative sshash_tmp/
+piscem-rs build -i cuttlefish_prefix -o index_prefix -k 31 -m 19 --tmp-dir /scratch/tmp
+```
+
+Very large decoy-aware indices (a human gentrome is ~3B k-mers, ~140 GB
+estimated) exceed any real machine's RAM and will still legitimately spill.
+
 ### Mapping reads
 
 ```bash
