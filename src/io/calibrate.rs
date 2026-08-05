@@ -228,6 +228,169 @@ fn safe_rate(gb: f64, secs: f64) -> f64 {
     if secs <= 1e-9 { f64::INFINITY } else { gb / secs }
 }
 
+/// Direct measurement of whether decode can keep the mapping threads fed.
+///
+/// # Why this replaces comparing two rates
+///
+/// The rate comparison asks whether `files x supply` exceeds
+/// `map_threads x demand`, with both terms measured in isolation. Its supply
+/// term is wrong in a way no calibration fixes: the producer never gets a whole
+/// core. `paraseq` serializes `fill` behind a per-file mutex, the thread
+/// holding it also maps, and every thread competes for memory bandwidth.
+/// Achieved supply therefore *falls* as `-t` rises — exactly where the parallel
+/// decoder earns its keep. Validated against a measured crossover surface, that
+/// model got 4 of 8 points wrong, all predicting serial where parallel won.
+///
+/// It is also machine-specific in a way a constant cannot repair. The
+/// threads-per-file constant that outperformed it was fit on one CPU, one disk
+/// and one memory system; supply and demand move independently across hardware,
+/// so nothing about that number transfers.
+///
+/// This instead runs the real shape in miniature — one producer feeding a
+/// bounded queue, `map_threads` consumers draining it — and observes **which
+/// side blocks**. That is the question the decision actually turns on, it is
+/// measured on the hardware in front of us, and it is immune to error in either
+/// absolute rate.
+#[derive(Debug, Clone, Copy)]
+pub struct Starvation {
+    /// Fraction of consumer time spent waiting for the producer, in `0.0..=1.0`.
+    ///
+    /// High means the mapping threads are decode-starved and a parallel decoder
+    /// has something to give. Low means decode already keeps up.
+    pub consumer_wait_fraction: f64,
+    /// Records mapped during the observation.
+    pub records: usize,
+    /// How long the observation ran.
+    pub elapsed: std::time::Duration,
+}
+
+/// Validated against the same crossover surface that broke the rate model.
+/// Consumers are given the share of mapping threads *one file* must feed
+/// (`map_threads / num_files`), because a real run fills every file
+/// concurrently:
+///
+/// | threads/file | consumer wait | measured parallel speedup |
+/// |---:|---:|---|
+/// | 4 | 0.5-0.6% | 1.09x, 1.07x, 0.92x |
+/// | 8 | 41.8-44.2% | 1.92x, 1.54x, 1.20x |
+/// | 16 | 67.4-69.3% | 3.05x, 2.08x |
+///
+/// The wait fraction is monotonic in threads-per-file and consistent *across
+/// different file counts*, which is what makes it a measurement rather than a
+/// restatement of the input. Six of eight points come out right; both misses
+/// are in the 4 threads/file band, where the outcomes themselves average 1.03x
+/// and the regime is genuinely a wash. No threshold can rank within that band —
+/// all three points sit at 0.5-0.6% wait — and none needs to.
+///
+/// This is the property the fitted constant lacks. `MIN_THREADS_PER_FILE = 3`
+/// scores 7 of 8 here, but it was fit on one CPU, one disk and one memory
+/// system, and supply and demand move independently across hardware. The
+/// starvation fraction is measured on whatever machine is running.
+///
+/// Consumer-wait fraction above which the parallel decoder is worth its cost.
+///
+/// Deliberately low. A quarter of mapping capacity lost to waiting is already
+/// worth recovering, and the asymmetry established elsewhere — enabling the
+/// parallel decoder needlessly costs a few percent, failing to enable it costs
+/// up to 3x — argues for erring toward it.
+pub const STARVATION_THRESHOLD: f64 = 0.25;
+
+/// How long the starvation probe observes, in milliseconds.
+///
+/// Long enough for the queue to reach a steady state at high thread counts,
+/// short enough to disappear next to any real run.
+pub const STARVATION_BUDGET_MS: u64 = 150;
+
+/// Run one producer against `consumers` mapping threads for `budget`, and
+/// report how much of the consumers' time went to waiting.
+///
+/// `map_one` must be callable from several threads at once; it stands in for
+/// whatever the caller means by mapping one record.
+pub fn probe_starvation<M>(
+    path: &Path,
+    consumers: usize,
+    budget: std::time::Duration,
+    map_one: M,
+) -> anyhow::Result<Option<Starvation>>
+where
+    M: Fn(&[u8]) + Sync,
+{
+    use paraseq::fastx;
+    use paraseq::prelude::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Instant;
+
+    let (reader, _fmt) = niffler::send::from_path(path)?;
+    let mut reader = fastx::Reader::new(reader)?;
+
+    // Bounded so a fast producer blocks rather than buffering the file: the
+    // queue depth is what makes "which side blocks" a meaningful question.
+    let (tx, rx) = crossbeam::channel::bounded::<fastx::RecordSet>(consumers.max(1) * 2);
+
+    let done = AtomicBool::new(false);
+    let waited_nanos = AtomicU64::new(0);
+    let worked_nanos = AtomicU64::new(0);
+    let records = AtomicU64::new(0);
+
+    let start = Instant::now();
+    let result = std::thread::scope(|scope| -> anyhow::Result<()> {
+        for _ in 0..consumers.max(1) {
+            let rx = rx.clone();
+            let (done, waited, worked, records) = (&done, &waited_nanos, &worked_nanos, &records);
+            let map_one = &map_one;
+            scope.spawn(move || {
+                loop {
+                    let t = Instant::now();
+                    let Ok(rs) = rx.recv() else { break };
+                    waited.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+                    let t = Instant::now();
+                    let mut n = 0u64;
+                    for rec in rs.iter().filter_map(Result::ok) {
+                        map_one(rec.seq().as_ref());
+                        n += 1;
+                    }
+                    worked.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    records.fetch_add(n, Ordering::Relaxed);
+                    if done.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(rx);
+
+        // Producer runs on this thread, mirroring paraseq: one filler per file.
+        while start.elapsed() < budget {
+            let mut rs = reader.new_record_set();
+            match rs.fill(&mut reader) {
+                Ok(true) => {}
+                _ => break,
+            }
+            if tx.send(rs).is_err() {
+                break;
+            }
+        }
+        done.store(true, Ordering::Relaxed);
+        drop(tx);
+        Ok(())
+    });
+    result?;
+
+    let waited = waited_nanos.load(Ordering::Relaxed) as f64;
+    let worked = worked_nanos.load(Ordering::Relaxed) as f64;
+    let n = records.load(Ordering::Relaxed) as usize;
+    if n == 0 || waited + worked <= 0.0 {
+        return Ok(None);
+    }
+
+    Ok(Some(Starvation {
+        consumer_wait_fraction: waited / (waited + worked),
+        records: n,
+        elapsed: start.elapsed(),
+    }))
+}
+
 /// Compare measured demand against measured supply.
 ///
 /// `margin` biases the comparison, and should be **below** 1.0. The payoff is

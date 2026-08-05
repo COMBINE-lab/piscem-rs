@@ -434,7 +434,12 @@ where
 /// or when the probe itself fails; every one of those falls back to the
 /// ratio rule in `plan_thread_budget`, which is what ran before this existed.
 #[allow(clippy::too_many_arguments)]
-fn calibrate_decoder<const K: usize, S: SketchHitInfo, D: KmerDictionary, C: ContigTableLike>(
+fn calibrate_decoder<
+    const K: usize,
+    S: SketchHitInfo,
+    D: KmerDictionary + Sync,
+    C: ContigTableLike + Sync,
+>(
     first_path: Option<&std::path::PathBuf>,
     num_files: usize,
     num_threads: usize,
@@ -472,32 +477,48 @@ where
         return Some(forced);
     }
 
-    // Ambiguous: measure. One thread's worth of mapping state, matching what a
-    // worker would build.
-    let mut query =
-        crate::mapping::streaming_query::PiscemStreamingQuery::<K, D>::new(index.dict());
-    let mut hs = crate::mapping::hit_searcher::HitSearcher::new(index);
-    let mut cache = crate::mapping::cache::MappingCache::<S>::new(K);
-    opts.apply_to(&mut cache);
-    let mut poison = crate::mapping::filters::PoisonState::new(index.poison_table());
-
-    let rates = calibrate::probe_path(path, calibrate::DEFAULT_PROBE_RECORDS, |seq| {
+    // Ambiguous: measure whether decode can actually keep the mapping threads
+    // fed, by running the pipeline's shape in miniature and seeing which side
+    // blocks. Comparing two separately-measured rates does not work here -- the
+    // producer never runs alone, so its isolated rate overstates achieved
+    // supply, and the error grows with -t. See `calibrate::probe_starvation`.
+    //
+    // Mapping state is per-consumer, so each thread builds its own.
+    // One producer against the share of mapping threads *one file* has to feed.
+    // The probe opens a single file, but a real run opens `num_files` and fills
+    // them concurrently, so pitting one producer against every mapping thread
+    // reports starvation that only a single-file run would see. Measured: at 8
+    // files the unscaled probe read 83-91% consumer wait while the parallel
+    // decoder actually lost (0.92x).
+    let per_file_consumers = (num_threads / num_files.max(1)).max(1);
+    let budget = std::time::Duration::from_millis(calibrate::STARVATION_BUDGET_MS);
+    let starve = calibrate::probe_starvation(path, per_file_consumers, budget, |seq| {
+        let mut q = crate::mapping::streaming_query::PiscemStreamingQuery::<K, D>::new(index.dict());
+        let mut hs = crate::mapping::hit_searcher::HitSearcher::new(index);
+        let mut cache = crate::mapping::cache::MappingCache::<S>::new(K);
+        opts.apply_to(&mut cache);
+        let mut poison = crate::mapping::filters::PoisonState::new(index.poison_table());
         crate::mapping::engine::map_read::<K, S, D, C>(
-            seq, &mut cache, &mut hs, &mut query, index, &mut poison, strat,
+            seq, &mut cache, &mut hs, &mut q, index, &mut poison, strat,
         );
     })
     .ok()
     .flatten()?;
 
-    let decision = calibrate::decide(&rates, num_files, num_threads, calibrate::DEFAULT_MARGIN);
+    let decision = if starve.consumer_wait_fraction > calibrate::STARVATION_THRESHOLD {
+        calibrate::Decision { parallel: true, reason: calibrate::Reason::MeasuredDecodeBound }
+    } else {
+        calibrate::Decision { parallel: false, reason: calibrate::Reason::MeasuredConsumerBound }
+    };
     tracing::info!(
-        "decoder calibration: {} records, {:.3} GB/s per stream, {:.3} GB/s per mapping thread -> {} ({:?})",
-        rates.records_sampled,
-        rates.decode_gbps_per_stream,
-        rates.map_gbps_per_thread,
+        "decoder calibration: {} records in {:.0} ms, consumers waited {:.1}% of their time -> {} ({:?})",
+        starve.records,
+        starve.elapsed.as_secs_f64() * 1000.0,
+        starve.consumer_wait_fraction * 100.0,
         if decision.parallel { "parallel" } else { "serial" },
         decision.reason
     );
+
     Some(decision)
 }
 
