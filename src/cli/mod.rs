@@ -5,6 +5,7 @@ pub mod map_scatac;
 pub mod map_scrna;
 mod parity;
 pub mod poison;
+pub mod probe_bench;
 mod stats;
 
 use anyhow::Result;
@@ -71,6 +72,10 @@ enum Commands {
     Stats(stats::StatsArgs),
     Parity(parity::ParityArgs),
     LookupBench(bench::LookupBenchArgs),
+    /// Diagnostic: compare the calibration probe's producer estimate against a
+    /// whole-file measurement of the same work, in this binary.
+    #[command(hide = true)]
+    ProbeBench(probe_bench::ProbeBenchArgs),
 }
 
 pub fn run() -> Result<()> {
@@ -84,5 +89,6 @@ pub fn run() -> Result<()> {
         Commands::Stats(args) => stats::run(args),
         Commands::Parity(args) => parity::run(args),
         Commands::LookupBench(args) => bench::run(args),
+        Commands::ProbeBench(args) => probe_bench::run(args),
     }
 }

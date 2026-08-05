@@ -479,6 +479,7 @@ where
     // 0.43-0.52. Reading further costs little and stabilises it.
     let produce_sample = sample.saturating_mul(PRODUCER_SAMPLE_FACTOR);
     let mut sets: Vec<fastx::RecordSet> = Vec::new();
+    let mut retained_records = 0usize;
     let mut records = 0usize;
     let mut bytes = 0u64;
     let produce_start = Instant::now();
@@ -492,7 +493,14 @@ where
             records += 1;
             bytes += rec.seq().as_ref().len() as u64;
         }
-        sets.push(rs);
+        // Retain only what the consumer phase will map; drop the rest as we go.
+        // Holding all of them grows the working set through the timed loop and
+        // cost ~20% of the measured producer rate -- 0.70 GB/s where dropping
+        // gives 0.88, against a whole-file truth of 0.82.
+        if retained_records < sample {
+            retained_records += rs.iter().filter_map(Result::ok).count();
+            sets.push(rs);
+        }
     }
     let produce_elapsed = produce_start.elapsed();
 
