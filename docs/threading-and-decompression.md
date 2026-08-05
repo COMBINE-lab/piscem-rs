@@ -187,6 +187,33 @@ message saying a flag was overridden is useless if only visible to someone who
 already suspected a problem. Two cases: `parallel` on a non-regular input, and
 any explicit decoder on input that is not gzip, where neither path competes.
 
+### scATAC
+
+`map-scatac` opened every input through the niffler-only helper, so `-t` and
+`--decoder` did nothing for it whatever their value. It now goes through the
+same `plan_thread_budget` / `open_input` path as the other two.
+
+Measured, and it is a consistency fix rather than a speedup. 10x `atac_pbmc_5k`
+lane L001 (107.8 M reads, 3 files) against a k=23 chr1+chr2 GRCh38 index, `-t 32`,
+3 reps each:
+
+| | wall | CPU |
+|---|---|---|
+| serial | 324.2 s | 10,310 s |
+| parallel | 327.3 s | 10,426 s |
+
++1.0% wall and +1.1% CPU for the parallel decoder — inside the noise floor and
+if anything marginally worse. scATAC opens **three files per sample**, so the
+serial path already supplies three inflate streams, and mapping a 397 M-vertex
+index is costly enough per read that decode never binds: the supervisor reported
+`peak busy 3` against a budget of 16, having found no starvation to answer.
+
+The caveat runs against the change rather than for it: a two-chromosome
+reference makes mapping cheaper than a whole-genome run and so biases the
+workload *toward* decode-bound. Even so the parallel decoder does not win, so on
+full GRCh38 the case would be weaker still. The value here is that the policy
+now applies at all and reaches the right answer, not that the answer is faster.
+
 ### Non-regular inputs (FIFOs, process substitution)
 
 `rapidgzip` gates its parallel path on `file_type().is_file()` and falls back to
