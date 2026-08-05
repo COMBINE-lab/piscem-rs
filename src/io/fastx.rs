@@ -115,7 +115,7 @@ pub fn open_input(
     let path = path.as_ref();
 
     // `ceiling == 0` selects the serial path explicitly (see
-    // `MIN_THREADS_PER_FILE`), independent of whether the feature is on.
+    // the probe's verdict), independent of whether the feature is on.
     //
     // Non-regular inputs are excluded here rather than left to the decoder.
     // `rapidgzip` gates its parallel path on `file_type().is_file()` and falls
@@ -185,13 +185,7 @@ pub struct ThreadBudget {
     pub parallel_gzip: bool,
 }
 
-/// Re-export of the single threads-per-file threshold, which lives in
-/// [`crate::io::calibrate`] alongside the measurements that set it.
-///
-/// `plan_thread_budget` applies it as a fast path so a run that is obviously
-/// serial never builds mapping state for a probe; `calibrate::forced_choice`
-/// applies the same bound as its `AmpleSerialSupply` arm.
-use crate::io::calibrate::MIN_THREADS_PER_FILE;
+
 
 /// Decide the decompression share of the thread budget.
 ///
@@ -219,40 +213,9 @@ use crate::io::calibrate::MIN_THREADS_PER_FILE;
 /// `num_files` matters because throughput on the serial path scales with file
 /// count (one inflate stream per file), so many inputs already supply
 /// parallelism and need proportionally less help per file. Whether the parallel
-/// decoder is used at all is decided by the threads-per-file ratio; see
-/// [`MIN_THREADS_PER_FILE`].
+/// decoder is used at all is decided by measurement; see
+/// [`crate::io::calibrate::probe_starvation`].
 pub fn plan_thread_budget(map_threads: usize, num_files: usize) -> ThreadBudget {
-    plan_thread_budget_for(map_threads, num_files, ConsumerCost::Unknown)
-}
-
-/// How expensive one read is to consume, which decides how hungry the mapping
-/// threads are for decoded bytes.
-///
-/// Callers that map the same reads two ways need this: salmon's selective
-/// alignment consumes roughly a quarter of what sketch mode does per unit time
-/// -- measured at 256 s of mapping-only CPU against 60 s for the same 8M reads
-/// -- so the same input and thread count can be decode-bound in one mode and
-/// comfortably fed in the other. Passing the mode lets them land differently
-/// instead of sharing one answer that is wrong for one of them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ConsumerCost {
-    /// No hint; the threads-per-file rule alone decides. What piscem's own
-    /// mapping paths use, since they have only one mode.
-    #[default]
-    Unknown,
-    /// Cheap per read, so decode is reached sooner -- pseudoalignment/sketch.
-    Light,
-    /// Expensive per read, so serial decode keeps up further -- selective
-    /// alignment, or mapping against a very large index.
-    Heavy,
-}
-
-/// [`plan_thread_budget`] with a hint about how costly consumption is.
-pub fn plan_thread_budget_for(
-    map_threads: usize,
-    num_files: usize,
-    consumer_cost: ConsumerCost,
-) -> ThreadBudget {
     if let Ok(v) = std::env::var("PISCEM_RAPIDGZIP_THREADS")
         && let Ok(per_file) = v.parse::<usize>()
     {
@@ -267,27 +230,11 @@ pub fn plan_thread_budget_for(
 
     let files = num_files.max(1);
 
-    // Heavy consumers reach decode-bound later, so require proportionally more
-    // threads per file before paying for the parallel decoder; light ones reach
-    // it sooner. `Unknown` leaves the measured threshold alone.
-    let threshold = match consumer_cost {
-        ConsumerCost::Unknown => MIN_THREADS_PER_FILE,
-        ConsumerCost::Light => MIN_THREADS_PER_FILE,
-        ConsumerCost::Heavy => MIN_THREADS_PER_FILE * 2,
-    };
-
-    // Serial per-file streams already supply enough for the mapping threads.
-    // This mirrors `calibrate::forced_choice`'s `AmpleSerialSupply` arm; the
-    // per-file `InputKind` check lives in `open_input`, since a run can mix
-    // regular files and FIFOs.
-    if map_threads / files < threshold {
-        return ThreadBudget {
-            decode_budget: 0,
-            per_file_ceiling: 0,
-            initial_per_file: 0,
-            parallel_gzip: false,
-        };
-    }
+    // No threads-per-file gate here any more: it was a constant standing in for
+    // consumer cost, which `calibrate::probe_starvation` measures directly and
+    // continuously. This now returns a budget; whether it is used at all is the
+    // probe's call. The per-file `InputKind` check still lives in `open_input`,
+    // since a run can mix regular files and FIFOs.
     // Half the mapping allotment, i.e. a third of the combined footprint --
     // but never more than the cores this process can actually run on.
     // `-t` is a request, not a guarantee: under a cpuset or a cgroup CPU quota

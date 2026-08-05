@@ -94,9 +94,6 @@ pub enum Reason {
     NonSeekableInput,
     /// Only one mapping thread, so decode can never be the constraint.
     SingleThreaded,
-    /// Serial streams already outnumber what the mapping threads can consume by
-    /// so much that no mapping rate makes the parallel decoder worthwhile.
-    AmpleSerialSupply,
     /// Measured demand exceeds measured supply.
     MeasuredDecodeBound,
     /// Measured supply covers measured demand.
@@ -114,39 +111,27 @@ pub enum Reason {
 ///
 /// * A non-regular file cannot be decoded in parallel at all.
 /// * With one mapping thread there is nothing to starve.
-/// * Below [`MIN_THREADS_PER_FILE`] threads per file, even a free decoder
-///   cannot help: serial supply already exceeds what that few threads can
-///   consume at the *fastest* per-thread rate ever measured here (0.43 GB/s),
-///   so no probe can change the answer.
-pub fn forced_choice(kind: InputKind, num_files: usize, map_threads: usize) -> Option<Decision> {
+///
+/// A threads-per-file bound used to live here too, justified as a forcing on
+/// the grounds that serial supply exceeded what so few threads could consume
+/// "at the fastest per-thread rate ever measured". That reasoning embeds a
+/// measured consumer rate, so it was empirical rather than logical, and it
+/// inherited every objection to fitting a constant on one machine — a consumer
+/// lighter than anything we had measured would break it. Consumer cost is a
+/// continuous quantity the probe already measures, through the very closure the
+/// caller supplies, so it is measured rather than assumed.
+///
+/// A user's explicit `--decoder serial` is also honoured unconditionally, but
+/// earlier: see [`preference_choice`], which runs before this.
+pub fn forced_choice(kind: InputKind, _num_files: usize, map_threads: usize) -> Option<Decision> {
     if kind == InputKind::Stream {
         return Some(Decision { parallel: false, reason: Reason::NonSeekableInput });
     }
     if map_threads <= 1 {
         return Some(Decision { parallel: false, reason: Reason::SingleThreaded });
     }
-    if map_threads / num_files.max(1) < MIN_THREADS_PER_FILE {
-        return Some(Decision { parallel: false, reason: Reason::AmpleSerialSupply });
-    }
     None
 }
-
-/// Threads per file below which serial supply is sufficient at any mapping rate.
-///
-/// Taken from the measured crossover surface rather than derived from the rate
-/// constants, because those disagree depending on which rate you mean: raw
-/// serial inflate runs at 2.24 GB/s, but the *producer* -- decode plus parse,
-/// which is what is actually serialized per file -- runs at 0.43-0.52. Dividing
-/// by the fastest observed per-thread consumption gives ~5 with the former and
-/// ~1 with the latter, so neither is a safe forcing bound.
-///
-/// The surface is unambiguous where the constants are not: 2 threads/file
-/// measures 0.92-1.00x for the parallel decoder and 4 threads/file 1.07-1.09x,
-/// so the crossing is between them.
-///
-/// This is the single source of truth; `io::fastx` uses it too, rather than
-/// keeping a second copy that could drift.
-pub const MIN_THREADS_PER_FILE: usize = 3;
 
 /// Rates measured from a prefix of the input.
 #[derive(Debug, Clone, Copy)]
@@ -260,6 +245,10 @@ pub struct Starvation {
     pub records: usize,
     /// How long the observation ran.
     pub elapsed: std::time::Duration,
+    /// Sampling windows observed.
+    pub windows: usize,
+    /// Why sampling stopped: `decisive`, `stable` or `ceiling`.
+    pub stopped_because: &'static str,
 }
 
 /// Validated against the same crossover surface that broke the rate model.
@@ -293,21 +282,91 @@ pub struct Starvation {
 /// up to 3x — argues for erring toward it.
 pub const STARVATION_THRESHOLD: f64 = 0.25;
 
-/// How long the starvation probe observes, in milliseconds.
+/// How long the probe samples, and when it may stop early.
 ///
-/// Long enough for the queue to reach a steady state at high thread counts,
-/// short enough to disappear next to any real run.
-pub const STARVATION_BUDGET_MS: u64 = 150;
+/// The probe used to run for a fixed 150 ms. That is wrong in both directions:
+/// the queue starts empty, so consumers wait at the beginning *whichever* side
+/// is really bound, and a short window lets that startup transient dominate —
+/// biasing the answer toward "parallel" exactly when a heavy consumer makes the
+/// transient longest. Meanwhile a workload whose answer is obvious in 50 ms
+/// paid the full budget anyway.
+///
+/// So sample in short windows and stop when the answer stops moving, or when it
+/// is unambiguous, whichever comes first. Clear-cut inputs pay a fraction of the
+/// ceiling; genuinely marginal ones pay more, which is where the extra
+/// measurement is worth something.
+#[derive(Debug, Clone, Copy)]
+pub struct ProbeConfig {
+    /// Length of one sampling window. Wait fractions are computed from
+    /// per-window deltas, never cumulatively — a cumulative average drags the
+    /// startup transient through the whole measurement.
+    pub window: std::time::Duration,
+    /// Windows that must elapse before any verdict, so the probe cannot
+    /// converge *on* the transient it is trying to discard.
+    pub min_windows: usize,
+    /// Recent windows considered when testing for stability and for an
+    /// unambiguous verdict.
+    pub smoothing_windows: usize,
+    /// Spread across the recent windows below which the answer counts as
+    /// settled.
+    pub tolerance: f64,
+    /// Distance from [`STARVATION_THRESHOLD`] beyond which the verdict is
+    /// unambiguous and further sampling cannot change it.
+    pub decisive_margin: f64,
+    /// Hard ceiling on total probe time.
+    pub ceiling: std::time::Duration,
+}
 
-/// Run one producer against `consumers` mapping threads for `budget`, and
-/// report how much of the consumers' time went to waiting.
+impl Default for ProbeConfig {
+    fn default() -> Self {
+        Self {
+            window: std::time::Duration::from_millis(25),
+            min_windows: 3,
+            smoothing_windows: 3,
+            tolerance: 0.05,
+            decisive_margin: 0.20,
+            ceiling: std::time::Duration::from_millis(
+                env_u64("PISCEM_PROBE_CEILING_MS", 1_000),
+            ),
+        }
+    }
+}
+
+impl ProbeConfig {
+    /// Override the ceiling, in milliseconds.
+    pub fn with_ceiling_ms(mut self, ms: u64) -> Self {
+        self.ceiling = std::time::Duration::from_millis(ms);
+        self
+    }
+
+    /// Override the sampling window, in milliseconds.
+    pub fn with_window_ms(mut self, ms: u64) -> Self {
+        self.window = std::time::Duration::from_millis(ms.max(1));
+        self
+    }
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default)
+}
+
+
+/// Run one producer against `consumers` mapping threads and report how much of
+/// the consumers' time went to waiting.
 ///
 /// `map_one` must be callable from several threads at once; it stands in for
-/// whatever the caller means by mapping one record.
+/// whatever the caller means by mapping one record, and *is* the consumer cost
+/// — a caller with two mapping modes passes the closure for the mode it is
+/// about to run, and the measurement follows continuously. There is no need to
+/// classify the workload.
 pub fn probe_starvation<M>(
     path: &Path,
     consumers: usize,
-    budget: std::time::Duration,
+    cfg: ProbeConfig,
     map_one: M,
 ) -> anyhow::Result<Option<Starvation>>
 where
@@ -331,7 +390,10 @@ where
     let records = AtomicU64::new(0);
 
     let start = Instant::now();
-    let result = std::thread::scope(|scope| -> anyhow::Result<()> {
+    let mut windows: Vec<f64> = Vec::new();
+    let mut stopped_because = "ceiling";
+
+    std::thread::scope(|scope| {
         for _ in 0..consumers.max(1) {
             let rx = rx.clone();
             let (done, waited, worked, records) = (&done, &waited_nanos, &worked_nanos, &records);
@@ -358,34 +420,84 @@ where
         }
         drop(rx);
 
-        // Producer runs on this thread, mirroring paraseq: one filler per file.
-        while start.elapsed() < budget {
-            let mut rs = reader.new_record_set();
-            match rs.fill(&mut reader) {
-                Ok(true) => {}
-                _ => break,
+        // Producer on its own thread, leaving this one free to sample.
+        let producer = {
+            let done = &done;
+            let tx = tx.clone();
+            scope.spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    let mut rs = reader.new_record_set();
+                    match rs.fill(&mut reader) {
+                        Ok(true) => {}
+                        _ => break,
+                    }
+                    if tx.send(rs).is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+        drop(tx);
+
+        // Sample in windows, judging from per-window deltas. A running mean
+        // would carry the startup transient -- consumers waiting on an empty
+        // queue -- through the entire measurement.
+        let (mut prev_wait, mut prev_work) = (0u64, 0u64);
+        loop {
+            std::thread::sleep(cfg.window);
+
+            let w = waited_nanos.load(Ordering::Relaxed);
+            let k = worked_nanos.load(Ordering::Relaxed);
+            let (dw, dk) = (w.saturating_sub(prev_wait), k.saturating_sub(prev_work));
+            prev_wait = w;
+            prev_work = k;
+            if dw + dk > 0 {
+                windows.push(dw as f64 / (dw + dk) as f64);
             }
-            if tx.send(rs).is_err() {
+
+            if start.elapsed() >= cfg.ceiling || producer.is_finished() {
+                break;
+            }
+            if windows.len() < cfg.min_windows.max(cfg.smoothing_windows) {
+                continue;
+            }
+
+            let recent = &windows[windows.len() - cfg.smoothing_windows..];
+            let mean = recent.iter().sum::<f64>() / recent.len() as f64;
+            let spread = recent.iter().cloned().fold(f64::MIN, f64::max)
+                - recent.iter().cloned().fold(f64::MAX, f64::min);
+
+            // Unambiguous: no further sampling can move it across the line.
+            if (mean - STARVATION_THRESHOLD).abs() > cfg.decisive_margin {
+                stopped_because = "decisive";
+                break;
+            }
+            // Settled: the answer has stopped moving.
+            if spread <= cfg.tolerance {
+                stopped_because = "stable";
                 break;
             }
         }
-        done.store(true, Ordering::Relaxed);
-        drop(tx);
-        Ok(())
-    });
-    result?;
 
-    let waited = waited_nanos.load(Ordering::Relaxed) as f64;
-    let worked = worked_nanos.load(Ordering::Relaxed) as f64;
+        done.store(true, Ordering::Relaxed);
+    });
+
     let n = records.load(Ordering::Relaxed) as usize;
-    if n == 0 || waited + worked <= 0.0 {
+    if n == 0 || windows.is_empty() {
         return Ok(None);
     }
 
+    // Report the smoothed tail, so the warm-up windows -- whose only content is
+    // the queue filling from empty -- do not colour the verdict.
+    let tail = &windows[windows.len().saturating_sub(cfg.smoothing_windows)..];
+    let fraction = tail.iter().sum::<f64>() / tail.len() as f64;
+
     Ok(Some(Starvation {
-        consumer_wait_fraction: waited / (waited + worked),
+        consumer_wait_fraction: fraction,
         records: n,
         elapsed: start.elapsed(),
+        windows: windows.len(),
+        stopped_because,
     }))
 }
 
@@ -719,14 +831,14 @@ mod tests {
         assert_eq!(d.reason, Reason::SingleThreaded);
     }
 
+    /// Only genuinely logical cases are forced. A threads-per-file bound used
+    /// to live here; it encoded consumer cost as a constant, which the probe
+    /// measures directly, so 8 files at 16 threads must now be *measured*
+    /// rather than assumed.
     #[test]
-    fn many_files_and_few_threads_is_forced_serial() {
-        // 8 files, 16 threads = 2 threads/file: measured 0.92-1.00x, and no
-        // mapping rate can make it pay.
-        assert_eq!(
-            forced_choice(InputKind::Regular, 8, 16).unwrap().reason,
-            Reason::AmpleSerialSupply
-        );
+    fn thread_ratios_are_measured_not_forced() {
+        assert!(forced_choice(InputKind::Regular, 8, 16).is_none());
+        assert!(forced_choice(InputKind::Regular, 2, 4).is_none());
     }
 
     #[test]

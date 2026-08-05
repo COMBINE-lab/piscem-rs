@@ -405,8 +405,11 @@ where
     // files the unscaled probe read 83-91% consumer wait while the parallel
     // decoder actually lost (0.92x).
     let per_file_consumers = (num_threads / num_files.max(1)).max(1);
-    let budget = std::time::Duration::from_millis(calibrate::STARVATION_BUDGET_MS);
-    let starve = calibrate::probe_starvation(path, per_file_consumers, budget, |seq| {
+    let starve = calibrate::probe_starvation(
+        path,
+        per_file_consumers,
+        calibrate::ProbeConfig::default(),
+        |seq| {
         let mut q = crate::mapping::streaming_query::PiscemStreamingQuery::<K, D>::new(index.dict());
         let mut hs = crate::mapping::hit_searcher::HitSearcher::new(index);
         let mut cache = crate::mapping::cache::MappingCache::<S>::new(K);
@@ -415,7 +418,8 @@ where
         crate::mapping::engine::map_read::<K, S, D, C>(
             seq, &mut cache, &mut hs, &mut q, index, &mut poison, strat,
         );
-    })
+        },
+    )
     .ok()
     .flatten()?;
 
@@ -425,9 +429,11 @@ where
         calibrate::Decision { parallel: false, reason: calibrate::Reason::MeasuredConsumerBound }
     };
     tracing::info!(
-        "decoder calibration: {} records in {:.0} ms, consumers waited {:.1}% of their time -> {} ({:?})",
+        "decoder calibration: {} records over {} windows in {:.0} ms ({}), consumers waited {:.1}% of their time -> {} ({:?})",
         starve.records,
+        starve.windows,
         starve.elapsed.as_secs_f64() * 1000.0,
+        starve.stopped_because,
         starve.consumer_wait_fraction * 100.0,
         if decision.parallel { "parallel" } else { "serial" },
         decision.reason
