@@ -16,6 +16,7 @@ use tracing::info;
 
 use super::contig_table::ContigTableDirectBuilder;
 use super::eq_classes::{EqClassMapBuilder, Orientation};
+use super::mem_budget::resolve_ram_limit_gib;
 use super::reference_index::ReferenceIndex;
 use super::refinfo::RefInfo;
 
@@ -54,8 +55,10 @@ pub struct BuildConfig {
     /// location and cleanup. The directory is created by sshash if absent.
     pub tmp_dir: Option<PathBuf>,
     /// RAM ceiling, in GiB, for sshash's external minimizer sort (the dominant
-    /// build-time memory/disk trade-off). `None` keeps sshash's default (8 GiB);
-    /// a smaller value spills to disk sooner (less RAM, more I/O).
+    /// build-time memory/disk trade-off). A smaller value spills to disk sooner
+    /// (less RAM, more I/O); `0` is sshash's "unlimited" (always sort in
+    /// memory). `None` auto-detects a budget from the memory this process may
+    /// actually use — see [`crate::index::mem_budget::resolve_ram_limit_gib`].
     pub ram_limit_gib: Option<usize>,
 }
 
@@ -167,9 +170,7 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
     if let Some(dir) = &config.tmp_dir {
         build_cfg.tmp_dirname = dir.clone();
     }
-    if let Some(gib) = config.ram_limit_gib {
-        build_cfg.ram_limit_gib = gib;
-    }
+    build_cfg.ram_limit_gib = resolve_ram_limit_gib(config.ram_limit_gib);
 
     let dict_builder = DictionaryBuilder::new(build_cfg)
         .map_err(|e| anyhow::anyhow!("failed to create dictionary builder: {e}"))?;

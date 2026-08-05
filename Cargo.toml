@@ -95,6 +95,13 @@ mem_dbg = "0.4.1"
 libradicl = { version = "0.14", optional = true }
 mimalloc = { version = "0.1.48", optional = true }
 
+# Total-RAM detection for the sshash minimizer-sort budget (src/index/mem_budget.rs)
+sysinfo = { version = "0.36", default-features = false, features = ["system"] }
+
+# getrlimit(RLIMIT_AS) for the same budget; POSIX only
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }

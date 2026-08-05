@@ -45,8 +45,11 @@ pub struct BuildArgs {
     /// Unset keeps sshash's default (`sshash_tmp` in the current directory).
     #[arg(long)]
     pub tmp_dir: Option<PathBuf>,
-    /// RAM ceiling, in GiB, for sshash's external minimizer sort. Unset keeps
-    /// sshash's default (8 GiB); a smaller value spills to disk sooner.
+    /// RAM ceiling, in GiB, for sshash's external minimizer sort. Unset
+    /// auto-detects a budget from the memory this process may actually use
+    /// (physical RAM, RLIMIT_AS and any cgroup limit, whichever is smallest),
+    /// never below 8 GiB on a machine that has that much. A smaller value
+    /// spills to disk sooner; 0 means unlimited (always sort in memory).
     #[arg(long)]
     pub ram_limit_gib: Option<usize>,
 }
