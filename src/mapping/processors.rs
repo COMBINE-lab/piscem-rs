@@ -69,16 +69,11 @@ pub struct MappingOpts {
     pub max_read_occ: usize,
     /// Maximum equivalence class cardinality for ambiguous hit filtering.
     pub max_ec_card: u32,
-    /// User's gzip-decoder request. Carried here because it is settled at the
-    /// same point as the other per-run mapping options and is needed where they
-    /// are, not because it affects mapping.
-    pub decoder: crate::io::calibrate::DecoderPreference,
 }
 
 impl Default for MappingOpts {
     fn default() -> Self {
         Self {
-            decoder: crate::io::calibrate::DecoderPreference::default(),
             max_hit_occ: 256,
             max_hit_occ_recover: 1024,
             max_read_occ: 2500,

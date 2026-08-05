@@ -253,8 +253,6 @@ where
     let end_cache = UnitigEndCache::new(args.end_cache_capacity);
     let num_threads = args.threads.max(1);
     let opts = MappingOpts {
-        // scATAC has not been through decoder calibration; keep the default.
-        decoder: crate::io::calibrate::DecoderPreference::default(),
         max_hit_occ: args.max_hit_occ,
         max_hit_occ_recover: args.max_hit_occ_recover,
         max_read_occ: args.max_read_occ,

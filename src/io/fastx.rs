@@ -115,7 +115,7 @@ pub(crate) fn open_input(
     let path = path.as_ref();
 
     // `ceiling == 0` selects the serial path explicitly (see
-    // `MIN_THREADS_PER_FILE_FOR_PARALLEL`), independent of whether the feature is on.
+    // `MIN_THREADS_PER_FILE`), independent of whether the feature is on.
     //
     // Non-regular inputs are excluded here rather than left to the decoder.
     // `rapidgzip` gates its parallel path on `file_type().is_file()` and falls
@@ -185,40 +185,13 @@ pub(crate) struct ThreadBudget {
     pub parallel_gzip: bool,
 }
 
-/// Minimum mapping threads per input file before the parallel decoder is worth
-/// its overhead.
+/// Re-export of the single threads-per-file threshold, which lives in
+/// [`crate::io::calibrate`] alongside the measurements that set it.
 ///
-/// The serial path opens exactly one inflate stream per file, so its supply is
-/// `files x per-stream rate` and does not respond to `-t` at all. Demand is
-/// `map_threads x per-thread consumption`. The parallel decoder therefore pays
-/// off on the *ratio*, not on file count -- which the previous file-count
-/// threshold got right only at the `-t 32` it was calibrated at.
-///
-/// Measured (10x Flex probe panel, multi-member archives, wall-clock speedup of
-/// the parallel decoder over the serial one):
-///
-/// | files | threads/file | speedup |
-/// |------:|-------------:|--------:|
-/// |     2 |            4 |   1.09x |
-/// |     2 |            8 |   1.92x |
-/// |     2 |           16 |   3.05x |
-/// |     4 |            4 |   1.07x |
-/// |     4 |            8 |   1.54x |
-/// |     4 |           16 |   2.08x |
-/// |     8 |            4 |   0.92x |
-/// |     8 |            8 |   1.20x |
-///
-/// The old `files >= 8` rule left 1.20x on the table at 8 files / 64 threads,
-/// and switched on at 8 files / 32 threads where the parallel decoder loses.
-///
-/// Set at 4 rather than 8 because the payoff is sharply asymmetric. Enabling it
-/// when it is not needed costs a few percent: on a 96.3 M-k-mer transcriptome,
-/// where mapping is so slow that decode never binds, the parallel path measured
-/// -3.7% wall and +1.7% CPU. Not enabling it when it is needed costs up to 3x
-/// wall. The dynamic supervisor absorbs the rest: decoders start at one worker
-/// and grow only on demonstrated starvation, so an unnecessary parallel path
-/// degenerates to roughly the serial cost rather than to its ceiling.
-const MIN_THREADS_PER_FILE_FOR_PARALLEL: usize = 4;
+/// `plan_thread_budget` applies it as a fast path so a run that is obviously
+/// serial never builds mapping state for a probe; `calibrate::forced_choice`
+/// applies the same bound as its `AmpleSerialSupply` arm.
+use crate::io::calibrate::MIN_THREADS_PER_FILE;
 
 /// Decide the decompression share of the thread budget.
 ///
@@ -247,7 +220,7 @@ const MIN_THREADS_PER_FILE_FOR_PARALLEL: usize = 4;
 /// count (one inflate stream per file), so many inputs already supply
 /// parallelism and need proportionally less help per file. Whether the parallel
 /// decoder is used at all is decided by the threads-per-file ratio; see
-/// [`MIN_THREADS_PER_FILE_FOR_PARALLEL`].
+/// [`MIN_THREADS_PER_FILE`].
 pub(crate) fn plan_thread_budget(map_threads: usize, num_files: usize) -> ThreadBudget {
     if let Ok(v) = std::env::var("PISCEM_RAPIDGZIP_THREADS")
         && let Ok(per_file) = v.parse::<usize>()
@@ -267,7 +240,7 @@ pub(crate) fn plan_thread_budget(map_threads: usize, num_files: usize) -> Thread
     // This mirrors `calibrate::forced_choice`'s `AmpleSerialSupply` arm; the
     // per-file `InputKind` check lives in `open_input`, since a run can mix
     // regular files and FIFOs.
-    if map_threads / files < MIN_THREADS_PER_FILE_FOR_PARALLEL {
+    if map_threads / files < MIN_THREADS_PER_FILE {
         return ThreadBudget {
             decode_budget: 0,
             per_file_ceiling: 0,

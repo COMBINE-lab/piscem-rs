@@ -16,12 +16,24 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// Threading configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct ThreadConfig {
+    /// Mapping threads, as given by `-t`.
     pub threads: usize,
+    /// The user's gzip-decoder request, from `--decoder`.
+    ///
+    /// Lives here rather than with the mapping options because it is a
+    /// statement about how to spend threads on I/O, which is what this struct
+    /// is for. It reached `plan_thread_budget` via `MappingOpts` for one
+    /// revision, which put a decision about decompression inside a bag of
+    /// alignment parameters.
+    pub decoder: crate::io::calibrate::DecoderPreference,
 }
 
 impl Default for ThreadConfig {
     fn default() -> Self {
-        Self { threads: 16 }
+        Self {
+            threads: 16,
+            decoder: crate::io::calibrate::DecoderPreference::default(),
+        }
     }
 }
 

@@ -133,11 +133,20 @@ pub fn forced_choice(kind: InputKind, num_files: usize, map_threads: usize) -> O
 
 /// Threads per file below which serial supply is sufficient at any mapping rate.
 ///
-/// `SERIAL_GBPS_PER_STREAM / fastest observed per-thread consumption`
-/// = 1.45 / 0.43 ~= 3.4, rounded down. Independently corroborated by the
-/// measured crossover surface, where 4 threads/file sits at 1.07-1.09x and 2
-/// threads/file at 0.92-1.00x.
-const MIN_THREADS_PER_FILE: usize = 3;
+/// Taken from the measured crossover surface rather than derived from the rate
+/// constants, because those disagree depending on which rate you mean: raw
+/// serial inflate runs at 2.24 GB/s, but the *producer* -- decode plus parse,
+/// which is what is actually serialized per file -- runs at 0.43-0.52. Dividing
+/// by the fastest observed per-thread consumption gives ~5 with the former and
+/// ~1 with the latter, so neither is a safe forcing bound.
+///
+/// The surface is unambiguous where the constants are not: 2 threads/file
+/// measures 0.92-1.00x for the parallel decoder and 4 threads/file 1.07-1.09x,
+/// so the crossing is between them.
+///
+/// This is the single source of truth; `io::fastx` uses it too, rather than
+/// keeping a second copy that could drift.
+pub const MIN_THREADS_PER_FILE: usize = 3;
 
 /// Rates measured from a prefix of the input.
 #[derive(Debug, Clone, Copy)]
@@ -405,6 +414,13 @@ pub const DEFAULT_MARGIN: f64 = 0.8;
 /// Upper bound on the untimed warm-up prefix. See [`probe`].
 const WARMUP_RECORDS_MAX: usize = 1_000;
 
+/// How many times more records the producer side reads than the consumer maps.
+///
+/// The producer is fast, so a consumer-sized sample times it over ~20 ms, which
+/// on a validation run read 0.83 GB/s against 0.43-0.52 measured over a whole
+/// file. Ten times the records costs a few extra milliseconds and removes that.
+const PRODUCER_SAMPLE_FACTOR: usize = 10;
+
 /// Records to sample when probing.
 ///
 /// Measured cost single-threaded: 0.04 s against a 96.3 M k-mer transcriptome,
@@ -454,11 +470,19 @@ where
     drop(warm);
 
     // Producer: decode + parse, nothing else running.
+    //
+    // Measured over more records than the consumer needs. The two rates want
+    // different sample sizes: mapping is slow enough that a few thousand
+    // records take tens of milliseconds, while producing the same few thousand
+    // takes ~20 ms -- short enough that the result was dominated by noise and
+    // read 0.83 GB/s where a whole-file measurement of the identical work gives
+    // 0.43-0.52. Reading further costs little and stabilises it.
+    let produce_sample = sample.saturating_mul(PRODUCER_SAMPLE_FACTOR);
     let mut sets: Vec<fastx::RecordSet> = Vec::new();
     let mut records = 0usize;
     let mut bytes = 0u64;
     let produce_start = Instant::now();
-    while records < sample {
+    while records < produce_sample {
         let mut rs = reader.new_record_set();
         match rs.fill(&mut reader) {
             Ok(true) => {}
@@ -476,20 +500,32 @@ where
         return Ok(None);
     }
 
-    // Consumer: map in place, producer finished.
+    // Consumer: map in place, producer finished. Only the first `sample`
+    // records -- mapping is the expensive half, and its rate is stable well
+    // before the producer's is.
+    let mut mapped = 0usize;
+    let mut mapped_bytes = 0u64;
     let consume_start = Instant::now();
-    for rs in &sets {
+    'consume: for rs in &sets {
         for rec in rs.iter().filter_map(Result::ok) {
-            map_one(rec.seq().as_ref());
+            if mapped >= sample {
+                break 'consume;
+            }
+            let seq = rec.seq();
+            mapped_bytes += seq.as_ref().len() as u64;
+            map_one(seq.as_ref());
+            mapped += 1;
         }
     }
     let consume_elapsed = consume_start.elapsed();
 
-    let gb = bytes as f64 / 1e9;
     Ok(Some(InputRates {
-        decode_gbps_per_stream: safe_rate(gb, produce_elapsed.as_secs_f64()),
-        map_gbps_per_thread: safe_rate(gb, consume_elapsed.as_secs_f64()),
-        records_sampled: records,
+        decode_gbps_per_stream: safe_rate(bytes as f64 / 1e9, produce_elapsed.as_secs_f64()),
+        map_gbps_per_thread: safe_rate(
+            mapped_bytes as f64 / 1e9,
+            consume_elapsed.as_secs_f64(),
+        ),
+        records_sampled: mapped,
         bytes_sampled: bytes,
     }))
 }

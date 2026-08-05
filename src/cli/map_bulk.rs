@@ -247,7 +247,6 @@ where
     let decoder_pref = crate::io::calibrate::DecoderPreference::parse(&args.decoder)
         .map_err(|e| anyhow::anyhow!("invalid --decoder value: {e}"))?;
     let opts = MappingOpts {
-        decoder: decoder_pref,
         max_hit_occ: args.max_hit_occ,
         max_hit_occ_recover: args.max_hit_occ_recover,
         max_read_occ: args.max_read_occ,
@@ -275,14 +274,14 @@ where
                 r1_paths, r2_paths,
                 &output_info, &stats,
                 index, strat, opts, is_paired,
-                num_threads, &progress,
+                num_threads, decoder_pref, &progress,
             )?;
         } else {
             run_bulk_pipeline::<K, SketchHitInfoSimple, _, _>(
                 r1_paths, r2_paths,
                 &output_info, &stats,
                 index, strat, opts, is_paired,
-                num_threads, &progress,
+                num_threads, decoder_pref, &progress,
             )?;
         }
     });
@@ -350,13 +349,13 @@ where
 /// ratio rule in `plan_thread_budget`, which is what ran before this existed.
 #[allow(clippy::too_many_arguments)]
 fn calibrate_decoder<const K: usize, S: SketchHitInfo, D: KmerDictionary, C: ContigTableLike>(
-    pref: crate::io::calibrate::DecoderPreference,
     first_path: Option<&std::path::PathBuf>,
     num_files: usize,
     num_threads: usize,
     index: &ReferenceIndex<D, C>,
     opts: &crate::mapping::processors::MappingOpts,
     strat: SkippingStrategy,
+    pref: crate::io::calibrate::DecoderPreference,
 ) -> Option<crate::io::calibrate::Decision>
 where
     Kmer<K>: KmerBits,
@@ -433,6 +432,7 @@ fn run_bulk_pipeline<
     opts: MappingOpts,
     is_paired: bool,
     num_threads: usize,
+    decoder_pref: crate::io::calibrate::DecoderPreference,
     progress: &ProgressBar,
 ) -> Result<()>
 where
@@ -450,13 +450,13 @@ where
     let mut plan = crate::io::fastx::plan_thread_budget(num_threads, num_input_files);
     // Tier 1: when nothing forces the choice, measure instead of assuming.
     if let Some(decision) = calibrate_decoder::<K, S, D, C>(
-        opts.decoder,
         read1_paths.first(),
         num_input_files,
         num_threads,
         index,
         &opts,
         strat,
+        decoder_pref,
     ) {
         if !decision.parallel {
             plan.parallel_gzip = false;
@@ -465,7 +465,7 @@ where
             plan.initial_per_file = 0;
         } else if let crate::io::calibrate::DecoderPreference::Parallel {
             workers_per_file: Some(w),
-        } = opts.decoder
+        } = decoder_pref
         {
             // An explicit worker count is a ceiling *and* a starting point:
             // someone naming a number wants it used, not ratcheted up to.
