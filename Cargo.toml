@@ -97,7 +97,7 @@ mem_dbg = "0.4.1"
 # RAD file parsing — optional, enabled by parity-test feature
 libradicl = { version = "0.14", optional = true }
 mimalloc = { version = "0.1.48", optional = true }
-rapidgzip-core = { version = "0.1", optional = true }
+rapidgzip-core = { version = "0.2.0", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -137,6 +137,5 @@ debug = true
 # inheritance despite `[workspace] exclude`, so its crates resolve to this
 # workspace's 0.5.0 rather than sshash-rs's own version, silently failing the
 # `"0.6"` requirement and leaving the patch unused.
-# sshash-lib = { path = "../sshash-rs-dev/crates/sshash-lib" }
-# tiny-dict = { path = "../sshash-rs-dev/crates/tiny-dict" }
-# rapidgzip-core = { path = "../rapidgzip-rust/crates/rapidgzip-core" }
+sshash-lib = { path = "../sshash-rs-dev/crates/sshash-lib" }
+tiny-dict = { path = "../sshash-rs-dev/crates/tiny-dict" }
