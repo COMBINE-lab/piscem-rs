@@ -84,16 +84,23 @@ fn rlimit_as_bytes() -> Option<u64> {
 
 /// Memory ceiling imposed by the process's cgroup, if any.
 ///
-/// Handles cgroup v2 (`memory.max`) and v1 (`memory.limit_in_bytes`). Reads the
-/// process's *own* cgroup path from `/proc/self/cgroup` before falling back to
-/// the mount root, because a scheduler places the job in a nested cgroup and
-/// the root file usually reads `max`.
+/// Handles cgroup v2 (`memory.max`) and v1 (`memory.limit_in_bytes`), resolving
+/// the process's own path from `/proc/self/cgroup` and then taking the
+/// **minimum over that cgroup and every ancestor**.
+///
+/// Walking the chain matters as much as finding the leaf. The effective ceiling
+/// is the tightest limit anywhere above the process, and a scheduler routinely
+/// caps an ancestor while the job's own cgroup reads `max` — so reading only
+/// the leaf reports "unlimited" for a confined job, which is precisely the
+/// failure this module exists to prevent. (Raised by @BenjaminDEMAILLE in
+/// review of PR #4, against an earlier version that read only the leaf.)
 ///
 /// This is the case that matters: SLURM, LSF and container runtimes all limit
 /// memory here rather than through rlimits.
 #[cfg(target_os = "linux")]
 fn cgroup_limit_bytes() -> Option<u64> {
     use std::fs;
+    use std::path::PathBuf;
 
     fn parse(s: &str) -> Option<u64> {
         let s = s.trim();
@@ -105,26 +112,74 @@ fn cgroup_limit_bytes() -> Option<u64> {
         if v >= i64::MAX as u64 / 2 { None } else { Some(v) }
     }
 
-    // The process's own cgroup path, e.g. "0::/slurm/uid_1000/job_123".
-    let own_path = fs::read_to_string("/proc/self/cgroup").ok().and_then(|s| {
-        s.lines()
-            .find_map(|l| l.strip_prefix("0::").map(str::to_string))
+    /// Minimum limit over `dir` and every ancestor up to `root`.
+    ///
+    /// The effective ceiling is the tightest limit anywhere on the chain, not
+    /// the one on the leaf: a scheduler routinely caps an ancestor while the
+    /// job's own cgroup reads `max`. Reading only the leaf therefore reports
+    /// "unlimited" for a confined job — the exact failure this module exists to
+    /// prevent.
+    fn min_along_chain(root: &str, mut dir: PathBuf, file: &str) -> Option<u64> {
+        let mut best: Option<u64> = None;
+        loop {
+            if let Some(v) = fs::read_to_string(dir.join(file)).ok().and_then(|s| parse(&s)) {
+                best = Some(best.map_or(v, |b: u64| b.min(v)));
+            }
+            if dir.as_os_str() == root || !dir.pop() {
+                break;
+            }
+        }
+        best
+    }
+
+    // The process's own cgroup path. v2 lines start "0::"; v1 lines name their
+    // controllers, and we want the one carrying `memory`.
+    let cgroup_file = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    let v2_rel = cgroup_file
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(|p| p.trim_start_matches('/').to_string());
+    let v1_rel = cgroup_file.lines().find_map(|l| {
+        let mut f = l.splitn(3, ':');
+        let (_, ctrls, path) = (f.next()?, f.next()?, f.next()?);
+        ctrls
+            .split(',')
+            .any(|c| c == "memory")
+            .then(|| path.trim_start_matches('/').to_string())
     });
 
-    let mut candidates = Vec::new();
-    if let Some(p) = own_path {
-        let p = p.trim_start_matches('/');
-        if !p.is_empty() {
-            candidates.push(format!("/sys/fs/cgroup/{p}/memory.max"));
+    let mut found: Option<u64> = None;
+    let mut take = |v: Option<u64>| {
+        if let Some(v) = v {
+            found = Some(found.map_or(v, |b: u64| b.min(v)));
         }
-    }
-    candidates.push("/sys/fs/cgroup/memory.max".to_string());
-    candidates.push("/sys/fs/cgroup/memory/memory.limit_in_bytes".to_string());
+    };
 
-    candidates
-        .iter()
-        .filter_map(|p| fs::read_to_string(p).ok())
-        .find_map(|s| parse(&s))
+    // cgroup v2: unified hierarchy at the mount root.
+    const V2_ROOT: &str = "/sys/fs/cgroup";
+    take(min_along_chain(
+        V2_ROOT,
+        PathBuf::from(V2_ROOT).join(v2_rel.clone().unwrap_or_default()),
+        "memory.max",
+    ));
+
+    // cgroup v1: the memory controller is mounted in its own subdirectory.
+    const V1_ROOT: &str = "/sys/fs/cgroup/memory";
+    take(min_along_chain(
+        V1_ROOT,
+        PathBuf::from(V1_ROOT).join(v1_rel.unwrap_or_default()),
+        "memory.limit_in_bytes",
+    ));
+
+    if found.is_none() && v2_rel.is_some() {
+        // Under a rootless container the path from /proc/self/cgroup may not
+        // resolve inside the namespace, and we fall back to whatever the mount
+        // root reports — possibly a larger limit than the real one. That is
+        // today's behaviour rather than a new hazard, but it is silent, so say
+        // so at debug level.
+        debug!("no cgroup memory limit resolved; falling back to other sources");
+    }
+    found
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -96,6 +96,10 @@ fn ensure_rust_index() -> Result<()> {
         seed: 1,
         single_mphf: false,
         emit_tiny: None,
+        tmp_dir: None,
+        // Auto-detect, as a normal build does — these harnesses build real
+        // indices and should exercise the same budget path users get.
+        ram_limit_gib: None,
     };
 
     piscem_rs::index::build::build_index(&config)?;
