@@ -11,8 +11,8 @@ license-file = "LICENSE"
 repository = "https://github.com/COMBINE-lab/sshash-rs"
 
 [workspace.dependencies]
-sshash-lib = { version = "0.6.1" }
-tiny-dict = { version = "0.6.0" }
+sshash-lib = { version = "0.6.3" }
+tiny-dict = { version = "0.6.3" }
 sux = { version = "0.14.0", features = ["epserde"] }
 ph = { package = "ph-temp", version = "0.12.0", default-features = false, features = ["rapidhash"] }
 needletail = "0.6"
@@ -69,8 +69,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sshash-lib = "0.6.1"
-tiny-dict = "0.6"
+sshash-lib = "0.6.3"
+tiny-dict = "0.6.3"
 
 # Fast hashing with deterministic seeding (same version as sshash-rs)
 ahash = "0.8"
@@ -128,14 +128,3 @@ debug = 1
 [profile.bench]
 inherits = "release"
 debug = true
-
-[patch.crates-io]
-# Local sshash-rs checkout for development.
-#
-# NOTE: the checkout must live *outside* this crate's directory tree. A nested
-# `./sshash-rs/` is still bound to *this* workspace for `version.workspace`
-# inheritance despite `[workspace] exclude`, so its crates resolve to this
-# workspace's 0.5.0 rather than sshash-rs's own version, silently failing the
-# `"0.6"` requirement and leaving the patch unused.
-sshash-lib = { path = "../sshash-rs-dev/crates/sshash-lib" }
-tiny-dict = { path = "../sshash-rs-dev/crates/tiny-dict" }
