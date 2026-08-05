@@ -371,6 +371,9 @@ where
     #[cfg(feature = "rapidgzip")]
     let mut handles: Vec<rapidgzip_core::DecoderHandle> = Vec::new();
 
+    // `mut` is required only with the `rapidgzip` feature, where the closure
+    // pushes into `handles`; without it the body has nothing to mutate.
+    #[allow(unused_mut)]
     let mut open = |path: &std::path::Path| -> Result<_> {
         let opened =
             crate::io::fastx::open_input(path, plan.per_file_ceiling, plan.initial_per_file)?;
@@ -382,15 +385,18 @@ where
             .map_err(|e| anyhow::anyhow!("failed to open {}: {}", path.display(), e))
     };
 
+    // Scoped so the closure's mutable borrow of `handles` ends here, leaving
+    // the vector free for the supervisor below.
     let mut readers = Vec::with_capacity(num_input_files);
-    for i in 0..bio_paths.len() {
-        readers.push(open(&bio_paths[i])?);
-        readers.push(open(&barcode_paths[i])?);
-        if is_paired {
-            readers.push(open(&read2_paths[i])?);
+    {
+        for i in 0..bio_paths.len() {
+            readers.push(open(&bio_paths[i])?);
+            readers.push(open(&barcode_paths[i])?);
+            if is_paired {
+                readers.push(open(&read2_paths[i])?);
+            }
         }
     }
-    drop(open);
 
     #[cfg(feature = "rapidgzip")]
     let budget = crate::io::decode_budget::DecodeBudget::spawn(handles, plan.decode_budget);

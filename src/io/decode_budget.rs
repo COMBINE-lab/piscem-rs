@@ -286,19 +286,19 @@ fn supervise(
             let want = want.clamp(1, configured);
 
             // Ignore adjustments too small to matter; they only churn threads.
-            if want.abs_diff(applied[i]) >= MIN_ADJUSTMENT || applied[i] == 0 {
-                if handle.set_worker_limit(want).is_ok() {
-                    tracing::debug!(
-                        "decode-budget: file {} {} -> {} ({:?} score {}, spawned {})",
-                        i,
-                        applied[i],
-                        want,
-                        last_verdict[i],
-                        score[i],
-                        snapshots[i].spawned_workers
-                    );
-                    applied[i] = want;
-                }
+            if (want.abs_diff(applied[i]) >= MIN_ADJUSTMENT || applied[i] == 0)
+                && handle.set_worker_limit(want).is_ok()
+            {
+                tracing::debug!(
+                    "decode-budget: file {} {} -> {} ({:?} score {}, spawned {})",
+                    i,
+                    applied[i],
+                    want,
+                    last_verdict[i],
+                    score[i],
+                    snapshots[i].spawned_workers
+                );
+                applied[i] = want;
             }
         }
 

@@ -80,12 +80,7 @@ mod tests {
 
     #[test]
     fn state_hashes_identically_to_a_freshly_seeded_one() {
-        use std::hash::{BuildHasher, Hash, Hasher};
-        let h = |s: &RandomState| {
-            let mut hasher = s.build_hasher();
-            0xDEAD_BEEF_u64.hash(&mut hasher);
-            hasher.finish()
-        };
+        let h = |s: &RandomState| std::hash::BuildHasher::hash_one(s, 0xDEAD_BEEF_u64);
         assert_eq!(h(&fixed_state()), h(&fixed_state()));
     }
 }

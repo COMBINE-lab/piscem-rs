@@ -187,9 +187,7 @@ where
     // block say nothing about steady state. Pulled but not timed.
     let warmup = (sample / 8).clamp(1, WARMUP_RECORDS_MAX);
     for _ in 0..warmup {
-        if next_record().is_none() {
-            return None;
-        }
+        next_record()?;
     }
 
     // Phase 1: decode, with nothing else competing.

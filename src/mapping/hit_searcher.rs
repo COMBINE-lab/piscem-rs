@@ -61,7 +61,7 @@ static VALID_BASE: [u64; 4] = {
     let mut t = [0u64; 4];
     let mut i = 0;
     while i < 8 {
-        let b = [b'A', b'C', b'G', b'T', b'a', b'c', b'g', b't'][i];
+        let b = b"ACGTacgt"[i];
         t[(b >> 6) as usize] |= 1u64 << (b & 63);
         i += 1;
     }
@@ -1037,7 +1037,7 @@ mod tests {
             }
             (fw, rc)
         }
-        let bases = [b'A', b'C', b'G', b'T', b'a', b'c', b'g', b't'];
+        let bases = b"ACGTacgt";
         let mut st = 0x1234_5678_9abc_def1u64;
         let mut rng = || {
             st ^= st << 13;
