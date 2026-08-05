@@ -28,7 +28,7 @@ seq-macro = "0.3"
 
 [package]
 name = "piscem-rs"
-version = "0.6.4"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.91"
 license = "BSD-3-Clause"
