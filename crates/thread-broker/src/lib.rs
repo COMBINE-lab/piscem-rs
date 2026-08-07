@@ -79,15 +79,15 @@
 //! # use thread_broker::*;
 //! # use std::time::Duration;
 //! # fn demo<C: Consumer + 'static, P: Producer + 'static>(mapper: C, decoders: P)
-//! # -> Result<(), BrokerConfigError> {
+//! # -> Result<(), Box<dyn std::error::Error>> {
 //! let broker = ThreadBroker::builder(mapper, decoders)
 //!     .budget(32)
 //!     .sample_interval(Duration::from_millis(100))
 //!     .build()?;
 //!
-//! let running = broker.start();
+//! let running = broker.start()?;
 //! // ... run the job ...
-//! let report = running.finish();
+//! let report = running.finish()?;
 //! tracing::info!(
 //!     "decode settled at {} of 32 threads after {:?}",
 //!     report.final_producer_limit,
@@ -102,7 +102,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 mod controller;
-pub use controller::{BrokerReport, Model, RunningBroker};
+pub use controller::{
+    BrokerPhase, BrokerReport, Model, ProducerCapReason, Rejection, RunningBroker,
+};
 
 /// Cumulative work done by one stage.
 ///
@@ -154,7 +156,11 @@ impl Work {
 /// Implementors resize a worker pool and report how much work it has done.
 pub trait Consumer: Send + Sync {
     /// Ask for `n` worker threads. May take effect gradually.
-    fn set_threads(&self, n: usize);
+    ///
+    /// Returning success acknowledges the request, not its completion. The
+    /// broker observes [`Self::live_threads`] before spending the released
+    /// capacity on the producer.
+    fn set_threads(&self, n: usize) -> Result<(), ResizeError>;
 
     /// Workers **actually running now**, which may lag what was asked for.
     ///
@@ -173,15 +179,78 @@ pub trait Consumer: Send + Sync {
     /// from a totally idle consumer, and reporting maximum starvation for one
     /// running flat out. [`BusyMeter`] handles this.
     fn work(&self) -> Work;
+
+    /// Switch instrumentation between decision-quality and settled cadence.
+    ///
+    /// Most consumers can leave this as a no-op. Consumers for which publishing
+    /// progress is itself measurable work may use a finer cadence only while a
+    /// decision is open and a coarser cadence in steady state.
+    fn set_measurement_mode(&self, _mode: ProducerMeasurementMode) {}
 }
 
 /// The side that produces decoded bytes: a decompressor or pool of them.
 pub trait Producer: Send + Sync {
     /// Ask for an aggregate concurrency limit of `n`.
-    fn set_limit(&self, n: usize);
+    ///
+    /// Returning success acknowledges the request, not the completion of work
+    /// already admitted under the previous limit.
+    fn set_limit(&self, n: usize) -> Result<(), ResizeError>;
 
     /// The current limit.
     fn limit(&self) -> usize;
+
+    /// Slots executing producer work now.
+    ///
+    /// This is the acknowledgement signal for a shrink. It must include work
+    /// admitted before a lower limit was requested and exclude coordinator or
+    /// I/O threads that do not consume controlled execution slots.
+    fn active_slots(&self) -> usize;
+
+    /// Current queued output in the same unit as [`Work::items`], when known.
+    ///
+    /// The controller rejects cost windows in which this buffer changes
+    /// materially, because the two stages then processed different amounts of
+    /// logical work and their busy-time ratio is not a per-item cost ratio.
+    fn buffered_items(&self) -> Option<u64> {
+        None
+    }
+
+    /// Live auxiliary threads outside the controlled execution-slot budget.
+    fn auxiliary_threads(&self) -> usize {
+        0
+    }
+
+    /// Select how aggressively an adapter should observe producer busy time.
+    ///
+    /// Calibration is requested only while the broker is gathering or
+    /// ratifying cost evidence. Monitoring is requested while resizing,
+    /// blacking out contaminated windows, or sitting at a settled split. The
+    /// default is a no-op because producers with native cumulative counters do
+    /// not need a sampling policy.
+    fn set_measurement_mode(&self, _mode: ProducerMeasurementMode) {}
+
+    /// Suggest an observation interval while the broker is settled.
+    ///
+    /// Producers with native cumulative counters may ignore this. An adapter
+    /// that reconstructs busy time by polling should reduce its own observation
+    /// rate when steady-state probes are far apart. It may clamp the request to
+    /// the minimum cadence needed for a useful estimate.
+    fn set_monitoring_interval(&self, _interval: Duration) {}
+
+    /// Optional diagnostics for a sampled producer measurement.
+    fn measurement_stats(&self) -> Option<ProducerMeasurementStats> {
+        None
+    }
+
+    /// Stop any private measurement adapter and return its final diagnostics.
+    ///
+    /// The controller calls this exactly once when it exits. Native cumulative
+    /// counters may use the default snapshot implementation. Sampled adapters
+    /// should join their sampler here so lifetime CPU accounting is complete
+    /// before the report is serialized.
+    fn finish_measurement(&self) -> Option<ProducerMeasurementStats> {
+        self.measurement_stats()
+    }
 
     /// Why the producer is or is not keeping up.
     ///
@@ -193,6 +262,95 @@ pub trait Producer: Send + Sync {
 
     /// Cumulative work. See [`Work`].
     fn work(&self) -> Work;
+}
+
+/// Requested fidelity for an adapter that reconstructs cumulative busy time
+/// from instantaneous observations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProducerMeasurementMode {
+    /// Short, high-resolution observation while a cost decision is open.
+    #[default]
+    Calibration,
+    /// Low-frequency observation sufficient to detect a possible regime change.
+    Monitoring,
+}
+
+/// What the broker does after it has established a stable split.
+///
+/// All variants share warm-up, cost measurement, guarded model resizing,
+/// blackout, ratification, and the first clean steady-state check. Responsive
+/// may additionally run opt-in nonlinear probes. The two freeze variants make
+/// the calibration/overhead tradeoff explicit rather than overloading one
+/// ambiguous "freeze" setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SteadyStatePolicy {
+    /// Continue low-frequency observation and re-open the controller after a
+    /// persistent workload change. Also permits opt-in nonlinear probing.
+    #[default]
+    Responsive,
+    /// Use the model-only path, then stop the controller and release recurring
+    /// measurement adapters after the first stable split is established.
+    ///
+    /// This makes the recurring broker cost zero for the rest of a stable run,
+    /// but intentionally gives up adaptation to later workload regimes. Use it
+    /// only when that tradeoff is known to fit the application.
+    FreezeAfterConvergence,
+    /// Complete the same opt-in nonlinear response-curve calibration as
+    /// [`Responsive`](Self::Responsive), then stop the controller and release
+    /// recurring measurement adapters after the first stable split.
+    ///
+    /// This pays a bounded startup calibration cost in exchange for zero
+    /// recurring broker work. It cannot react to a later workload regime.
+    FreezeAfterFullCalibration,
+}
+
+/// Bounded diagnostics for producer-side busy-time sampling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ProducerMeasurementStats {
+    /// Integrated sampled executing-worker time.
+    pub busy_nanos: u64,
+    /// CPU time from completed producer worker-thread lifetimes, when the
+    /// adapter supports optional component accounting.
+    pub completed_worker_cpu_nanos: Option<u64>,
+    /// CPU time from completed producer auxiliary-thread lifetimes, when the
+    /// adapter supports optional component accounting.
+    pub completed_auxiliary_cpu_nanos: Option<u64>,
+    /// Thread CPU-clock read failures, when component accounting is enabled.
+    pub cpu_accounting_failures: Option<usize>,
+    /// Lifetime CPU time of the measurement sampler itself. This requires only
+    /// one thread-clock read at sampler start and one at sampler exit; no clock
+    /// reads are added to its observation loop.
+    pub sampler_cpu_nanos: Option<u64>,
+    /// Sampler thread-clock reads that failed.
+    pub sampler_cpu_accounting_failures: usize,
+    pub calibration_samples: u64,
+    pub monitoring_samples: u64,
+    pub mode_changes: u64,
+    pub final_mode: ProducerMeasurementMode,
+    /// Wall time spent obtaining instantaneous observations, excluding sleeps.
+    pub observation_nanos: u64,
+    pub calibration_interval_micros: u64,
+    pub monitoring_interval_micros: u64,
+}
+
+/// A two-read lifetime CPU timer for low-overhead administrative accounting.
+///
+/// It must be started and read on the same thread. Constructing it reads that
+/// thread's CPU clock once, and [`Self::elapsed`] reads it once more. It does
+/// not install periodic instrumentation or affect application hot paths.
+#[doc(hidden)]
+pub struct ThreadCpuTimer(Option<cpu_time::ThreadTime>);
+
+impl ThreadCpuTimer {
+    pub fn start() -> Self {
+        Self(cpu_time::ThreadTime::try_now().ok())
+    }
+
+    pub fn elapsed(&self) -> Option<Duration> {
+        self.0.as_ref()?.try_elapsed().ok()
+    }
 }
 
 /// Whether more producer concurrency would buy anything.
@@ -258,6 +416,113 @@ impl std::fmt::Display for BrokerConfigError {
 
 impl std::error::Error for BrokerConfigError {}
 
+/// A pool refused a resize request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResizeError(Box<str>);
+
+impl ResizeError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into().into_boxed_str())
+    }
+}
+
+impl std::fmt::Display for ResizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ResizeError {}
+
+/// Which side was being resized or drained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeSide {
+    Consumer,
+    Producer,
+}
+
+/// Why a broker could not start or complete safely.
+#[derive(Debug)]
+pub enum BrokerErrorKind {
+    ResizeRefused {
+        side: ResizeSide,
+        requested: usize,
+        source: ResizeError,
+    },
+    ResizeTimedOut {
+        side: ResizeSide,
+        target: usize,
+        observed: usize,
+        timeout: Duration,
+    },
+    ThreadSpawn(std::io::Error),
+    ThreadPanicked,
+}
+
+/// A broker failure, optionally carrying the report accumulated before it.
+#[derive(Debug)]
+pub struct BrokerError {
+    kind: BrokerErrorKind,
+    report: Option<Box<BrokerReport>>,
+}
+
+impl BrokerError {
+    pub(crate) fn new(kind: BrokerErrorKind) -> Self {
+        Self { kind, report: None }
+    }
+
+    pub(crate) fn with_report(mut self, report: BrokerReport) -> Self {
+        self.report = Some(Box::new(report));
+        self
+    }
+
+    pub fn kind(&self) -> &BrokerErrorKind {
+        &self.kind
+    }
+
+    pub fn report(&self) -> Option<&BrokerReport> {
+        self.report.as_deref()
+    }
+}
+
+impl std::fmt::Display for BrokerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            BrokerErrorKind::ResizeRefused {
+                side,
+                requested,
+                source,
+            } => write!(
+                f,
+                "thread broker {side:?} resize to {requested} was refused: {source}"
+            ),
+            BrokerErrorKind::ResizeTimedOut {
+                side,
+                target,
+                observed,
+                timeout,
+            } => write!(
+                f,
+                "thread broker timed out after {timeout:?} waiting for {side:?} to shrink to {target} (observed {observed})"
+            ),
+            BrokerErrorKind::ThreadSpawn(source) => {
+                write!(f, "could not spawn thread-broker sampler: {source}")
+            }
+            BrokerErrorKind::ThreadPanicked => f.write_str("thread-broker sampler panicked"),
+        }
+    }
+}
+
+impl std::error::Error for BrokerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            BrokerErrorKind::ResizeRefused { source, .. } => Some(source),
+            BrokerErrorKind::ThreadSpawn(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
 /// Tuning, all of it overridable.
 ///
 /// Every default below was arrived at by fixing an observed failure, so they
@@ -280,6 +545,13 @@ pub struct BrokerConfig {
     /// reports instantaneous worker counts; the signals used here are an
     /// integrated busy counter and a demand estimate, neither of which aliases.
     pub sample_interval: Duration,
+    /// How often a responsive broker probes after convergence.
+    ///
+    /// `None` (the default) uses [`Self::sample_interval`], preserving the fully
+    /// responsive behavior. A longer interval changes only settled monitoring;
+    /// warm-up, calibration, resizing, blackout, and ratification continue at
+    /// `sample_interval`.
+    pub steady_probe_interval: Option<Duration>,
     /// Time discarded before the first decision.
     ///
     /// **Load-bearing, not merely tuned.** Every workload measured reported ~99%
@@ -342,6 +614,27 @@ pub struct BrokerConfig {
     pub blackout_samples: usize,
     /// Windows of throughput evidence gathered before a move is ratified.
     pub ratify_samples: usize,
+    /// Windows used by an optional nonlinear response probe.
+    ///
+    /// A caller whose records have genuine short-range cost variation may
+    /// lengthen this bounded, startup-only experiment without slowing ordinary
+    /// model moves or settled monitoring. Publication granularity should be
+    /// fixed first: this is not a substitute for progress counters that update
+    /// less often than a sample.
+    pub nonlinear_probe_samples: usize,
+    /// Enable bounded response-curve exploration at the producer floor.
+    ///
+    /// Disabled by default: it is an application policy for workloads with
+    /// measured allocation-dependent scaling, not a tax every model-floor job
+    /// should pay. Freeze-after-convergence skips it even when configured.
+    pub nonlinear_probes: bool,
+    /// Post-resize blackout used only before a nonlinear response probe.
+    ///
+    /// Some allocation changes take longer to reach representative throughput
+    /// than they take to acknowledge worker retirement. This separates that
+    /// transition-settling horizon from both the ordinary model blackout and
+    /// the number of evidence windows gathered afterward.
+    pub nonlinear_blackout_samples: usize,
     /// Relative throughput loss that counts as a regression rather than noise.
     ///
     /// Only a *regression* reverts a move. Absence of improvement does not,
@@ -357,11 +650,12 @@ pub struct BrokerConfig {
     /// Settling must not mean going deaf: a file ending or a different sample
     /// beginning genuinely changes the costs. But adapting continuously spends
     /// moves on noise forever, and each move rebuilds per-thread state on both
-    /// sides. So the broker settles and then sleeps until surprised, with this
-    /// as the surprise threshold. It should be comfortably wider than
-    /// [`Self::deadband_threads`], which is the asymmetric hysteresis the
-    /// load-balancing literature recommends: cheap to keep a decision, dear to
-    /// re-open one.
+    /// sides. So the broker settles and then sleeps until surprised. This value
+    /// is only an absolute floor: observed cost-share uncertainty can widen the
+    /// effective threshold, and persistent evidence is required before the
+    /// decision re-opens. Keeping the floor at one preserves sensitivity to a
+    /// one-slot regime change on small budgets without making noisy large
+    /// budgets unstable.
     ///
     /// # Why drift rather than a throughput CUSUM
     ///
@@ -391,6 +685,21 @@ pub struct BrokerConfig {
     /// survive a second of consecutive windows, and a real regime change does.
     /// It also costs nothing when there is no drift.
     pub resurvey_samples: usize,
+    /// Maximum time to wait for the shrinking side to release capacity before
+    /// aborting the broker. The other side is never grown before this
+    /// acknowledgement arrives.
+    pub resize_timeout: Duration,
+    /// Absolute queue drift tolerated in one cost window.
+    pub max_buffer_drift_items: u64,
+    /// Queue drift tolerated as a fraction of producer progress in the window.
+    pub max_buffer_drift_fraction: f64,
+    /// Wall-clock history retained for producer scalability caps.
+    pub cap_history: Duration,
+    /// Continuous corroborating evidence required before slack or source
+    /// saturation is allowed to constrain a move.
+    pub cap_persistence: Duration,
+    /// Maximum number of requested/actual samples retained in a report.
+    pub trace_capacity: usize,
     /// The consumer never drops below this.
     pub min_consumer_threads: usize,
     /// Producer concurrency never drops below this, in aggregate.
@@ -414,14 +723,24 @@ impl Default for BrokerConfig {
     fn default() -> Self {
         Self {
             sample_interval: Duration::from_millis(100),
+            steady_probe_interval: None,
             warmup: Duration::from_millis(400),
             smoothing_windows: 3,
-            deadband_threads: 2,
+            deadband_threads: 1,
             blackout_samples: 4,
             ratify_samples: 4,
+            nonlinear_probe_samples: 4,
+            nonlinear_probes: false,
+            nonlinear_blackout_samples: 4,
             regression_tolerance: 0.05,
-            resurvey_distance: 6,
+            resurvey_distance: 1,
             resurvey_samples: 8,
+            resize_timeout: Duration::from_secs(2),
+            max_buffer_drift_items: 1 << 20,
+            max_buffer_drift_fraction: 0.05,
+            cap_history: Duration::from_millis(800),
+            cap_persistence: Duration::from_millis(300),
+            trace_capacity: 256,
             min_consumer_threads: 1,
             min_producer_slots: 1,
         }
@@ -435,6 +754,7 @@ pub struct ThreadBroker<C: Consumer, P: Producer> {
     pub(crate) budget: usize,
     pub(crate) config: BrokerConfig,
     pub(crate) initial_producer_slots: Option<usize>,
+    pub(crate) steady_state_policy: SteadyStatePolicy,
 }
 
 /// Builder for [`ThreadBroker`].
@@ -444,6 +764,7 @@ pub struct ThreadBrokerBuilder<C: Consumer, P: Producer> {
     budget: Option<usize>,
     config: BrokerConfig,
     initial_producer_slots: Option<usize>,
+    steady_state_policy: SteadyStatePolicy,
 }
 
 impl<C: Consumer, P: Producer> ThreadBroker<C, P> {
@@ -472,6 +793,7 @@ impl<C: Consumer, P: Producer> ThreadBroker<C, P> {
             budget: None,
             config,
             initial_producer_slots: None,
+            steady_state_policy: SteadyStatePolicy::default(),
         }
     }
 }
@@ -494,9 +816,27 @@ impl<C: Consumer, P: Producer> ThreadBrokerBuilder<C, P> {
         self
     }
 
+    /// Choose whether a settled broker keeps watching for regime changes.
+    ///
+    /// See [`SteadyStatePolicy`] for the responsiveness/overhead tradeoff.
+    pub fn steady_state_policy(mut self, policy: SteadyStatePolicy) -> Self {
+        self.steady_state_policy = policy;
+        self
+    }
+
     /// See [`BrokerConfig::sample_interval`].
     pub fn sample_interval(mut self, interval: Duration) -> Self {
         self.config.sample_interval = interval;
+        self
+    }
+
+    /// Set the interval between responsive steady-state probes.
+    ///
+    /// This does not change the high-resolution convergence cadence. The
+    /// producer is asked to use roughly four monitoring observations per probe,
+    /// subject to any accuracy floor imposed by its adapter.
+    pub fn steady_probe_interval(mut self, interval: Duration) -> Self {
+        self.config.steady_probe_interval = Some(interval);
         self
     }
 
@@ -530,6 +870,24 @@ impl<C: Consumer, P: Producer> ThreadBrokerBuilder<C, P> {
         self
     }
 
+    /// See [`BrokerConfig::nonlinear_probe_samples`].
+    pub fn nonlinear_probe_samples(mut self, samples: usize) -> Self {
+        self.config.nonlinear_probe_samples = samples;
+        self
+    }
+
+    /// See [`BrokerConfig::nonlinear_probes`].
+    pub fn nonlinear_probes(mut self, enabled: bool) -> Self {
+        self.config.nonlinear_probes = enabled;
+        self
+    }
+
+    /// See [`BrokerConfig::nonlinear_blackout_samples`].
+    pub fn nonlinear_blackout_samples(mut self, samples: usize) -> Self {
+        self.config.nonlinear_blackout_samples = samples;
+        self
+    }
+
     /// See [`BrokerConfig::regression_tolerance`].
     pub fn regression_tolerance(mut self, fraction: f64) -> Self {
         self.config.regression_tolerance = fraction;
@@ -545,6 +903,18 @@ impl<C: Consumer, P: Producer> ThreadBrokerBuilder<C, P> {
     /// See [`BrokerConfig::resurvey_samples`].
     pub fn resurvey_samples(mut self, samples: usize) -> Self {
         self.config.resurvey_samples = samples;
+        self
+    }
+
+    /// See [`BrokerConfig::resize_timeout`].
+    pub fn resize_timeout(mut self, timeout: Duration) -> Self {
+        self.config.resize_timeout = timeout;
+        self
+    }
+
+    /// See [`BrokerConfig::min_consumer_threads`].
+    pub fn min_consumer_threads(mut self, threads: usize) -> Self {
+        self.config.min_consumer_threads = threads.max(1);
         self
     }
 
@@ -573,6 +943,13 @@ impl<C: Consumer, P: Producer> ThreadBrokerBuilder<C, P> {
         if c.sample_interval.is_zero() {
             return Err(BrokerConfigError("sample_interval must be non-zero"));
         }
+        if c.steady_probe_interval
+            .is_some_and(|interval| interval.is_zero())
+        {
+            return Err(BrokerConfigError(
+                "steady_probe_interval must be non-zero when configured",
+            ));
+        }
         if c.warmup < c.sample_interval * 2 {
             return Err(BrokerConfigError(
                 "warmup must span at least two sample intervals, or the first \
@@ -600,16 +977,44 @@ impl<C: Consumer, P: Producer> ThreadBrokerBuilder<C, P> {
         if c.ratify_samples == 0 {
             return Err(BrokerConfigError("ratify_samples must be non-zero"));
         }
-        // Re-opening a settled decision must be strictly harder than making one,
-        // or the broker can reach a split it immediately wants to leave and
-        // oscillate between the two forever.
+        if c.nonlinear_probe_samples == 0 {
+            return Err(BrokerConfigError(
+                "nonlinear_probe_samples must be non-zero",
+            ));
+        }
+        if c.nonlinear_blackout_samples < c.smoothing_windows {
+            return Err(BrokerConfigError(
+                "nonlinear_blackout_samples must be at least smoothing_windows",
+            ));
+        }
+        // Re-opening is made harder by persistence. Its distance may equal the
+        // movement deadband so a one-slot regime change remains observable on
+        // small budgets.
         if c.resurvey_samples == 0 {
             return Err(BrokerConfigError("resurvey_samples must be non-zero"));
         }
-        if c.resurvey_distance <= c.deadband_threads {
+        if c.resize_timeout.is_zero() {
+            return Err(BrokerConfigError("resize_timeout must be non-zero"));
+        }
+        if !(0.0..=1.0).contains(&c.max_buffer_drift_fraction) {
             return Err(BrokerConfigError(
-                "resurvey_distance must exceed deadband_threads, or a settled \
-                 split can immediately re-open itself",
+                "max_buffer_drift_fraction must be in 0.0..=1.0",
+            ));
+        }
+        if c.cap_history.is_zero()
+            || c.cap_persistence.is_zero()
+            || c.cap_persistence > c.cap_history
+        {
+            return Err(BrokerConfigError(
+                "cap durations must be non-zero and cap_persistence must not exceed cap_history",
+            ));
+        }
+        if c.trace_capacity == 0 {
+            return Err(BrokerConfigError("trace_capacity must be non-zero"));
+        }
+        if c.resurvey_distance < c.deadband_threads {
+            return Err(BrokerConfigError(
+                "resurvey_distance must be at least deadband_threads",
             ));
         }
         if c.min_consumer_threads == 0 || c.min_producer_slots == 0 {
@@ -628,22 +1033,46 @@ impl<C: Consumer, P: Producer> ThreadBrokerBuilder<C, P> {
             budget,
             config: self.config,
             initial_producer_slots: self.initial_producer_slots,
+            steady_state_policy: self.steady_state_policy,
         })
     }
 }
 
-/// Shared stop flag, so the sampling thread can be told to wind up.
-pub(crate) struct Stop(pub(crate) AtomicBool);
+/// Shared stop flag and wakeup, so even a very sparse steady probe remains
+/// immediately interruptible at application shutdown.
+pub(crate) struct Stop {
+    value: AtomicBool,
+    mutex: std::sync::Mutex<()>,
+    wake: std::sync::Condvar,
+}
 
 impl Stop {
     pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self(AtomicBool::new(false)))
+        Arc::new(Self {
+            value: AtomicBool::new(false),
+            mutex: std::sync::Mutex::new(()),
+            wake: std::sync::Condvar::new(),
+        })
     }
     pub(crate) fn is_set(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.value.load(Ordering::Acquire)
     }
     pub(crate) fn set(&self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.value.store(true, Ordering::Release);
+        self.wake.notify_all();
+    }
+    pub(crate) fn wait_timeout(&self, timeout: Duration) -> bool {
+        if self.is_set() {
+            return true;
+        }
+        let Ok(guard) = self.mutex.lock() else {
+            return self.is_set();
+        };
+        if self.is_set() {
+            return true;
+        }
+        let _wait = self.wake.wait_timeout(guard, timeout);
+        self.is_set()
     }
 }
 
@@ -710,9 +1139,13 @@ impl BusyMeter {
     pub fn timer(&self) -> BatchTimer<'_> {
         BatchTimer {
             meter: self,
+            single_writer_progress: None,
+            single_writer_progress_total: 0,
             mark: Instant::now(),
-            since_flush: 0,
-            flush_every: DEFAULT_FLUSH_EVERY,
+            items_since_publish: 0,
+            time_items_since_publish: 0,
+            progress_every: DEFAULT_FLUSH_EVERY,
+            time_every: DEFAULT_FLUSH_EVERY,
         }
     }
 }
@@ -742,15 +1175,60 @@ pub const DEFAULT_FLUSH_EVERY: u64 = 256;
 /// crate exists to avoid.
 pub struct BatchTimer<'a> {
     meter: &'a BusyMeter,
+    single_writer_progress: Option<&'a std::sync::atomic::AtomicU64>,
+    single_writer_progress_total: u64,
     mark: Instant,
-    since_flush: u64,
-    flush_every: u64,
+    items_since_publish: u64,
+    time_items_since_publish: u64,
+    progress_every: u64,
+    time_every: u64,
 }
 
 impl<'a> BatchTimer<'a> {
-    /// Publish every `n` items instead of the default.
+    /// Publish item progress to a single-writer caller-owned counter.
+    ///
+    /// A consumer with several hot workers can give each worker a cache-padded
+    /// counter and sum those counters in [`Consumer::work`]. Busy time remains
+    /// in this meter, while fine progress uses a relaxed cumulative store
+    /// rather than a contended atomic read-modify-write. No other writer may
+    /// update `counter`; it must remain cumulative across successive timers.
+    pub fn single_writer_progress_counter(
+        mut self,
+        counter: &'a std::sync::atomic::AtomicU64,
+    ) -> Self {
+        self.single_writer_progress_total = counter.load(Ordering::Relaxed);
+        self.single_writer_progress = Some(counter);
+        self
+    }
+
+    /// Publish both progress and busy time every `n` items instead of the default.
+    ///
+    /// Prefer [`Self::progress_every`] when only the completed-item signal needs
+    /// finer resolution. That avoids adding clock reads to a hot record loop.
     pub fn flush_every(mut self, n: u64) -> Self {
-        self.flush_every = n.max(1);
+        let n = n.max(1);
+        self.progress_every = n;
+        self.time_every = n;
+        self
+    }
+
+    /// Publish completed-item progress every `n` items.
+    ///
+    /// This cadence is independent of busy-time publication: making throughput
+    /// visible to short controller windows therefore costs one relaxed counter
+    /// update per interval, without forcing an `Instant::now()` at that cadence.
+    pub fn progress_every(mut self, n: u64) -> Self {
+        self.progress_every = n.max(1);
+        self
+    }
+
+    /// Publish accumulated busy time every `n` items.
+    ///
+    /// Most consumers should retain [`DEFAULT_FLUSH_EVERY`]. This separate
+    /// control primarily lets a converged freeze policy disable all in-batch
+    /// measurement for new callbacks.
+    pub fn time_every(mut self, n: u64) -> Self {
+        self.time_every = n.max(1);
         self
     }
 
@@ -760,28 +1238,68 @@ impl<'a> BatchTimer<'a> {
     /// consistent unit will do; it plays no part in sizing the split.
     #[inline]
     pub fn tick(&mut self) {
-        self.since_flush += 1;
-        if self.since_flush >= self.flush_every {
-            self.publish();
+        self.items_since_publish += 1;
+        self.time_items_since_publish += 1;
+        if self.items_since_publish >= self.progress_every {
+            self.publish_items();
+        }
+        if self.time_items_since_publish >= self.time_every {
+            self.publish_time();
         }
     }
 
+    /// Count one item when the returned guard leaves scope.
+    ///
+    /// Use this when a loop has early exits and throughput must mean completed,
+    /// rather than started, items. Construct the guard at the top of an
+    /// iteration; normal completion, `continue`, and `?` all publish the item
+    /// only after that iteration's work has finished.
     #[inline]
-    fn publish(&mut self) {
+    pub fn completed_item(&mut self) -> CompletedItem<'_, 'a> {
+        CompletedItem { timer: self }
+    }
+
+    #[inline]
+    fn publish_items(&mut self) {
+        if let Some(counter) = self.single_writer_progress {
+            self.single_writer_progress_total = self
+                .single_writer_progress_total
+                .saturating_add(self.items_since_publish);
+            counter.store(self.single_writer_progress_total, Ordering::Relaxed);
+        } else {
+            self.meter
+                .items
+                .fetch_add(self.items_since_publish, Ordering::Relaxed);
+        }
+        self.items_since_publish = 0;
+    }
+
+    #[inline]
+    fn publish_time(&mut self) {
         let now = Instant::now();
         self.meter
             .nanos
             .fetch_add((now - self.mark).as_nanos() as u64, Ordering::Relaxed);
-        self.meter
-            .items
-            .fetch_add(self.since_flush, Ordering::Relaxed);
         self.mark = now;
-        self.since_flush = 0;
+        self.time_items_since_publish = 0;
+    }
+}
+
+/// Completion guard returned by [`BatchTimer::completed_item`].
+pub struct CompletedItem<'timer, 'meter> {
+    timer: &'timer mut BatchTimer<'meter>,
+}
+
+impl Drop for CompletedItem<'_, '_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.timer.tick();
     }
 }
 
 impl Drop for BatchTimer<'_> {
     fn drop(&mut self) {
-        self.publish();
+        self.publish_items();
+        self.publish_time();
     }
 }

@@ -540,6 +540,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cpu-time"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9e393a7668fe1fad3075085b86c781883000b4ede868f43627b34a87c8b7ded"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1849,7 +1859,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 [[package]]
 name = "paraseq"
 version = "0.4.14"
-source = "git+https://github.com/rob-p/paraseq.git?branch=feat%2Fdynamic-thread-pool#40ae74fe4e8c6d8009ae65eb4c955083c238fa06"
+source = "git+https://github.com/rob-p/paraseq.git?rev=40ae74fe4e8c6d8009ae65eb4c955083c238fa06#40ae74fe4e8c6d8009ae65eb4c955083c238fa06"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -2175,9 +2185,10 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 [[package]]
 name = "rapidgzip-core"
 version = "0.2.1"
-source = "git+https://github.com/COMBINE-lab/rapidgzip-rust.git?branch=feat%2Fshared-pool#e4c745192996d0b9148fa4653c2a688d4a69d2b3"
+source = "git+https://github.com/COMBINE-lab/rapidgzip-rust.git?rev=dee928f90c9ab389bee11db62d59c97bcda6469e#dee928f90c9ab389bee11db62d59c97bcda6469e"
 dependencies = [
  "bon",
+ "cpu-time",
  "crossbeam-deque",
  "libz-rs-sys",
 ]
@@ -2689,6 +2700,8 @@ dependencies = [
 name = "thread-broker"
 version = "0.1.0"
 dependencies = [
+ "cpu-time",
+ "serde",
  "tracing",
 ]
 

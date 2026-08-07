@@ -13,6 +13,8 @@
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+#[cfg(feature = "rapidgzip")]
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -25,15 +27,56 @@ use crate::index::contig_table::ContigTableLike;
 
 use super::DictKind;
 use crate::index::reference_index::{ReferenceIndex, tiny_artifacts_exist};
-use crate::io::fastx::{Collection, CollectionType, reader_with_batch_size};
+use crate::io::fastx::{Collection, CollectionType};
 use crate::io::map_info::{MapInfoParams, write_map_info};
 use crate::io::rad::write_rad_header_atac;
 use crate::io::threads::{MappingStats, OutputInfo};
 use crate::mapping::binning::BinPos;
-use crate::mapping::processors::{MappingOpts, ScatacProcessor};
+use crate::mapping::processors::{MappingOpts, SCATAC_PROGRESS_FLUSH_EVERY, ScatacProcessor};
 use crate::mapping::unitig_end_cache::UnitigEndCache;
 
 use super::map_bulk::make_progress_bar;
+
+/// Same-binary validation hook for the scATAC broker progress cadence.
+///
+/// This is intentionally not a user-facing CLI option. It exists so the
+/// 64-record default can be compared with the generic 256-record cadence
+/// without changing any executable code between benchmark arms.
+const SCATAC_PROGRESS_FLUSH_EVERY_ENV: &str = "PISCEM_SCATAC_PROGRESS_FLUSH_EVERY";
+
+fn parse_progress_flush_every(value: Option<&str>) -> Result<u64> {
+    let Some(value) = value else {
+        return Ok(SCATAC_PROGRESS_FLUSH_EVERY);
+    };
+    let flush_every = value.parse::<u64>().with_context(|| {
+        format!("invalid {SCATAC_PROGRESS_FLUSH_EVERY_ENV}={value:?}; expected a positive integer")
+    })?;
+    anyhow::ensure!(
+        flush_every > 0,
+        "invalid {SCATAC_PROGRESS_FLUSH_EVERY_ENV}=0; value must be non-zero"
+    );
+    Ok(flush_every)
+}
+
+#[cfg(feature = "rapidgzip")]
+fn scatac_broker_config(budget: usize) -> thread_broker::BrokerConfig {
+    let mut config = crate::io::fastx::broker_config_for_budget(budget);
+    // Stable scATAC runs converge to one split and hold it. Retain responsive
+    // regime-change handling, but make its ordinary cadence sparse by default;
+    // the environment override can restore 25 ms monitoring for applications
+    // that need rapid post-convergence reaction.
+    config.steady_probe_interval = Some(Duration::from_secs(5));
+    // With the 25 ms small-budget calibration cadence, scATAC records retain
+    // real short-range cost variation after their progress publisher is fine
+    // grained. Bound only the optional nonlinear startup probe to 300 ms;
+    // ordinary moves and settled monitoring keep their own horizons.
+    if budget <= 8 {
+        config.nonlinear_probe_samples = 12;
+        config.nonlinear_blackout_samples = 12;
+    }
+    config.nonlinear_probes = true;
+    config
+}
 
 #[derive(Args, Debug)]
 #[command(group(
@@ -73,18 +116,17 @@ pub struct MapScatacArgs {
     /// Output directory
     #[arg(short = 'o', long)]
     pub output: PathBuf,
-    /// Number of mapping threads
+    /// Total execution-slot budget shared by mapping and gzip decoding
     #[arg(short = 't', long, default_value = "16")]
     pub threads: usize,
 
     /// Gzip decoder selection: `auto`, `serial`, `parallel`, or `parallel=N`.
     ///
-    /// `auto` (the default) decides from the input: forced rules first, then a
-    /// brief measurement of how starved the mapping threads are. Override it
-    /// when you know something the probe cannot — a slow network filesystem, a
-    /// shared node where spending cores on decode is antisocial, or to reproduce
-    /// a measurement. `parallel` still yields on inputs that are not regular
-    /// files, where the parallel decoder degrades to sequential anyway.
+    /// `auto` adapts the aggregate mapping/decode split during the real run.
+    /// `serial` gives mapping the full budget. `parallel` forces the parallel
+    /// path but still adapts its split; `parallel=N` fixes N slots per
+    /// decoder-capable input and disables adaptation. Non-regular inputs remain
+    /// serial because the parallel decoder requires positional reads.
     #[arg(long, default_value = "auto", value_name = "MODE")]
     pub decoder: String,
     /// Barcode length in bases
@@ -263,6 +305,16 @@ where
     let num_threads = args.threads.max(1);
     let decoder_pref = crate::io::calibrate::DecoderPreference::parse(&args.decoder)
         .map_err(|e| anyhow::anyhow!("invalid --decoder value: {e}"))?;
+    let progress_flush_every = parse_progress_flush_every(
+        std::env::var(SCATAC_PROGRESS_FLUSH_EVERY_ENV)
+            .ok()
+            .as_deref(),
+    )?;
+    stats.set_broker_progress_flush_every(progress_flush_every);
+    tracing::debug!(
+        progress_flush_every,
+        "configured scATAC broker progress publication"
+    );
     let opts = MappingOpts {
         max_hit_occ: args.max_hit_occ,
         max_hit_occ_recover: args.max_hit_occ_recover,
@@ -275,7 +327,7 @@ where
     let index_num_refs = index.num_refs();
     let sig_info_owned = index.ref_sig_info().cloned();
 
-    dispatch_on_k!(k, K => {
+    let outcome = dispatch_on_k!(k, K => {
         let (bio_paths, r2_paths) = if is_paired {
             (args.read1.as_slice(), args.read2.as_slice())
         } else {
@@ -285,9 +337,9 @@ where
             bio_paths, &args.barcode, r2_paths,
             &output_info, &stats,
             index, &binning, bc_len, tn5_shift, min_overlap, Some(&end_cache),
-            is_paired, opts,
+            is_paired, progress_flush_every, opts,
             num_threads, decoder_pref, &progress,
-        )?;
+        )?
     });
 
     progress.finish_and_clear();
@@ -323,9 +375,14 @@ where
         num_mapped,
         num_poisoned,
         elapsed_secs: elapsed,
+        mapping_elapsed_secs: outcome.mapping_elapsed_secs,
         sig_info: sig_info_owned.as_ref(),
         piscem_rs_version: crate::VERSION,
-        num_threads,
+        num_threads: outcome.execution_plan.effective_budget,
+        execution_plan: Some(&outcome.execution_plan),
+        broker_report: outcome.broker_report.as_ref(),
+        producer_measurement: outcome.producer_measurement.as_ref(),
+        consumer_measurement: Some(&outcome.consumer_measurement),
         index_path: &args.index,
         k: index_k,
         m: index_m,
@@ -350,14 +407,18 @@ fn run_atac_pipeline<const K: usize, D: KmerDictionary + Sync, C: ContigTableLik
     min_overlap: i32,
     end_cache: Option<&UnitigEndCache>,
     is_paired: bool,
+    progress_flush_every: u64,
     opts: MappingOpts,
     num_threads: usize,
     decoder_pref: crate::io::calibrate::DecoderPreference,
     progress: &indicatif::ProgressBar,
-) -> Result<()>
+) -> Result<crate::io::fastx::PipelineOutcome>
 where
     Kmer<K>: KmerBits,
 {
+    #[cfg(not(feature = "rapidgzip"))]
+    let _ = progress_flush_every;
+
     let mut processor = ScatacProcessor::<K, D, C>::new(
         index,
         end_cache,
@@ -375,13 +436,8 @@ where
     let arity = if is_paired { 3 } else { 2 };
     let num_input_files = bio_paths.len() * arity;
 
-    // scATAC opens `arity` files per sample -- biological read, barcode read,
-    // and mate when paired -- so a multi-sample run already has many inflate
-    // streams and is usually served by serial decode alone. Measured on 10x
-    // `atac_pbmc_5k` against a k=23 chr1+chr2 index at `-t 32`, the parallel
-    // decoder cost +1.0% wall and +1.1% CPU: the supervisor found no starvation
-    // to answer. Calibrating anyway is what makes that a measured outcome for
-    // each run rather than an assumption carried from one dataset.
+    // scATAC opens `arity` files per sample. Preserve that grouping so mixed
+    // regular/stream input is handled per file without inspecting a stream.
     let groups: Vec<crate::io::calibrate::ReadGroup> = (0..bio_paths.len())
         .map(|i| {
             let mut g = vec![bio_paths[i].clone(), barcode_paths[i].clone()];
@@ -392,48 +448,38 @@ where
         })
         .collect();
     let decision = crate::io::calibrate::choose_decoder(&groups, num_threads, decoder_pref);
-    let mut plan = crate::io::fastx::plan_thread_budget(num_threads, num_input_files);
-    if !decision.parallel {
-        plan.parallel_gzip = false;
-        plan.decode_budget = 0;
-    } else if let crate::io::calibrate::DecoderPreference::Parallel {
-        workers_per_file: Some(w),
-    } = decoder_pref
-    {
-        // A named number is a request to *use* it, not to converge toward it.
-        plan.decode_budget = w
-            .saturating_mul(num_input_files)
-            .max(1)
-            .min(num_threads - 1);
-        // The budget is the point. `decode_budget` was overwritten without
-        // touching `map_threads`, so a pinned request spent both sides of the
-        // split in full: measured at `-t 32`, `--decoder parallel=16` ran an
-        // average of 41 concurrent threads and looked 41% faster than `auto`
-        // purely by using half as much machine again.
-        plan.map_threads = num_threads.saturating_sub(plan.decode_budget).max(1);
-    }
-    #[cfg(feature = "rapidgzip")]
-    let pinned = matches!(
+    #[cfg_attr(not(feature = "rapidgzip"), allow(unused_mut))]
+    let mut plan = crate::io::fastx::plan_thread_budget(
+        num_threads,
+        num_input_files,
+        decision.parallel,
         decoder_pref,
-        crate::io::calibrate::DecoderPreference::Parallel {
-            workers_per_file: Some(_)
-        }
-    );
+    )?;
+    if plan.adaptive() {
+        // scATAC is the measured negative-scaling modality. Start its opt-in
+        // response search at the midpoint rather than at the mapping-biased
+        // generic opening: the latter spends the calibration interval in the
+        // known high-contention region before the response curve can correct
+        // it. Fixed and serial requests retain their exact semantics.
+        plan.map_threads = (plan.effective_budget / 2).max(1);
+        plan.decode_slots = plan.effective_budget - plan.map_threads;
+    }
 
     // One pool for the whole run, sized to the entire budget: `workers` is an
     // immutable maximum and a refused `set_worker_limit` would silently desync
     // the broker's accounting from the pool's.
     #[cfg(feature = "rapidgzip")]
-    let decode_pool = if plan.parallel_gzip {
-        rapidgzip_core::DecoderPool::builder()
-            .workers(num_threads.max(2))
-            .initial_worker_limit(plan.decode_budget.clamp(1, num_threads - 1))
-            .build()
-            .ok()
+    let decode_pool = if plan.parallel_gzip() {
+        Some(
+            rapidgzip_core::DecoderPool::builder()
+                .workers(plan.effective_budget)
+                .initial_worker_limit(plan.decode_slots)
+                .build()
+                .map_err(|e| anyhow::anyhow!("could not create decoder pool: {e}"))?,
+        )
     } else {
         None
     };
-    let num_threads = plan.map_threads;
     #[cfg(feature = "rapidgzip")]
     let mut handles: Vec<rapidgzip_core::DecoderHandle> = Vec::new();
 
@@ -442,19 +488,20 @@ where
     #[allow(unused_mut)]
     let mut open = |path: &std::path::Path| -> Result<_> {
         #[cfg(feature = "rapidgzip")]
-        let opened = crate::io::fastx::open_input_pooled(path, decode_pool.as_ref(), num_threads)?;
+        let opened =
+            crate::io::fastx::open_input_pooled(path, decode_pool.as_ref(), plan.effective_budget)?;
         #[cfg(not(feature = "rapidgzip"))]
         let opened = crate::io::fastx::open_input(path, 0)?;
         #[cfg(feature = "rapidgzip")]
         if let Some(h) = opened.handle {
             handles.push(h);
         }
-        reader_with_batch_size(opened.reader)
+        crate::io::fastx::scatac_reader(opened.reader)
             .map_err(|e| anyhow::anyhow!("failed to open {}: {}", path.display(), e))
     };
 
-    // Scoped so the closure's mutable borrow of `handles` ends here, leaving
-    // the vector free for the supervisor below.
+    // Scoped so the closure's mutable borrow of `handles` ends before the
+    // broker adapter takes the vector.
     let mut readers = Vec::with_capacity(num_input_files);
     {
         for i in 0..bio_paths.len() {
@@ -466,43 +513,103 @@ where
         }
     }
 
+    #[cfg(feature = "rapidgzip")]
+    {
+        plan.reconcile_parallel_decoders(handles.len());
+        if plan.parallel_gzip()
+            && let Some(pool) = &decode_pool
+        {
+            pool.set_worker_limit(plan.decode_slots)
+                .map_err(|e| anyhow::anyhow!("could not apply decoder execution plan: {e}"))?;
+        }
+    }
+
+    tracing::info!(
+        requested_budget = plan.requested_budget,
+        effective_budget = plan.effective_budget,
+        mapping_threads = plan.map_threads,
+        decode_slots = plan.decode_slots,
+        allocation = ?plan.allocation,
+        "thread execution plan"
+    );
+
     // The mapping side, resizable for the same reason.
-    let map_pool = paraseq::parallel::ThreadPool::with_max(plan.map_threads, num_threads);
+    let map_pool = paraseq::parallel::ThreadPool::with_max(plan.map_threads, plan.effective_budget);
+    #[cfg(feature = "rapidgzip")]
+    let consumer_floor =
+        crate::io::fastx::collection_share_floor(readers.len(), arity, plan.map_threads);
 
     #[cfg(feature = "rapidgzip")]
-    let broker = match (&decode_pool, pinned) {
-        (Some(pool), false) => thread_broker::ThreadBroker::builder(
-            crate::io::broker::MappingConsumer::new(map_pool.clone(), stats),
-            crate::io::broker::DecodeProducer::new(pool.clone(), handles.clone()),
-        )
-        .budget(num_threads)
-        .initial_producer_slots(plan.decode_budget)
-        .build()
-        .map(|b| b.start())
-        // Loud, not swallowed. A misconfigured broker silently returning `None`
-        // means the run quietly keeps whatever split it opened with, which is
-        // exactly how a self-inconsistent default pair went unnoticed: the
-        // decode limit stayed at its opening value and consumer utilisation
-        // fell from 93% to 32% with nothing said.
-        .inspect_err(|e| tracing::warn!("thread broker disabled: {e}"))
-        .ok(),
+    let broker = match (&decode_pool, plan.adaptive()) {
+        (Some(pool), true) => {
+            let broker_config = scatac_broker_config(plan.effective_budget);
+            Some(
+                thread_broker::ThreadBroker::builder_with(
+                    crate::io::broker::MappingConsumer::new(map_pool.clone(), stats)
+                        .with_progress_cadence(
+                            stats,
+                            progress_flush_every,
+                            thread_broker::DEFAULT_FLUSH_EVERY,
+                        ),
+                    crate::io::broker::DecodeProducer::new(pool.clone(), handles.clone())
+                        .map_err(|e| anyhow::anyhow!("could not start decode measurement: {e}"))?,
+                    crate::io::broker::broker_config_from_environment(broker_config).map_err(
+                        |e| anyhow::anyhow!("invalid thread broker probe interval: {e}"),
+                    )?,
+                )
+                .budget(plan.effective_budget)
+                .initial_producer_slots(plan.decode_slots)
+                .min_consumer_threads(consumer_floor)
+                .steady_state_policy(
+                    crate::io::broker::broker_policy_from_environment()
+                        .map_err(|e| anyhow::anyhow!("invalid thread broker policy: {e}"))?,
+                )
+                .build()
+                .map_err(|e| anyhow::anyhow!("invalid thread broker configuration: {e}"))?
+                .start()
+                .map_err(|e| anyhow::anyhow!("could not start thread broker: {e}"))?,
+            )
+        }
         _ => None,
     };
 
+    #[cfg(feature = "rapidgzip")]
+    let fixed_decode_measurement = crate::io::broker::FixedDecodeMeasurement::from_environment(
+        handles.clone(),
+        plan.adaptive(),
+    )
+    .map_err(|e| anyhow::anyhow!("invalid fixed decode measurement control: {e}"))?;
+
+    let measurement_at_start = stats.measurement_snapshot();
+    let wall_start = std::time::Instant::now();
+
     let collection = Collection::new(readers, CollectionType::Multi { arity })
         .map_err(|e| anyhow::anyhow!("failed to create collection: {}", e))?;
-    collection
+    let result = collection
         .process_parallel_multi_pool(&mut processor, &map_pool, None)
-        .map_err(|e| anyhow::anyhow!("mapping failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("mapping failed: {}", e));
+    let mapping_elapsed = wall_start.elapsed();
+    let consumer_measurement =
+        stats.log_measurement(measurement_at_start, mapping_elapsed, plan.effective_budget);
 
     #[cfg(feature = "rapidgzip")]
-    if let Some(broker) = broker {
-        let r = broker.finish();
+    let fixed_producer_measurement =
+        fixed_decode_measurement.map(crate::io::broker::FixedDecodeMeasurement::finish);
+
+    #[cfg(feature = "rapidgzip")]
+    let broker_report = if let Some(broker) = broker {
+        let mut r = broker
+            .finish()
+            .map_err(|e| anyhow::anyhow!("thread broker failed: {e}"))?;
+        if let Some(measurement) = &mut r.producer_measurement {
+            crate::io::broker::refresh_measurement_cpu(measurement, &handles);
+        }
         tracing::info!(
-            "thread broker: settled at {} mapping / {} decode of {num_threads} \
+            "thread broker: settled at {} mapping / {} decode of {} \
              ({} moves, {} reverts, {} resurveys, converged {}, {:?} to settle)",
             r.final_consumer_threads,
             r.final_producer_limit,
+            plan.effective_budget,
             r.moves,
             r.reverts,
             r.resurveys,
@@ -526,7 +633,50 @@ where
                 },
             );
         }
+        Some(r)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "rapidgzip"))]
+    let broker_report = None;
+
+    #[cfg(feature = "rapidgzip")]
+    let producer_measurement = broker_report
+        .as_ref()
+        .and_then(|report| report.producer_measurement)
+        .or(fixed_producer_measurement);
+    #[cfg(not(feature = "rapidgzip"))]
+    let producer_measurement = None;
+
+    result?;
+    Ok(crate::io::fastx::PipelineOutcome {
+        execution_plan: plan,
+        broker_report,
+        producer_measurement,
+        consumer_measurement,
+        mapping_elapsed_secs: mapping_elapsed.as_secs_f64(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scatac_progress_cadence_has_a_fine_default_and_validates_overrides() {
+        assert_eq!(parse_progress_flush_every(None).unwrap(), 64);
+        assert_eq!(parse_progress_flush_every(Some("256")).unwrap(), 256);
+        assert!(parse_progress_flush_every(Some("0")).is_err());
+        assert!(parse_progress_flush_every(Some("not-a-number")).is_err());
     }
 
-    Ok(())
+    #[cfg(feature = "rapidgzip")]
+    #[test]
+    fn scatac_defaults_to_sparse_responsive_monitoring() {
+        let config = scatac_broker_config(8);
+        assert_eq!(config.steady_probe_interval, Some(Duration::from_secs(5)));
+        assert!(config.nonlinear_probes);
+        assert_eq!(config.nonlinear_probe_samples, 12);
+        assert_eq!(config.nonlinear_blackout_samples, 12);
+    }
 }

@@ -59,7 +59,7 @@ fn observe_with_work(
         .build()
         .expect("decoder");
     let mut reader = decoder.open(path).expect("open");
-    let producer = DecodeProducer::new(pool, vec![reader.handle()]);
+    let producer = DecodeProducer::new(pool, vec![reader.handle()]).unwrap();
 
     let mut buf = vec![0u8; 1 << 20];
     let mut total = 0u64;
@@ -194,7 +194,7 @@ fn a_decoder_ahead_of_its_consumer_reports_satisfied() {
         .build()
         .expect("decoder");
     let mut reader = decoder.open(&f).expect("open");
-    let producer = DecodeProducer::new(pool, vec![reader.handle()]);
+    let producer = DecodeProducer::new(pool, vec![reader.handle()]).unwrap();
 
     let mut buf = vec![0u8; 1 << 20];
     let mut seen = Vec::new();
@@ -225,22 +225,21 @@ fn a_decoder_ahead_of_its_consumer_reports_satisfied() {
 
 /// The limit round-trips, so the broker's arithmetic and the pool's agree.
 #[test]
-#[ignore = "needs the rapidgzip feature"]
 fn the_limit_round_trips() {
     let pool = DecoderPool::builder()
         .workers(24)
         .initial_worker_limit(4)
         .build()
         .expect("pool");
-    let producer = DecodeProducer::new(pool, Vec::new());
+    let producer = DecodeProducer::new(pool, Vec::new()).unwrap();
 
     assert_eq!(producer.limit(), 4);
-    producer.set_limit(12);
+    producer.set_limit(12).expect("valid limit");
     assert_eq!(producer.limit(), 12);
 
     // Above the immutable maximum is refused, and must leave the limit intact
     // rather than silently clamping to something the broker did not choose.
-    producer.set_limit(999);
+    assert!(producer.set_limit(999).is_err());
     assert_eq!(
         producer.limit(),
         12,
@@ -249,4 +248,5 @@ fn the_limit_round_trips() {
 
     // With no decoders attached there is nothing to size.
     assert_eq!(producer.pressure(), ProducerPressure::Satisfied);
+    assert_eq!(producer.active_slots(), 0);
 }

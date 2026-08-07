@@ -25,6 +25,7 @@ rayon = "1.11"
 memmap2 = "0.9"
 tempfile = "3.15"
 seq-macro = "0.3"
+cpu-time = "1.0.0"
 
 [package]
 name = "piscem-rs"
@@ -60,6 +61,7 @@ parity-test = ["dep:libradicl"]
 # Parallel gzip decoding via the pure-Rust COMBINE-lab/rapidgzip-rust.
 # No C++ toolchain required. See RESULTS.md.
 rapidgzip = ["dep:rapidgzip-core"]
+rapidgzip-cpu-accounting = ["rapidgzip", "rapidgzip-core/cpu-accounting"]
 
 [dependencies]
 seq_geom_parser = { version = "1.1.0", path = "crates/seq_geom_parser" }
@@ -88,8 +90,9 @@ crossbeam = "0.8"
 #
 # Adds `ThreadPool` so the mapping thread count can change mid-run, which is
 # what lets a bad decode/map split be corrected instead of merely avoided.
-# See noamteyssier/paraseq#75. Revert to a crates.io version once that lands.
-paraseq = { git = "https://github.com/rob-p/paraseq.git", branch = "feat/dynamic-thread-pool" }
+# See noamteyssier/paraseq#75. Pinned to the reviewed implementation used by
+# the broker audit; revert to a released crates.io version once that lands.
+paraseq = { git = "https://github.com/rob-p/paraseq.git", rev = "40ae74fe4e8c6d8009ae65eb4c955083c238fa06" }
 niffler = { version = "3", default-features = false, features = [
   "gz",
   "bz2",
@@ -107,15 +110,16 @@ mem_dbg = "0.4.1"
 # RAD file parsing — optional, enabled by parity-test feature
 libradicl = { version = "0.16", optional = true }
 mimalloc = { version = "0.1.48", optional = true }
-# TEMPORARY: the shared-pool branch, while adaptive scheduling is developed.
+# TEMPORARY: an exact upstream commit, while adaptive scheduling is developed.
 #
 # Adds `DecoderPool` (one aggregate decode budget across files, mutable ceiling)
 # and decouples marker admission from the runtime throttle, so a low limit no
 # longer latches `DecoderPath::Sequential`. Together with the paraseq fork this
 # is what makes the decode/map split converge-able rather than predict-able.
-# See COMBINE-lab/rapidgzip-rust `feat/shared-pool`. Revert to a crates.io
-# version once that lands.
-rapidgzip-core = { git = "https://github.com/COMBINE-lab/rapidgzip-rust.git", branch = "feat/shared-pool", optional = true }
+# The shared-pool and optional lifetime CPU-accounting changes are merged on
+# COMBINE-lab/rapidgzip-rust main. Pinned to the reviewed implementation used by
+# the broker audit; revert to a released crates.io version once that lands.
+rapidgzip-core = { git = "https://github.com/COMBINE-lab/rapidgzip-rust.git", rev = "dee928f90c9ab389bee11db62d59c97bcda6469e", optional = true }
 
 thread-broker = { path = "crates/thread-broker" }
 

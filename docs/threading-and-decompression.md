@@ -89,7 +89,139 @@ parallel, lifting the ceiling without changing paraseq's structure:
 Non-gzip input (plain, zstd, bz2) keeps the niffler path and allocates no
 decoder threads.
 
-## 2. Choosing the decoder: threads per file, not file count
+## 2. Current decoder selection and allocation
+
+`-t` is the total execution-slot budget shared by mapping and parallel gzip
+decoding. The effective budget is capped by `available_parallelism`; the
+requested and effective values are both written to `map_info.json`. Serial
+input, builds without `rapidgzip`, and an effective budget of one give the whole
+budget to mapping.
+
+`--decoder` has four forms:
+
+- `auto` opens seekable gzip through the shared decoder pool and lets the live
+  thread broker adapt the aggregate mapping/decode split;
+- `serial` disables the parallel pool and gives mapping the full budget;
+- `parallel` forces the parallel path where the input supports positional reads,
+  but still lets the broker adapt the split;
+- `parallel=N` fixes `N` decode slots per decoder-capable input, reconciles that
+  request after the files are opened, and disables adaptation.
+
+Every fixed request is clamped visibly when necessary to preserve at least one
+mapping slot. `PISCEM_DECODE_SLOTS=N` is the aggregate fixed control intended
+for oracle sweeps. The legacy `PISCEM_RAPIDGZIP_THREADS=N` remains a per-file
+fixed control. Setting both environment controls is an error. Non-gzip paths do
+not count as decoder-capable inputs, and FIFOs/process substitutions always use
+the serial path because they cannot be rewound or positionally read.
+
+In adaptive mode, one shared `ExecutionPlan` sizes both pool maxima, the opening
+split, and the broker budget. The broker measures non-blocked mapping and decode
+work during the real run, rejects windows whose inter-stage buffer is materially
+filling or draining, and applies a solved split using shrink acknowledgement
+before growth. Resize failures and sampler failures abort with typed errors.
+Reports include the requested and actual split, final phase, uncertainty,
+empirical cap reason, bounded trajectories, rejections, controlled/auxiliary
+occupancy, and consumer component timings in `map_info.json`.
+
+Effective budgets up to eight use a 25 ms cadence and 100 ms warm-up so short
+jobs can adapt after the observed startup transient. They open with two decode
+slots where the budget permits. A producer that still has runnable work queued
+may veto a model-requested shrink, but pressure never grows or sizes the split;
+this is the bounded fallback for allocation-dependent decoder scaling.
+scATAC instead opens its opt-in nonlinear search at the midpoint. This avoids
+spending calibration in its measured high-contention mapping region without
+hard-coding the pinned oracle; serial and fixed allocations retain their exact
+requested split.
+
+The decoder busy-time signal is integrated from lock-free per-decoder executing
+worker counts. While a scheduling decision is open, a dedicated sampler uses a
+jittered cadence averaging 3 ms and trapezoidal integration; after the broker
+settles it drops to 25 ms and returns to the denser cadence only for a resurvey.
+Sample counts and observation time are reported in `map_info.json`. Generated
+burst/cadence accuracy tests and same-binary sampler-on/off overhead controls
+guard this design.
+
+Applications can select steady-state behavior with the thread-broker builder.
+`SteadyStatePolicy::Responsive` is the default and preserves regime-change
+adaptation. Applications may opt into a bounded geometric response probe when
+the cost model reaches the producer floor; piscem does so for scATAC, whose
+measured response curve has negative consumer scaling that a one-point
+service-cost ratio cannot see. Other modalities do not pay this exploration
+cost. Its `steady_probe_interval` is
+independently configurable: it does
+not weaken startup calibration or ratification, and the sampled decoder adapter
+scales toward roughly four observations per probe without exceeding its measured
+25 ms accuracy floor. Stable scATAC uses a 5 s responsive interval by default;
+`PISCEM_THREAD_BROKER_PROBE_INTERVAL_MS=25` restores normal-resolution
+monitoring without changing startup calibration. Other modalities retain their
+ordinary cadence. `SteadyStatePolicy::FreezeAfterConvergence` is the cheaper
+model-only path: it skips nonlinear response exploration, then terminates the
+controller and producer sampler after guarded model convergence. The separate
+`SteadyStatePolicy::FreezeAfterFullCalibration` runs responsive mode's bounded
+nonlinear/local startup calibration before the same teardown. Both freeze modes
+have no recurring broker work and cannot react to a later workload change; only
+the full-calibration variant is suitable when the one-point model is known to
+miss the useful response curve.
+
+On the long scATAC validation fixture, an eight-pair direct comparison found no
+throughput penalty from the sparse default: one-sided 95% upper sparse/25 ms
+ratios were 1.0211 for mapping wall, 1.0209 for process wall, and 1.0197 for
+aggregate CPU. Median controller wakeups fell from 566.5 to 144.5 and decoder
+monitoring observations from 431 to 10.
+
+scATAC publishes completed-record mapping progress every 64 records only while a
+responsive decision is open; its more expensive records made the generic
+256-record cadence too coarse for 25 ms windows. Collecting more coarse windows
+does not repair that quantization, so the implementation increases publication
+resolution during calibration instead. It returns to 256 in responsive steady
+state, and freeze reduces new batches to drop-only publication after convergence.
+Only the item counter uses the 64-record cadence; busy-time clock reads remain at
+256 records. Each mapping processor owns a cache-padded progress shard and is
+the shard's only writer, so publication is one relaxed cumulative store rather
+than a contended shared increment. The controller sums the shards only at its
+sampling cadence. Generic consumers retain the shared 256-record meter.
+
+The validation-only `PISCEM_SCATAC_PROGRESS_FLUSH_EVERY=N` hook permits
+same-binary 64-versus-256 fixed-split tests. The formal 30-pair,
+2-million-record comparison was exactly balanced (15 fine-first and 15
+generic-first), retained canonical output and counts in all 60 runs, and passed
+the one-sided 95% <=1% overhead gates. Position-stratified upper ratios were
+`1.00419` for mapping wall, `1.00434` for process wall, and `1.00441` for
+aggregate process CPU; paired medians were `0.99933`, `0.99895`, and `0.99965`.
+The local measurement harness and raw-evidence location are inventoried in the
+ignored completion ledger.
+
+Piscem's same-binary A/B hooks are
+`PISCEM_THREAD_BROKER_POLICY=responsive|freeze-after-convergence|freeze-after-full-calibration` and
+`PISCEM_THREAD_BROKER_PROBE_INTERVAL_MS=N`. Machine telemetry records the
+selected policy, effective probe interval, controller samples/lifetime, and
+whether monitoring stopped at convergence. These hooks are intended for policy
+validation; fixed oracle runs still use `PISCEM_DECODE_SLOTS=N` and disable the
+broker. The policy-overhead runner compares fixed, default responsive, sparse
+responsive, model-only freeze, and full-calibration-freeze modes selected by its
+manifest, using paired absolute and fractional CPU/wall cost including
+minute-scale runs. Its <=1% process-CPU comparison is an aggregate
+regression backstop, not the administrative budget: on 64 saturated threads 1%
+would allow 0.64 core. Controller and sampler threads therefore also record
+their complete lifetime CPU using one clock read at entry and one at exit. The
+direct responsive gate is <=0.001 core (1 ms CPU per wall second); freeze is
+limited to <=5 ms through convergence and then stops both threads.
+
+An optional rapidgzip feature also records worker and auxiliary *thread-lifetime
+CPU time* for validation. It reads the CPU clock only when a thread registers
+and exits and updates a cumulative counter only at exit; it adds nothing to a
+decode-task or inflate hot loop. The feature is disabled by default and is not
+the controller signal. It passed separate direct-decoder and application-level
+feature-on/off gates whose one-sided 95% wall- and CPU-overhead bounds were at
+most 1%. See `THREAD-BROKER-AUDIT.md` for the remaining real-workload gates.
+
+<details>
+<summary>Archived pre-run probe and supervisor experiments (superseded)</summary>
+
+The material below records experiments that motivated the live broker. It is
+historical and does not describe the current command-line behavior.
+
+### Choosing the decoder: threads per file, not file count
 
 The serial (niffler/libz-rs) path opens exactly one inflate stream per input
 file, so its supply is `files x per-stream rate` and does **not** respond to
@@ -373,6 +505,8 @@ makes mapping costly enough per read that decode never binds. Measured
 end-to-end the parallel decoder cost +1.0% wall and +1.1% CPU. The value is that
 the policy now applies at all and reaches the right answer by measurement.
 
+</details>
+
 ## 4. The tiny-dict prefilter
 
 A blocked Bloom filter in front of the hashbrown probe, gated on two properties.
@@ -517,14 +651,17 @@ Consequences for reading anything else here:
 Use `-t 1` byte-identical RAD output to confirm correctness, and reserve
 performance claims for effects several times the floor.
 
-## 7. Environment overrides (measurement only)
+## 7. Environment overrides
 
 | variable | effect |
 |---|---|
-| `PISCEM_RAPIDGZIP_THREADS` | pins decoder workers per file, bypassing the measured split |
-| `PISCEM_PROBE_CEILING_MS` | hard cap on one probe's duration (default 1000) |
-| `PISCEM_PROBE_WINDOW_MS` | probe sampling window (default 25) |
-| `PISCEM_PROBE_WARMUP_MS` | probe time discarded before any window is recorded (default 150) |
+| `PISCEM_DECODE_SLOTS` | fixes the aggregate decoder slot allocation and disables adaptation; intended for oracle sweeps |
+| `PISCEM_RAPIDGZIP_THREADS` | legacy per-decoder-capable-input fixed allocation; disables adaptation |
 | `PISCEM_TINY_PREFILTER` | `0` forces the filter off, `1` forces it on |
 | `PISCEM_TINY_PREFILTER_MAX_BYTES` | overrides Gate A |
 | `PISCEM_TINY_PREFILTER_MIN_MISS` | overrides Gate B's threshold |
+
+Decoder fixed requests must be positive integers. Setting both decoder variables
+is an error. Requests above the effective budget are clamped with a warning to
+leave one mapping slot, and the requested and applied values are retained in
+`map_info.json`.

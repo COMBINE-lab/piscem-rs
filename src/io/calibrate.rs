@@ -1,51 +1,17 @@
-//! Choosing a gzip decoder from measured input characteristics.
+//! Resolve whether gzip input can use the shared parallel decoder.
 //!
-//! Reusable across tools that map FASTX through this crate — piscem-rs itself,
-//! and downstream consumers such as salmon, which query through
-//! [`crate::mapping::streaming_query`] and face the same decision. Nothing here
-//! depends on the mapping kernel: the probe takes a [`ProbeKernel`], so the
-//! caller supplies whatever "map one read group" means for it.
+//! This module no longer predicts a mapping/decode split before the run. Under
+//! `auto`, seekable gzip input opens the parallel path and the live
+//! `thread-broker` controller divides the execution-slot budget from cumulative
+//! pipeline evidence. This module retains only decisions that can be made
+//! without measurement: user preference, input seekability, compression type,
+//! and the one-thread serial case.
 //!
-//! # The decision
-//!
-//! The serial path (niffler/libz-rs) opens exactly one inflate stream per input
-//! file. Its supply is `files x per-stream rate` and does **not** respond to
-//! `-t`. Demand is `map_threads x per-thread consumption`. The parallel decoder
-//! is worth its overhead when demand exceeds supply.
-//!
-//! Per-thread consumption is the hard term: measured 0.064 GB/s on a 96.3 M
-//! k-mer transcriptome versus 0.43 GB/s on a 1.5 M k-mer probe panel, a 6.7x
-//! spread. No constant spans that, and two data points do not justify fitting a
-//! curve against index size — so rather than estimate either rate, the probe
-//! runs the real pipeline briefly and observes which side is starved. See
-//! [`crate::io::probe`].
-//!
-//! An earlier design measured the two rates separately and compared them. It is
-//! gone: validated against the crossover surface it got **4 of 8 points wrong**,
-//! every one predicting serial where the parallel decoder measurably won, by up
-//! to 1.92x. The flaw was structural rather than tuning — it modelled supply as
-//! `files x rate-measured-alone`, but the thread holding the per-file mutex also
-//! maps, so achieved supply falls exactly as `-t` rises, which is where the
-//! parallel decoder matters most.
-//!
-//! # Order of resolution
-//!
-//! [`choose_decoder`] applies, in order:
-//!
-//! 1. **Conflicts** — a request that cannot be carried out is reported before
-//!    anything else, so the user hears about it even if the outcome coincides.
-//! 2. **Preference** — [`preference_choice`], an explicit `--decoder`.
-//! 3. **Forcings** — [`forced_choice`], decisions that follow from the input
-//!    alone: no regular file to decode in parallel, or a single mapping thread.
-//! 4. **Measurement** — [`crate::io::probe::probe_starvation`].
-//!
-//! # Why probing does not consume a pipe
-//!
-//! Probing means reading a prefix and then re-reading from the start, which a
-//! pipe cannot do — the bytes are simply gone. Non-regular inputs are therefore
-//! excluded from the probe *by group*, and a run whose inputs are all streams is
-//! forced serial before the probe is reached. This is a data-loss guard, not a
-//! performance one; see [`crate::io::probe::probe_starvation`].
+//! [`choose_decoder`] reports request conflicts, applies an explicit
+//! [`DecoderPreference`], then applies [`forced_choice`]. If no rule forces a
+//! result, it selects the adaptive parallel path. Non-regular inputs are never
+//! opened merely to sniff compression: a FIFO or process substitution cannot
+//! be rewound, and the parallel decoder cannot use positional reads on it.
 
 use std::path::{Path, PathBuf};
 
@@ -87,7 +53,7 @@ pub fn classify_input(path: &Path) -> InputKind {
 /// cost the regular files their parallel decoder, because
 /// [`crate::io::fastx::open_input`] re-checks each path and falls back on its
 /// own. What the whole set decides is only whether the parallel decoder is worth
-/// considering at all, and which groups the probe may read.
+/// considering at all while preserving which paths must not be opened.
 pub fn partition_inputs(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
     paths
         .iter()
@@ -119,10 +85,10 @@ pub enum Reason {
     Adaptive,
 }
 
-/// Decisions that follow from the input alone, before any measurement.
+/// Decisions that follow from the input alone.
 ///
-/// Returns `None` when the answer genuinely depends on how fast mapping
-/// consumes data, in which case the caller should probe.
+/// Returns `None` when the answer should be left to adaptive allocation during
+/// the real run.
 ///
 /// These are forcings rather than guesses:
 ///
@@ -132,11 +98,8 @@ pub enum Reason {
 /// A threads-per-file bound used to live here too, justified as a forcing on
 /// the grounds that serial supply exceeded what so few threads could consume
 /// "at the fastest per-thread rate ever measured". That reasoning embeds a
-/// measured consumer rate, so it was empirical rather than logical, and it
-/// inherited every objection to fitting a constant on one machine — a consumer
-/// lighter than anything we had measured would break it. Consumer cost is a
-/// continuous quantity the probe measures directly, through the very kernel the
-/// caller supplies.
+/// measured consumer rate, so it was empirical rather than logical. Consumer
+/// cost is now observed by the live broker rather than predicted here.
 ///
 /// A user's explicit `--decoder serial` is also honoured unconditionally, but
 /// earlier: see [`preference_choice`], which runs before this.
@@ -445,7 +408,7 @@ mod tests {
     #[test]
     fn streams_never_take_the_parallel_path() {
         // The FIFO case: rapidgzip would decode it sequentially anyway, and a
-        // probe could not rewind it.
+        // compression sniff would consume bytes.
         let d = forced_choice(InputKind::Stream, 64).unwrap();
         assert!(!d.parallel);
         assert_eq!(d.reason, Reason::NonSeekableInput);
@@ -459,10 +422,10 @@ mod tests {
     }
 
     /// Only genuinely logical cases are forced. A threads-per-file bound used
-    /// to live here; it encoded consumer cost as a constant, which the probe
-    /// measures directly.
+    /// to live here; it encoded consumer cost as a constant, which the live
+    /// broker now measures directly.
     #[test]
-    fn thread_ratios_are_measured_not_forced() {
+    fn thread_ratios_are_adapted_not_forced() {
         assert!(forced_choice(InputKind::Regular, 16).is_none());
         assert!(forced_choice(InputKind::Regular, 4).is_none());
         assert!(forced_choice(InputKind::Regular, 32).is_none());
@@ -590,7 +553,7 @@ mod tests {
         assert!(!msg.contains("unaffected"), "{msg}");
     }
 
-    /// The guard that matters most: a FIFO must never be opened by the probe,
+    /// The guard that matters most: decoder selection must never open a FIFO,
     /// because the bytes it reads are gone from the run.
     #[test]
     fn an_all_stream_set_is_forced_before_any_read() {
@@ -610,12 +573,11 @@ mod tests {
     }
 }
 
-/// Tests for the guard that matters most: a non-rewindable input must never be
-/// read by the probe.
+/// Tests for the guard that matters most: decoder selection must never read a
+/// non-rewindable input.
 ///
-/// The probe reads a prefix and the run then re-opens from the start. On a FIFO
-/// those bytes are gone -- there is no second read -- so probing one silently
-/// drops reads from the run's output. That is data loss, not a slowdown.
+/// Compression sniffing reads a prefix and the run then re-opens from the start.
+/// On a FIFO those bytes are gone, so sniffing one would silently drop reads.
 ///
 /// These tests exploit a property of FIFOs to make the assertion airtight:
 /// opening one for reading **blocks until a writer appears**. Every FIFO below
@@ -675,7 +637,7 @@ mod non_rewindable_input_tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// Every input is a pipe: forced serial, and the probe is never reached.
+    /// Every input is a pipe: forced serial without opening it.
     #[test]
     fn an_all_fifo_run_is_forced_before_anything_is_read() {
         let d = tmpdir("allfifo");
@@ -703,26 +665,23 @@ mod non_rewindable_input_tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// A group with one regular file and one pipe cannot be probed at all --
-    /// `paraseq`'s paired `fill` reads both together, so probing the pair would
-    /// consume the pipe. The regular files keep their parallel decoder, which
-    /// `open_input` grants per file.
+    /// A group with one regular file and one pipe retains parallel decoding for
+    /// the regular file without ever inspecting the pipe's contents.
     #[test]
     fn a_split_group_is_skipped_rather_than_half_read() {
         let d = tmpdir("split");
         let groups = vec![vec![gzip_fixture(&d, "r1.fq.gz"), fifo(&d, "r2.fifo")]];
         let cal = choose_decoder(&groups, 32, DecoderPreference::Auto);
-        // Not measured -- there was no group safe to read.
+        // Adaptive -- seekable gzip exists and no data was read to decide.
         assert_eq!(cal.reason, Reason::Adaptive);
         // But not forced serial either: the regular file is still a candidate.
         assert!(cal.parallel);
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// Mixed *across* groups: the all-regular group is probed, the FIFO group is
-    /// left untouched. This is the case where the probe still gets an answer.
+    /// Mixed groups: regular input remains adaptive and the FIFO stays untouched.
     #[test]
-    fn a_regular_group_is_probed_while_a_fifo_group_is_left_alone() {
+    fn a_regular_group_is_adaptive_while_a_fifo_group_is_left_alone() {
         let d = tmpdir("mixed");
         let groups = vec![
             vec![gzip_fixture(&d, "a1.fq.gz"), gzip_fixture(&d, "a2.fq.gz")],
