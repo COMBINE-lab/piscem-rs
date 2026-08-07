@@ -37,3 +37,7 @@ piscem_build_stats.time
 piscem_build_stats_cpp.time
 profile.json.gz
 test_data/
+
+# Untracked working documents (design/plan notes, not part of the repo)
+PLAN-adaptive-scheduling.md
+DESIGN-thread-broker.md

@@ -241,6 +241,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "bon"
+version = "3.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a602c73c7b0148ec6d12af6fd5cc7a46e2eacc8878271a999abac56eed12f561"
+dependencies = [
+ "bon-macros",
+ "rustversion",
+]
+
+[[package]]
+name = "bon-macros"
+version = "3.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dee98b0db6a962de883bf5d20362dee4d7ca0d12fe39a7c6c73c844e1cd7c1f"
+dependencies = [
+ "darling",
+ "ident_case",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "rustversion",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "borsh"
 version = "1.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1824,8 +1849,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 [[package]]
 name = "paraseq"
 version = "0.4.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7f0c7259499c750423489d3fe955dfc60183f998f203a87a6f2d4c56872a2f4"
+source = "git+https://github.com/rob-p/paraseq.git?branch=feat%2Fdynamic-thread-pool#40ae74fe4e8c6d8009ae65eb4c955083c238fa06"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1927,6 +1951,7 @@ dependencies = [
  "sux",
  "sysinfo",
  "tempfile",
+ "thread-broker",
  "tiny-dict",
  "tracing",
  "tracing-subscriber",
@@ -1990,6 +2015,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a106d1259c23fac8e543272398ae0e3c0b8d33c88ed73d0cc71b0f1d902618"
 dependencies = [
  "portable-atomic",
+]
+
+[[package]]
+name = "prettyplease"
+version = "0.2.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
+dependencies = [
+ "proc-macro2",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2139,10 +2174,10 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rapidgzip-core"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1894813e4bddc60a4d75c2d9b85573a7d20bbdda81e97933c2c230042f22e4c5"
+version = "0.2.1"
+source = "git+https://github.com/COMBINE-lab/rapidgzip-rust.git?branch=feat%2Fshared-pool#e4c745192996d0b9148fa4653c2a688d4a69d2b3"
 dependencies = [
+ "bon",
  "crossbeam-deque",
  "libz-rs-sys",
 ]
@@ -2604,7 +2639,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys",
@@ -2648,6 +2683,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "thread-broker"
+version = "0.1.0"
+dependencies = [
+ "tracing",
 ]
 
 [[package]]

@@ -18,6 +18,20 @@ pub use paraseq::parallel::{
 /// Batch size for paraseq record sets. paraseq's default is 1024; we raise it
 /// to reduce contention on the per-reader mutex when many mapping threads drain
 /// batches faster than a single thread can fill them.
+///
+/// Swept and confirmed on the Flex pair at `-t 32` through `io::probe`, which
+/// runs the real pipeline, at three consumer costs. 4096 and 16384 form a
+/// plateau, differing by -0.8% to +3.8% — inside the ~3% noise floor, so neither
+/// is preferable. Outside it: **1024 is 8-10% worse** and **65536 is 4-9%
+/// worse**. Starvation also *falls* as batches grow (55.5% -> 41.6% at the
+/// marginal consumer cost), so the mutex is better amortised by larger batches
+/// rather than blocked behind them.
+///
+/// A short measurement says the opposite, and convincingly. At a 75 ms probe,
+/// throughput fell monotonically with batch size and starvation rose — because
+/// 65536 records x 32 threads is more groups than the probe reads, so most
+/// workers never started and the comparison measured startup. Sweep this only
+/// at steady state.
 pub const READER_BATCH_SIZE: usize = 16384;
 
 /// Build a paraseq fastx Reader with the shared piscem batch size.
@@ -54,16 +68,12 @@ pub struct OpenedInput {
 }
 
 #[cfg(feature = "rapidgzip")]
-fn open_gz_rapidgzip(
-    path: &Path,
-    ceiling: usize,
-    initial_limit: usize,
-) -> Result<Option<OpenedInput>> {
+fn open_gz_rapidgzip(path: &Path, ceiling: usize) -> Result<Option<OpenedInput>> {
     use std::io::Read;
 
     // Sniff the magic rather than trusting the extension.
-    let mut probe = std::fs::File::open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
+    let mut probe =
+        std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let mut magic = [0u8; 2];
     if probe.read_exact(&mut magic).is_err() || magic != [0x1f, 0x8b] {
         return Ok(None);
@@ -83,21 +93,30 @@ fn open_gz_rapidgzip(
         .map_err(|e| anyhow::anyhow!("rapidgzip-rust failed to open {}: {e}", path.display()))?;
     let handle = reader.handle();
 
-    // Apply the fair-share limit *here*, not once the supervisor starts.
-    // `reader_with_batch_size` makes paraseq read a first batch immediately, so
-    // decoding — and worker growth to the ceiling — begins before any later
-    // clamp could run. Threads never created cost nothing; threads retired
-    // moments after spawning have already cost their setup.
-    if initial_limit > 0
-        && let Err(e) = handle.set_worker_limit(initial_limit.min(ceiling))
-    {
-        tracing::warn!("could not set initial decoder limit: {e}");
-    }
+    // Deliberately do NOT call `set_worker_limit` here.
+    //
+    // On single-member gzip the application limit is not a ceiling the decoder
+    // can grow past later — it is a one-shot path selector, read once while
+    // choosing between the parallel and sequential backends. `should_probe`
+    // requires at least two effective workers; below that rapidgzip commits to
+    // `DecoderPath::Sequential`, pins its adaptive target to 1, and never
+    // spawns or registers a worker for the rest of the file. Raising the limit
+    // afterwards is a no-op.
+    //
+    // A previous version set an "initial limit" of 1 here, believing it merely
+    // a cheap starting point the supervisor could ratchet up. It was instead a
+    // latch that disabled parallel decoding outright: the decoder reported
+    // `Idle`/`spawned_workers = 0` for entire runs while the mapping threads
+    // sat 77% starved. `RuntimeState::new` already seeds the runtime limit from
+    // `decoder_threads`, so leaving it alone is both correct and simpler.
+    //
+    // There is also a race that makes any open-time clamp unsound: `open`
+    // spawns the coordinator, which may begin classifying before this line
+    // could run.
     tracing::debug!(
-        "rapidgzip-rust: {} (ceiling {} workers, initial limit {})",
+        "rapidgzip-rust: {} (ceiling {} workers)",
         path.display(),
-        ceiling,
-        initial_limit
+        ceiling
     );
     Ok(Some(OpenedInput {
         reader: Box::new(reader),
@@ -107,11 +126,7 @@ fn open_gz_rapidgzip(
 
 /// Open a single file with automatic decompression, surfacing the decoder
 /// control handle when the parallel gzip path is taken.
-pub fn open_input(
-    path: impl AsRef<Path>,
-    ceiling: usize,
-    initial_limit: usize,
-) -> Result<OpenedInput> {
+pub fn open_input(path: impl AsRef<Path>, ceiling: usize) -> Result<OpenedInput> {
     let path = path.as_ref();
 
     // `ceiling == 0` selects the serial path explicitly (see
@@ -127,12 +142,12 @@ pub fn open_input(
     #[cfg(feature = "rapidgzip")]
     if ceiling > 0
         && crate::io::calibrate::classify_input(path) == crate::io::calibrate::InputKind::Regular
-        && let Some(opened) = open_gz_rapidgzip(path, ceiling, initial_limit)?
+        && let Some(opened) = open_gz_rapidgzip(path, ceiling)?
     {
         return Ok(opened);
     }
     #[cfg(not(feature = "rapidgzip"))]
-    let _ = (ceiling, initial_limit);
+    let _ = ceiling;
 
     let (reader, _format) = niffler::send::from_path(path)
         .with_context(|| format!("failed to open {}", path.display()))?;
@@ -143,6 +158,79 @@ pub fn open_input(
     })
 }
 
+/// Open a gzip file attached to a shared decode pool.
+///
+/// Every input in a run shares one pool, so the decode budget is a single
+/// aggregate rather than a per-file share that has to be divided up front. That
+/// division is what produced every thread-accounting bug in this area: a
+/// decoder granted more than it uses starves its peers, and one granted less
+/// than it needs cannot borrow.
+///
+/// `decoder_threads` is per-operation *headroom*, not an allocation. It bounds
+/// what one decoder may request and is what admission reads when choosing a
+/// backend, so it should be generous — the pool's mutable limit is what
+/// actually constrains concurrency, and it no longer affects path selection.
+///
+/// Returns `Ok(None)` when the file is not gzip, so the caller falls back to
+/// niffler.
+#[cfg(feature = "rapidgzip")]
+pub fn open_gz_pooled(
+    path: &Path,
+    pool: &rapidgzip_core::DecoderPool,
+    decoder_threads: usize,
+) -> Result<Option<OpenedInput>> {
+    use std::io::Read;
+
+    let mut probe =
+        std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut magic = [0u8; 2];
+    if probe.read_exact(&mut magic).is_err() || magic != [0x1f, 0x8b] {
+        return Ok(None);
+    }
+    drop(probe);
+
+    let decoder = rapidgzip_core::Decoder::builder()
+        .decoder_threads(decoder_threads.max(2))
+        .decoder_pool(pool.clone())
+        .build()
+        .map_err(|e| anyhow::anyhow!("rapidgzip-rust decoder config: {e}"))?;
+    let reader = decoder
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("rapidgzip-rust failed to open {}: {e}", path.display()))?;
+    let handle = reader.handle();
+    tracing::debug!(
+        "rapidgzip-rust (pooled): {} (headroom {} workers)",
+        path.display(),
+        decoder_threads
+    );
+    Ok(Some(OpenedInput {
+        reader: Box::new(reader),
+        handle: Some(handle),
+    }))
+}
+
+/// Open an input for a pooled run, falling back to the serial path where the
+/// parallel decoder cannot help.
+///
+/// The per-file downgrade lives here: a FIFO among the inputs does not cost the
+/// regular files their parallel decoder, and a non-gzip input never had a
+/// choice to make.
+#[cfg(feature = "rapidgzip")]
+pub fn open_input_pooled(
+    path: impl AsRef<Path>,
+    pool: Option<&rapidgzip_core::DecoderPool>,
+    decoder_threads: usize,
+) -> Result<OpenedInput> {
+    let path = path.as_ref();
+    if let Some(pool) = pool
+        && crate::io::calibrate::classify_input(path) == crate::io::calibrate::InputKind::Regular
+        && let Some(opened) = open_gz_pooled(path, pool, decoder_threads)?
+    {
+        return Ok(opened);
+    }
+    open_input(path, 0)
+}
+
 /// Open a single file with automatic decompression (gzip, zstd, etc.).
 ///
 /// Convenience wrapper for call sites that do not participate in decoder
@@ -151,7 +239,7 @@ pub(crate) fn open_with_decompression(
     path: impl AsRef<Path>,
 ) -> Result<Box<dyn std::io::Read + Send>> {
     let c = default_decoder_ceiling();
-    Ok(open_input(path, c, c)?.reader)
+    Ok(open_input(path, c)?.reader)
 }
 
 /// Per-file decoder ceiling when the caller has no budget of its own.
@@ -162,110 +250,78 @@ pub(crate) fn default_decoder_ceiling() -> usize {
         .unwrap_or(16)
 }
 
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-/// How a run intends to spend threads on decompression.
+/// How a run intends to spend its thread budget.
 #[derive(Debug, Clone, Copy)]
 pub struct ThreadBudget {
+    /// Threads that will map. Together with `decode_budget` this sums to the
+    /// user's `-t`.
+    pub map_threads: usize,
     /// Total decoder workers all files may hold at once.
     pub decode_budget: usize,
     /// Immutable per-decoder ceiling. Generous on purpose: it is a lazy cap,
     /// and `DecodeBudget` enforces the real limit at runtime.
     pub per_file_ceiling: usize,
-    /// Runtime limit each decoder starts at, so the budget holds from the very
-    /// first batch rather than after the supervisor's first sample.
-    pub initial_per_file: usize,
     /// Whether to use the parallel gzip decoder at all. When false, gzip input
     /// takes the serial niffler path and no decoder threads are spawned.
     pub parallel_gzip: bool,
 }
 
+/// A coarse opening split of `total_threads` between mapping and decoding.
+///
+/// # This is a starting point, not an answer
+///
+/// It used to be the answer, computed from rates measured before the run. That
+/// is gone: measured against the optimum on our own workloads, the closed-form
+/// model was **60% off** and a two-point measurement 7-38% off depending on
+/// where the second point was taken, with no placement good on both. A plain
+/// constant beat both.
+///
+/// Both sides are now resizable mid-run, so the split is converged to instead —
+/// see `thread_broker`. All this has to do is start somewhere sane and not
+/// waste the first few sampling intervals.
+///
+/// **Biased toward mapping on purpose.** Growth is cheap and safe now, so
+/// starting low costs only convergence time, while starting high wastes threads
+/// outright on the many workloads where decode never binds — measured at 10.0%
+/// consumer idle on paired bulk RNA-seq, where the right decode allocation is
+/// nearly none.
+pub fn plan_thread_budget(total_threads: usize, num_files: usize) -> ThreadBudget {
+    let files = num_files.max(1);
+    let total = total_threads.max(1);
 
-
-/// Decide the decompression share of the thread budget.
-///
-/// Measured on a 2.30 B read-pair archive (single .gz pair, ~186 KB gzip
-/// members, 2 x 149.5 GB):
-///
-/// * At a fixed 64-thread budget the *split* was worth 5.75x — 11.04 min with
-///   every thread on mapping and no parallel decode, versus 1.92 min at
-///   32 mapping / 32 decode. With one file pair the serial-gzip path caps at two
-///   inflate streams no matter how many mapping threads wait on them.
-/// * The knee is sharp then flat: 8 -> 16 decoder threads was worth 32%,
-///   16 -> 32 worth 2%. Under-provisioning decode is expensive;
-///   over-provisioning merely wastes threads.
-/// * Doubling the whole budget 64 -> 128 bought only 9%.
-///
-/// That established the *budget* — the most decode may cost. It does not
-/// establish a good starting point: measured across three workloads the knee
-/// sits at 16 workers/file (Flex), 4 (bulk ERR3239276), and effectively 0
-/// (PBMC on a 96 M-k-mer transcriptome, where mapping is so much costlier per
-/// read that decode demand nearly vanishes). Since every curve is flat past its
-/// knee, over-provisioning wastes threads without buying time. So this returns
-/// a generous ceiling, a bounded total, and a deliberately small starting
-/// point; `DecodeBudget` grows toward the knee only on demonstrated starvation.
-///
-/// `num_files` matters because throughput on the serial path scales with file
-/// count (one inflate stream per file), so many inputs already supply
-/// parallelism and need proportionally less help per file. Whether the parallel
-/// decoder is used at all is decided by measurement; see
-/// [`crate::io::calibrate::probe_starvation`].
-pub fn plan_thread_budget(map_threads: usize, num_files: usize) -> ThreadBudget {
     if let Ok(v) = std::env::var("PISCEM_RAPIDGZIP_THREADS")
         && let Ok(per_file) = v.parse::<usize>()
     {
         // Explicit override: honour it exactly, for reproducing measurements.
+        let decode = per_file.saturating_mul(files).max(1);
         return ThreadBudget {
-            decode_budget: per_file.saturating_mul(num_files.max(1)).max(1),
+            map_threads: total.saturating_sub(decode).max(1),
+            decode_budget: decode,
             per_file_ceiling: per_file.max(1),
-            initial_per_file: per_file.max(1),
             parallel_gzip: true,
         };
     }
 
-    let files = num_files.max(1);
-
-    // No threads-per-file gate here any more: it was a constant standing in for
-    // consumer cost, which `calibrate::probe_starvation` measures directly and
-    // continuously. This now returns a budget; whether it is used at all is the
-    // probe's call. The per-file `InputKind` check still lives in `open_input`,
-    // since a run can mix regular files and FIFOs.
-    // Half the mapping allotment, i.e. a third of the combined footprint --
-    // but never more than the cores this process can actually run on.
     // `-t` is a request, not a guarantee: under a cpuset or a cgroup CPU quota
-    // the process may hold far fewer cores than `-t` names, and budgeting
-    // decode threads against the larger number just oversubscribes what is
-    // left for mapping. (Bound suggested by salmon PR #1072.)
-    let usable_cores = std::thread::available_parallelism()
+    // the process may hold far fewer cores than it names, and budgeting against
+    // the larger number just oversubscribes. (Bound suggested by salmon #1072.)
+    let usable = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(map_threads);
-    let decode_budget = (map_threads / 2).clamp(1, 64).min(usable_cores.max(1));
-    // Ceiling per decoder is deliberately above the fair share: a decoder that
-    // is genuinely starved may exceed its slice when its peers are idle, and
-    // the supervisor claws it back. Capped because past ~16 the knee is flat.
-    let per_file_ceiling = (decode_budget.div_ceil(files) * 2).clamp(2, 16);
+        .unwrap_or(total);
+    let total = total.min(usable.max(1));
 
+    let decode_budget = (total / 8).clamp(1, total.saturating_sub(1).max(1));
+    let map_threads = total.saturating_sub(decode_budget).max(1);
+
+    // The per-file ceiling is now the *pool's* immutable maximum, so it is the
+    // whole budget rather than a share of it. `DecoderPool::set_worker_limit` is
+    // refused above this, and a refusal silently desyncs the broker's accounting
+    // from the pool's -- so the ceiling must never be the thing that binds.
     ThreadBudget {
+        map_threads,
         decode_budget,
-        per_file_ceiling,
+        per_file_ceiling: total,
         parallel_gzip: true,
-        // Start at one worker per decoder — cost-equivalent to the serial path
-        // — and let the supervisor buy growth with demonstrated starvation.
-        // This removes any need to predict decode demand up front, which is
-        // machine- and index-specific: measured per-mapping-thread consumption
-        // ranged 0.064 GB/s (96.3 M-k-mer transcriptome) to 0.43 GB/s (1.5 M
-        // probe panel), a 6.7x spread no constant could span.
-        //
-        // Verified not to regress the worst case: on the full Flex archive
-        // (single pair, knee at 16 workers/file, where under-provisioning had
-        // cost 48%), starting at 1 reached peak 16 and ran 114.29 s versus
-        // 117.81 s starting at 2.
-        initial_per_file: env_usize("PISCEM_DECODE_INITIAL", 1).min(per_file_ceiling).max(1),
     }
 }
 

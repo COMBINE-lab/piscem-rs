@@ -25,9 +25,7 @@ use crate::index::contig_table::ContigTableLike;
 
 use super::DictKind;
 use crate::index::reference_index::{ReferenceIndex, tiny_artifacts_exist};
-use crate::io::fastx::{
-    Collection, CollectionType, reader_with_batch_size,
-};
+use crate::io::fastx::{Collection, CollectionType, reader_with_batch_size};
 use crate::io::map_info::{MapInfoParams, write_map_info};
 use crate::io::rad::write_rad_header_atac;
 use crate::io::threads::{MappingStats, OutputInfo};
@@ -78,6 +76,17 @@ pub struct MapScatacArgs {
     /// Number of mapping threads
     #[arg(short = 't', long, default_value = "16")]
     pub threads: usize,
+
+    /// Gzip decoder selection: `auto`, `serial`, `parallel`, or `parallel=N`.
+    ///
+    /// `auto` (the default) decides from the input: forced rules first, then a
+    /// brief measurement of how starved the mapping threads are. Override it
+    /// when you know something the probe cannot — a slow network filesystem, a
+    /// shared node where spending cores on decode is antisocial, or to reproduce
+    /// a measurement. `parallel` still yields on inputs that are not regular
+    /// files, where the parallel decoder degrades to sequential anyway.
+    #[arg(long, default_value = "auto", value_name = "MODE")]
+    pub decoder: String,
     /// Barcode length in bases
     #[arg(long, default_value = "16")]
     pub bc_len: usize,
@@ -252,6 +261,8 @@ where
     let min_overlap = args.min_overlap;
     let end_cache = UnitigEndCache::new(args.end_cache_capacity);
     let num_threads = args.threads.max(1);
+    let decoder_pref = crate::io::calibrate::DecoderPreference::parse(&args.decoder)
+        .map_err(|e| anyhow::anyhow!("invalid --decoder value: {e}"))?;
     let opts = MappingOpts {
         max_hit_occ: args.max_hit_occ,
         max_hit_occ_recover: args.max_hit_occ_recover,
@@ -275,7 +286,7 @@ where
             &output_info, &stats,
             index, &binning, bc_len, tn5_shift, min_overlap, Some(&end_cache),
             is_paired, opts,
-            num_threads, &progress,
+            num_threads, decoder_pref, &progress,
         )?;
     });
 
@@ -341,6 +352,7 @@ fn run_atac_pipeline<const K: usize, D: KmerDictionary + Sync, C: ContigTableLik
     is_paired: bool,
     opts: MappingOpts,
     num_threads: usize,
+    decoder_pref: crate::io::calibrate::DecoderPreference,
     progress: &indicatif::ProgressBar,
 ) -> Result<()>
 where
@@ -363,11 +375,65 @@ where
     let arity = if is_paired { 3 } else { 2 };
     let num_input_files = bio_paths.len() * arity;
 
-    // Same decode/map split the bulk and scRNA paths use. scATAC opens `arity`
-    // files per sample -- biological read, barcode read, and mate when paired --
-    // so it reaches the threads-per-file bound sooner than a paired run does,
-    // and a multi-sample scATAC run is usually served by serial streams alone.
-    let plan = crate::io::fastx::plan_thread_budget(num_threads, num_input_files);
+    // scATAC opens `arity` files per sample -- biological read, barcode read,
+    // and mate when paired -- so a multi-sample run already has many inflate
+    // streams and is usually served by serial decode alone. Measured on 10x
+    // `atac_pbmc_5k` against a k=23 chr1+chr2 index at `-t 32`, the parallel
+    // decoder cost +1.0% wall and +1.1% CPU: the supervisor found no starvation
+    // to answer. Calibrating anyway is what makes that a measured outcome for
+    // each run rather than an assumption carried from one dataset.
+    let groups: Vec<crate::io::calibrate::ReadGroup> = (0..bio_paths.len())
+        .map(|i| {
+            let mut g = vec![bio_paths[i].clone(), barcode_paths[i].clone()];
+            if is_paired {
+                g.push(read2_paths[i].clone());
+            }
+            g
+        })
+        .collect();
+    let decision = crate::io::calibrate::choose_decoder(&groups, num_threads, decoder_pref);
+    let mut plan = crate::io::fastx::plan_thread_budget(num_threads, num_input_files);
+    if !decision.parallel {
+        plan.parallel_gzip = false;
+        plan.decode_budget = 0;
+    } else if let crate::io::calibrate::DecoderPreference::Parallel {
+        workers_per_file: Some(w),
+    } = decoder_pref
+    {
+        // A named number is a request to *use* it, not to converge toward it.
+        plan.decode_budget = w
+            .saturating_mul(num_input_files)
+            .max(1)
+            .min(num_threads - 1);
+        // The budget is the point. `decode_budget` was overwritten without
+        // touching `map_threads`, so a pinned request spent both sides of the
+        // split in full: measured at `-t 32`, `--decoder parallel=16` ran an
+        // average of 41 concurrent threads and looked 41% faster than `auto`
+        // purely by using half as much machine again.
+        plan.map_threads = num_threads.saturating_sub(plan.decode_budget).max(1);
+    }
+    #[cfg(feature = "rapidgzip")]
+    let pinned = matches!(
+        decoder_pref,
+        crate::io::calibrate::DecoderPreference::Parallel {
+            workers_per_file: Some(_)
+        }
+    );
+
+    // One pool for the whole run, sized to the entire budget: `workers` is an
+    // immutable maximum and a refused `set_worker_limit` would silently desync
+    // the broker's accounting from the pool's.
+    #[cfg(feature = "rapidgzip")]
+    let decode_pool = if plan.parallel_gzip {
+        rapidgzip_core::DecoderPool::builder()
+            .workers(num_threads.max(2))
+            .initial_worker_limit(plan.decode_budget.clamp(1, num_threads - 1))
+            .build()
+            .ok()
+    } else {
+        None
+    };
+    let num_threads = plan.map_threads;
     #[cfg(feature = "rapidgzip")]
     let mut handles: Vec<rapidgzip_core::DecoderHandle> = Vec::new();
 
@@ -375,8 +441,10 @@ where
     // pushes into `handles`; without it the body has nothing to mutate.
     #[allow(unused_mut)]
     let mut open = |path: &std::path::Path| -> Result<_> {
-        let opened =
-            crate::io::fastx::open_input(path, plan.per_file_ceiling, plan.initial_per_file)?;
+        #[cfg(feature = "rapidgzip")]
+        let opened = crate::io::fastx::open_input_pooled(path, decode_pool.as_ref(), num_threads)?;
+        #[cfg(not(feature = "rapidgzip"))]
+        let opened = crate::io::fastx::open_input(path, 0)?;
         #[cfg(feature = "rapidgzip")]
         if let Some(h) = opened.handle {
             handles.push(h);
@@ -398,25 +466,66 @@ where
         }
     }
 
+    // The mapping side, resizable for the same reason.
+    let map_pool = paraseq::parallel::ThreadPool::with_max(plan.map_threads, num_threads);
+
     #[cfg(feature = "rapidgzip")]
-    let budget = crate::io::decode_budget::DecodeBudget::spawn(handles, plan.decode_budget);
+    let broker = match (&decode_pool, pinned) {
+        (Some(pool), false) => thread_broker::ThreadBroker::builder(
+            crate::io::broker::MappingConsumer::new(map_pool.clone(), stats),
+            crate::io::broker::DecodeProducer::new(pool.clone(), handles.clone()),
+        )
+        .budget(num_threads)
+        .initial_producer_slots(plan.decode_budget)
+        .build()
+        .map(|b| b.start())
+        // Loud, not swallowed. A misconfigured broker silently returning `None`
+        // means the run quietly keeps whatever split it opened with, which is
+        // exactly how a self-inconsistent default pair went unnoticed: the
+        // decode limit stayed at its opening value and consumer utilisation
+        // fell from 93% to 32% with nothing said.
+        .inspect_err(|e| tracing::warn!("thread broker disabled: {e}"))
+        .ok(),
+        _ => None,
+    };
 
     let collection = Collection::new(readers, CollectionType::Multi { arity })
         .map_err(|e| anyhow::anyhow!("failed to create collection: {}", e))?;
     collection
-        .process_parallel_multi(&mut processor, num_threads, None)
+        .process_parallel_multi_pool(&mut processor, &map_pool, None)
         .map_err(|e| anyhow::anyhow!("mapping failed: {}", e))?;
 
     #[cfg(feature = "rapidgzip")]
-    if let Some(budget) = budget {
-        let report = budget.finish();
+    if let Some(broker) = broker {
+        let r = broker.finish();
         tracing::info!(
-            "decoder threads: peak {} worker + {} auxiliary (budget {}); peak busy {}",
-            report.peak_worker_threads,
-            report.peak_auxiliary_threads,
-            plan.decode_budget,
-            report.peak_busy_workers,
+            "thread broker: settled at {} mapping / {} decode of {num_threads} \
+             ({} moves, {} reverts, {} resurveys, converged {}, {:?} to settle)",
+            r.final_consumer_threads,
+            r.final_producer_limit,
+            r.moves,
+            r.reverts,
+            r.resurveys,
+            r.converged(),
+            r.time_to_converge,
         );
+        // The measured decode share of total per-read cost, which is what the
+        // split is solved from. Worth logging on its own: if a split looks
+        // wrong, this says whether the model was misinformed or merely
+        // overruled by the cap.
+        if let Some(m) = r.final_model {
+            tracing::info!(
+                "thread broker: decode is {:.0}% of per-read cost -> wanted {} slots, \
+                 usable ceiling {}",
+                m.producer_cost_share * 100.0,
+                m.ideal_producer_slots,
+                if m.useful_cap == usize::MAX {
+                    "none".to_string()
+                } else {
+                    m.useful_cap.to_string()
+                },
+            );
+        }
     }
 
     Ok(())

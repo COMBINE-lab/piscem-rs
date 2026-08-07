@@ -11,7 +11,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
-use crate::hash::{fixed_map, FixedMap};
+use crate::hash::{FixedMap, fixed_map};
 use indicatif::ProgressBar;
 use paraseq::Record;
 use paraseq::parallel::{MultiParallelProcessor, PairedParallelProcessor, ParallelProcessor};
@@ -337,10 +337,17 @@ where
             .get_or_insert_with(|| CommonThreadState::new(index, end_cache, &self.opts));
         s.ensure_chunk_started();
 
+        // Times the mapping work itself, for the thread broker. Published every
+        // few hundred reads rather than once per batch: a 16384-record batch
+        // takes far longer than one sampling window, so a per-batch counter
+        // would leave windows reading zero work -- reporting maximum starvation
+        // for a thread mapping flat out. See `thread_broker::BusyMeter`.
+        let mut busy = self.stats.busy.timer();
         let mut batch_reads: u64 = 0;
         for (rec1, rec2) in record_pairs {
             s.local_reads += 1;
             batch_reads += 1;
+            busy.tick();
             let seq1 = rec1.seq();
             let seq2 = rec2.seq();
 
@@ -421,10 +428,17 @@ where
             .get_or_insert_with(|| CommonThreadState::new(index, end_cache, &self.opts));
         s.ensure_chunk_started();
 
+        // Times the mapping work itself, for the thread broker. Published every
+        // few hundred reads rather than once per batch: a 16384-record batch
+        // takes far longer than one sampling window, so a per-batch counter
+        // would leave windows reading zero work -- reporting maximum starvation
+        // for a thread mapping flat out. See `thread_broker::BusyMeter`.
+        let mut busy = self.stats.busy.timer();
         let mut batch_reads: u64 = 0;
         for rec in records {
             s.local_reads += 1;
             batch_reads += 1;
+            busy.tick();
             let seq1 = rec.seq();
 
             s.poison_state.paired_for_mapping = false;
@@ -846,10 +860,14 @@ where
         };
         let mut multi_bc_packed: SmallVec<[u64; 2]> = SmallVec::new();
 
+        // See the note on the other batch loops: published within the batch,
+        // not at its end.
+        let mut busy = self.stats.busy.timer();
         let mut batch_reads: u64 = 0;
         for (rec1, rec2) in record_pairs {
             s.local_reads += 1;
             batch_reads += 1;
+            busy.tick();
 
             let r1 = rec1.seq();
             let r2 = rec2.seq();
@@ -1270,10 +1288,17 @@ where
         let s = &mut st.common;
         s.ensure_chunk_started();
 
+        // Times the mapping work itself, for the thread broker. Published every
+        // few hundred reads rather than once per batch: a 16384-record batch
+        // takes far longer than one sampling window, so a per-batch counter
+        // would leave windows reading zero work -- reporting maximum starvation
+        // for a thread mapping flat out. See `thread_broker::BusyMeter`.
+        let mut busy = self.stats.busy.timer();
         let mut batch_reads: u64 = 0;
         for multi in multi_records {
             s.local_reads += 1;
             batch_reads += 1;
+            busy.tick();
 
             if is_paired {
                 // PE mode: multi[0]=R1, multi[1]=barcode, multi[2]=R2

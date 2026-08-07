@@ -60,6 +60,13 @@ pub struct MappingStats {
     pub num_reads: AtomicU64,
     pub num_mapped: AtomicU64,
     pub num_poisoned: AtomicU64,
+    /// Time the mapping threads spent actually mapping.
+    ///
+    /// Lives here because it is the one struct already shared by every
+    /// processor clone, so the meter needs no extra plumbing through three
+    /// constructors. Read by the thread broker to decide whether the mapping
+    /// threads are starved; see `crate::io::broker`.
+    pub busy: std::sync::Arc<thread_broker::BusyMeter>,
 }
 
 impl MappingStats {
@@ -69,6 +76,7 @@ impl MappingStats {
             num_reads: AtomicU64::new(0),
             num_mapped: AtomicU64::new(0),
             num_poisoned: AtomicU64::new(0),
+            busy: std::sync::Arc::new(thread_broker::BusyMeter::new()),
         }
     }
 

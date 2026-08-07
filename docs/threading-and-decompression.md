@@ -19,7 +19,60 @@ fine for I/O and threading work, where only the byte volume matters, but it is
 the wrong choice for anything that depends on lookup outcomes. Use
 `SRR21186103` instead: 150 bp, **88.8%** mapping rate on the same index.
 
+`SRR21186103` is available as a **pair**, and both mates are needed to cover the
+paired-end path (`map_pe_fragment`, two mates filled per group under separate
+per-file mutexes). Both are at
+`/scratch1/rob/rshash_testing/human_reads/SRR21186103_{1,2}.fastq.gz`, fetched
+from ENA and byte-identical to the archive copies; both are gzip-family
+(`MarkerWindow`, zero `Z_SYNC_FLUSH` markers). Paired, the run maps 70.3% of
+26.1 M pairs.
+
+The pair earns its place by being the one reference workload that is
+**mapping-bound**: 10.0% consumer idle at `-t 32`, where Flex measures 93.8% and
+bulk SE 50.7%. Any thread-allocation policy validated only against decode-bound
+inputs can pass by always favouring decode, so a workload where the right answer
+is *serial* is what keeps that honest.
+
 Machine: AMD EPYC 9575F, 2 sockets x 64 cores.
+
+## 0. `pigz` output and rapidgzip (fixed upstream in 0.2.1)
+
+**Resolved — kept because the failure was invisible and is easy to re-encounter
+on an older dependency.** Against `rapidgzip-core` **0.2.0**, `pigz`-written gzip
+was never admitted to the parallel marker path: it committed to
+`DecoderPath::Sequential` during admission and decoded single-threaded for the
+whole file, whatever the thread budget or the calibrator's verdict.
+`gzip`- and `zlib`-written streams of identical content were admitted.
+
+Reported as
+[COMBINE-lab/rapidgzip-rust#29](https://github.com/COMBINE-lab/rapidgzip-rust/issues/29)
+and fixed in **0.2.1**, which this crate now requires. Every fixture is
+`MarkerWindow` or `DenseMembers` again; measured on the same files, `bulk8M`
+went from ~1770 MB/s sequential to 6493 MB/s.
+
+The cause, for anyone meeting a similar symptom: at a `pigz` flush point the
+exact decoder reports the boundary *before* a short zero-output block while the
+speculative searcher resolves to the boundary *after* it, so
+`run_admission_wave`'s strict `chunk.start_bit != previous_end` equality
+rejected. The cleanest instance was a 35-bit delta — a 3-bit block header plus a
+32-bit `LEN`/`NLEN`, i.e. an empty stored block (`Z_SYNC_FLUSH`). Neither
+single-member-ness nor byte alignment was the discriminator; admitted `gzip`
+boundaries are also non-byte-aligned and resolve exactly.
+
+**What survives the fix.** A correct calibrator can still select `parallel` and
+have the decoder report `Sequential`, because that is a property of the input's
+encoding rather than a bug. `io::decode_budget` logs exactly that mismatch at
+`WARN`, which is the only way a user learns their file is the limiter — the
+decoder otherwise reports `Idle` with `spawned_workers = 0`, indistinguishable
+from having nothing to do. Diagnosing a suspected case takes one line:
+
+```bash
+head -c 50000000 reads.fq.gz | python3 -c \
+  "import sys; print(sys.stdin.buffer.read().count(b'\x00\x00\xff\xff'))"
+```
+
+Nonzero means `Z_SYNC_FLUSH` markers, i.e. `pigz`-family output. On 0.2.1 that is
+no longer a problem; on anything older it is decisive.
 
 ## 1. Decompression is usually the constraint, not mapping
 
@@ -73,101 +126,82 @@ where it wins (1.20x). Replaced by `map_threads / files >= 4`. Verified:
 | 4 | 16 | 2 | 5.23 | 5.23 | 5.27 |
 | 4 | 64 | 8 | 2.95 | 2.93 | **2.55** |
 
-**The threshold is set low (4) because the payoff is asymmetric.** Enabling the
-parallel decoder when it is not needed is cheap: on a 96.3 M-k-mer
-transcriptome, where mapping is slow enough that decode never binds, it measured
--4.9% wall and +2.1% CPU. Not enabling it when it *is* needed costs up to 3x
-wall. The supervisor absorbs the rest -- decoders start at one worker and grow
-only on demonstrated starvation, so an unnecessary parallel path degenerates to
-roughly serial cost rather than to its ceiling.
+**Both rules above are historical.** Neither a file-count threshold nor a
+threads-per-file ratio survives, because both stand in for the term that actually
+decides: per-thread mapping cost, measured at 0.064 GB/s on a 96.3 M-k-mer
+transcriptome against 0.43 GB/s on a 1.5 M-k-mer probe panel. A 6.7x spread means
+the *correct* ratio is about 3.5 threads/file for cheap mapping and about 37 for
+expensive, and no constant spans that. The table is kept because it is the
+crossover surface any replacement has to be checked against.
 
-**Mapping cost is the remaining term, and it is not modelled.** Per-thread
-consumption ranged 0.064 GB/s (96.3 M-k-mer transcriptome) to 0.43 GB/s (1.5 M
-probe panel), so the *correct* ratio is index-dependent: about 3.5 threads/file
-for cheap mapping, about 37 for expensive. The ratio rule uses the cheap-mapping
-figure and accepts the small loss on expensive indices, per the asymmetry above.
+The payoff asymmetry does survive, and still sets which way ties break: enabling
+the parallel decoder needlessly measured -4.9% wall and +2.1% CPU on a
+transcriptome where decode never binds, while failing to enable it when needed
+costs up to 3x wall. The cost of the wrong "yes" is threads; the cost of the
+wrong "no" is time.
 
-### Calibration: measure the ambiguous cases
+### Calibration: run the pipeline, do not model it
 
-`io::calibrate` decides in two tiers, and is deliberately independent of the
-mapping kernel (the probe takes a closure) so downstream consumers that map
-through this crate can share it.
+`io::probe` decides by **running the real pipeline briefly** — the same
+`Collection` API, reader type, batch size, per-file mutexes and thread
+distribution production uses — and measuring what fraction of mapping-thread
+capacity is not spent mapping. It is deliberately independent of the mapping
+kernel (it takes a `ProbeKernel`) so downstream consumers such as salmon can
+share it.
 
-**Tier 0, `forced_choice`** — logical forcings, no measurement. Non-regular
-input; a single mapping thread; or fewer than 3 threads per file, where serial
-supply already exceeds what those threads consume at the *fastest* per-thread
-rate ever measured here (0.43 GB/s), so no measurement could change the answer.
+**An earlier design compared two separately-measured rates and is gone.** Both
+rates were accurate — the producer estimate came within 2.6% of a whole-file
+measurement of identical work, the consumer within 3% — but validated against
+the crossover surface above, `decide` got **4 of 8 points wrong**, every one
+predicting serial where the parallel decoder measurably won, by up to 1.92x. The
+flaw was structural: it modelled supply as `files x rate-measured-alone`, but the
+thread holding the per-file mutex also maps, so achieved supply falls exactly as
+`-t` rises — the model was most optimistic where it was most wrong.
 
-**Tier 1, `probe` + `decide`** — otherwise, map 5,000 records from the first
-input on one thread through the real kernel and compare demand against supply.
-There is deliberately **no index-size prior**: per-thread consumption spans
-0.064-0.43 GB/s across two measured indices, and two points do not justify
-fitting a curve against a proxy that has not been validated.
+Two traps found while building the replacement, both worth remembering because
+each produced confident, plausible, inverted numbers:
 
-Observed decisions, and why each is right:
+- **Per-batch time accounting cannot be sampled.** `READER_BATCH_SIZE` is 16384,
+  so at a realistic 5 us/record a batch takes ~80 ms against a 25 ms window.
+  Windows containing no completed batch read a delta of zero, and the probe
+  reported **100% starved for a workload mapping flat out**. Mapping time is now
+  published every 256 groups.
+- **The verdict landed on the startup transient.** Every workload stopped at
+  exactly `min_windows` reporting ~99% starved, because at 75 ms `paraseq` is
+  still spawning workers and nothing has been mapped yet — so *every* input looks
+  decode-bound. A 150 ms warm-up is now discarded and re-based.
 
-| workload | files | -t | measured GB/s per thread | decision |
-|---|---|---|---|---|
-| gencode | 1 | 32 | 0.051 | parallel |
-| Flex panel | 2 | 32 | 0.069 | parallel (ratchets to 8-16 workers) |
-| gencode | 8 | 32 | 0.050 | **serial** |
+With both fixed the measure is monotone across a 16,000x range of synthetic
+consumer cost, from 99.6% starved to 1.1%.
 
-The last row is the point of Tier 1: 8 files at `-t 32` is 4 threads/file, which
-the ratio rule passes, but supply (8 x 0.64) swamps demand (32 x 0.050), and the
-measurement says so. The probe's 0.051 GB/s for gencode independently reproduces
-the 0.064 GB/s measured by a completely different route.
+**Forcings** still apply first, and only where the answer cannot depend on
+measurement: no regular file among the inputs, or a single mapping thread. The
+threads-per-file bound that used to live here is gone — it encoded consumer cost
+as a constant, which was empirical rather than logical, and consumer cost is
+exactly what the probe measures.
 
-Cost, measured end-to-end on Flex at one pair: wall 3.46 s versus 3.33 s without
-the probe, CPU 100.32 s versus 102.50 s -- inside the noise floor either way.
+### Never probe what cannot be rewound
 
-The probe measures **producer against consumer**, following paraseq's own split:
-`RecordSet::fill` decodes *and parses* under the per-file mutex, so it is the
-producer and is serialized per file; mapping the filled batch is the consumer.
+The probe reads a prefix and the run re-opens from the start. On a FIFO those
+bytes are **gone** — there is no second read — so probing one silently drops
+reads from the output. That is data loss, not a slowdown, and it is the one
+failure mode here that corrupts results rather than costing time.
 
-**Both rates are accurate; the model built on them is not.** Measured in the
-same binary against a whole-file run of identical work, the producer estimate is
-0.843 GB/s versus 0.822 (+2.6%), and the consumer 0.066 versus the 0.064
-obtained independently from whole-run CPU accounting (+3%).
+The guard is per *group*, because `paraseq`'s paired `fill` reads both mates
+together: a regular R1 beside a FIFO R2 cannot be probed without consuming the
+pipe. Groups containing anything non-regular are excluded; if none remain the
+probe is skipped entirely and the run keeps its default.
 
-But validated against the crossover surface, `decide` got **4 of 8 points
-wrong** — every one predicting serial where the parallel decoder measurably won,
-by up to 1.92x — while the plain threads-per-file rule got 7 of 8. The
-comparison is therefore **advisory**: logged, but only an explicit `--decoder`
-request may force the serial path.
+The downgrade is **per file**, not per run: a FIFO among the inputs does not cost
+the regular files their parallel decoder, since `open_input` re-checks each path.
+Under `--decoder auto` the partial downgrade is reported at `INFO`; under an
+explicit `parallel` it is a `WARN` naming the offending paths, because "parallel
+was requested but you got serial" is actively misleading when one file of eight
+was affected.
 
-The model treats supply as `files x rate-measured-alone`. The producer never
-gets a whole core: the thread holding the per-file mutex also maps, and competes
-with every other thread for bandwidth. Achieved supply falls as `-t` rises —
-exactly where the parallel decoder matters — so the model is most optimistic
-where it is most wrong. Margin tuning cannot fix it: the false-serial points
-need a margin below 0.38, the one true-serial point above it.
-
-Fixing it properly means measuring the ratio directly — running a producer and
-a consumer concurrently and seeing which starves — rather than inferring it from
-two isolated rates.
-
-Two measurement traps found here, both worth remembering:
-
-- An early "ground truth" of 0.43-0.52 GB/s was an artifact of the reference
-  harness being a separate crate built without `lto`/`codegen-units=1`. The same
-  work in-binary runs at 0.82. **Never benchmark a reference implementation
-  under different compiler settings than the thing it judges.** The hidden
-  `probe-bench` subcommand exists to make that mistake impossible.
-- Retaining every `RecordSet` for the consumer phase cost ~20% of the producer
-  rate (0.70 vs 0.88). Only the sets the consumer maps are kept now.
-
-A warm-up record set is pulled but not timed, excluding file open and
-first-block decode.
-
-One caveat remains, biasing the cheap direction: the probe times **one** thread,
-so it overstates the per-thread rate a full run achieves under memory
-contention, inflating demand.
-
-That pushes toward the parallel decoder, which is the cheap error (-4.9% wall /
-+2.1% CPU when unnecessary, against up to 3x wall when wrongly skipped).
-
-For paired chemistries the probe reads **read 2**: read 1 is the technical read
-(barcode + UMI), so timing it would measure the wrong sequence.
+Tested by construction: opening a FIFO with no writer blocks forever, so the
+tests create writer-less FIFOs and a completing test *is* the proof that nothing
+opened them.
 
 ### Overriding the choice
 
@@ -233,40 +267,111 @@ identically to the regular file. Nothing was reported upstream.
 
 ## 3. Thread budget: how `-t` is split
 
-`plan_thread_budget` splits the user's budget between mapping and decoding, and
-`io::decode_budget` supervises the decoders under one shared ceiling. Upstream
-adapts *within* a decoder; nothing bounds the sum *across* the 2N decoders a
-multi-file run opens, and that gap is what this owns.
+**`-t` is now the whole budget**, divided into mapping threads and a decode
+budget. It previously meant mapping threads *alone*, with decode allocated on
+top, so a run used about 1.5x the cores it named — which is what cgroup-limited
+runs tripped over. Existing timings shift accordingly.
 
-**Allocation matters more than budget size.** At a fixed 64 threads, the split
-was worth **5.75x** (11.04 min with everything on mapping and no parallel
-decode, versus 1.92 min at 32 mapping / 32 decode). Doubling 64 -> 128 threads
-bought only 9%.
+**Allocation matters far more than budget size.** At a fixed 64 threads the split
+was worth **5.75x** (11.04 min with every thread mapping and no parallel decode,
+versus 1.92 min balanced), while doubling 64 -> 128 bought only 9%. It was
+nevertheless a constant — `decode = map / 2` — for as long as this module
+existed, which made the one parameter that mattered the one thing never
+measured.
 
-**Start low and ratchet.** Decoders start at 2 workers/file and double on
-evidence of starvation, bounded by the budget, giving threads back only on
-`Converged` (where the decoder has *measured* its own knee). Justified by an
-asymmetry: past its knee every workload's curve is flat, so surplus workers
-cost threads but no time, while under-provisioning costs 22-48%.
+A constant cannot work, because the right answer moves an order of magnitude with
+the index: the knee sat at 16 workers/file for Flex, 4 for bulk, and effectively
+0 for PBMC on a 96.3 M-k-mer transcriptome. So `plan_thread_budget` now derives
+it from two measured rates: per-thread mapping consumption, and achieved decode
+supply. Throughput is `min(demand, supply)`, so it evaluates every split and
+keeps the best.
 
-Two designs were tried first and rejected:
+### A decoder worker is not worth a stream
 
-- **Requiring N consecutive identical verdicts.** A healthy pipeline alternates
-  between `DecoderBound` and `ConsumerBound` sample to sample, so a run-length
-  rule either never fires or, shortened enough to fire, oscillates. Replaced by
-  an evidence score.
-- **Shrinking on sustained `ConsumerBound`.** Oscillates with a ~1 s period: at
-  4 workers the decoder is `DecoderBound` so the share grows to 8; at 8 it gets
-  ahead of the parser and reports `ConsumerBound` so the share halves; forever.
-  `ConsumerBound` is not waste — it means the decoder is comfortably ahead,
-  which is the goal. Growth is therefore one-way within a run.
+The obvious model — a worker supplies what one serial stream does — is wrong, and
+measurably so. Measured on gencode v49, one gzip file, `-t 32`, best of 3,
+**mapping seconds only** (whole-run wall clock buries this under 1.58 s of index
+load):
 
-Knees are **not portable**: 16 workers/file for Flex, 4 for bulk, ~0 for PBMC,
-because a 96 M-k-mer index makes mapping so much costlier per read that decode
-demand nearly vanishes. Hence evidence-driven growth rather than a fixed ratio.
+| decode threads | mapping |
+|---:|---:|
+| 1 (what the closed form chose) | 5.70 s |
+| 2 | 5.68 s |
+| 4 | 3.90 s |
+| **6 (optimum)** | **3.57 s** |
+| 8 (what the two-point split chooses) | 3.87 s |
+| 12 | 4.40 s |
 
-Measured (`-t 32`): Flex 111.74 s, PBMC 17.48 s, bulk 87.09 s — within 1-3% of
-the best hand-tuned setting on each, with no tuning knob exposed.
+The closed form lands **60% off**, always toward too little decode. The reason is
+Amdahl, not tuning: `paraseq` holds one mutex per file across `fill`, which
+**decodes *and* parses**. Workers parallelise only the decode half; parsing stays
+serialised per file whatever the worker count. A worker therefore buys a fraction
+of a stream — about `0.28 * s` here — and the fraction depends on the file's
+structure, since `DenseMembers` and `MarkerWindow` parallelise differently.
+
+No constant fixes that, so the probe measures supply a **second time** with
+decoders running, and the split interpolates between the two points and holds
+flat past the second (supply saturates; extrapolating promises throughput no
+worker count can deliver). That lands within **7%** of the optimum — above the
+~1-3% noise floor, and the residual comes from linear interpolation across a
+concave curve, which biases the choice high.
+
+Cost: a second probe, a few hundred ms, paid only when the first probe finds
+enough idleness to be worth measuring.
+
+### Serial versus parallel is a throughput comparison, not a threshold
+
+`parallel_gain` compares predicted throughput at the best split against spending
+nothing on decode, and the parallel decoder is used when that clears a few
+percent. A starvation threshold cannot answer this: idleness says the mapping
+threads are waiting, not that decoder threads would fix it — a file rapidgzip
+decodes sequentially is 100% starved and cannot be helped at all. It would also
+have to be calibrated, which is the fitted constant this design removed.
+
+`STARVATION_SCREEN` (0.05) survives only as a cheap gate on whether the second
+probe is worth taking, and it is derived rather than fitted: idle fraction `f`
+caps recoverable speedup at `1/(1-f)`, and enabling parallel decode needlessly
+measured -4.9% wall / +2.1% CPU, so below ~5% idle nothing can pay.
+
+Observed, `-t 32`:
+
+| workload | files | idle | gain | decision |
+|---|---:|---:|---:|---|
+| Flex probe panel | 1 | 78.5% | 2.60x | parallel |
+| gencode v49 | 1 | 51.3% | 1.88x | parallel |
+| gencode v49 | 8 | 4.5% | — (screened out) | serial |
+| scATAC, 10x pbmc_5k | 3 | 0.0% | — (screened out) | serial |
+
+### Growth is one-way within a run
+
+Decoders open at their ceiling and `io::decode_budget` only ever raises it.
+Shrinking was tried and oscillates with a ~1 s period: at 4 workers the decoder
+is `DecoderBound` so the share grows to 8; at 8 it gets ahead of the parser and
+reports `ConsumerBound` so the share halves; forever. Upstream's own controller
+already adapts downward — measured directly, a converged decoder drops from 16
+active workers to 1 under `ConsumerBound` with no help from here — so shrinking
+the ceiling is a second controller fighting the first.
+
+The supervisor's remaining job is the one upstream cannot do: dividing a fixed
+shared budget across the decoders a multi-file run opens. It accounts in
+**live workers**, not granted ceilings. Summing ceilings deadlocked it outright
+once decoders stopped being clamped at open: every decoder reported
+`worker_limit == per_file_ceiling`, roughly twice the fair share, so `held` came
+to about twice the budget, `spare` was zero on every sample, and the growth
+branch never fired.
+
+### scATAC
+
+`map-scatac` now takes `--decoder` and calibrates like the other two, rather than
+opening through a niffler-only helper where `-t` and `--decoder` did nothing.
+
+It is a consistency fix, not a speedup, and the calibrator agrees: 10x
+`atac_pbmc_5k` lane L001 against a k=23 chr1+chr2 index at `-t 32` probes
+**0.0% idle** and chooses serial. scATAC opens three files per sample, so the
+serial path already supplies three inflate streams, and a 397 M-vertex index
+makes mapping costly enough per read that decode never binds. Measured
+end-to-end the parallel decoder cost +1.0% wall and +1.1% CPU. The value is that
+the policy now applies at all and reaches the right answer by measurement.
 
 ## 4. The tiny-dict prefilter
 
@@ -416,7 +521,10 @@ performance claims for effects several times the floor.
 
 | variable | effect |
 |---|---|
-| `PISCEM_RAPIDGZIP_THREADS` | pins decoder workers per file, bypassing the budget |
+| `PISCEM_RAPIDGZIP_THREADS` | pins decoder workers per file, bypassing the measured split |
+| `PISCEM_PROBE_CEILING_MS` | hard cap on one probe's duration (default 1000) |
+| `PISCEM_PROBE_WINDOW_MS` | probe sampling window (default 25) |
+| `PISCEM_PROBE_WARMUP_MS` | probe time discarded before any window is recorded (default 150) |
 | `PISCEM_TINY_PREFILTER` | `0` forces the filter off, `1` forces it on |
 | `PISCEM_TINY_PREFILTER_MAX_BYTES` | overrides Gate A |
 | `PISCEM_TINY_PREFILTER_MIN_MISS` | overrides Gate B's threshold |
