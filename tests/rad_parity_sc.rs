@@ -108,7 +108,7 @@ fn ensure_rust_index() -> Result<()> {
 
 /// Generate a deterministic 16bp barcode from a seed index.
 fn make_barcode(idx: usize) -> [u8; BC_LEN] {
-    const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+    const BASES: [u8; 4] = *b"ACGT";
     let mut bc = [b'A'; BC_LEN];
     let mut val = idx;
     for b in bc.iter_mut() {
@@ -120,7 +120,7 @@ fn make_barcode(idx: usize) -> [u8; BC_LEN] {
 
 /// Generate a deterministic 12bp UMI from a seed index.
 fn make_umi(idx: usize) -> [u8; UMI_LEN] {
-    const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+    const BASES: [u8; 4] = *b"ACGT";
     let mut umi = [b'A'; UMI_LEN];
     // Use a simple hash to get different UMI per read
     let mut val = idx.wrapping_mul(2654435761); // Knuth multiplicative hash

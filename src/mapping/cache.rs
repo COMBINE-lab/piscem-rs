@@ -7,7 +7,7 @@
 //! borrow the index and are created as separate per-thread locals alongside
 //! the cache.
 
-use crate::hash::{fixed_map_with_capacity, fixed_set, FixedMap, FixedSet};
+use crate::hash::{FixedMap, FixedSet, fixed_map_with_capacity, fixed_set};
 
 use crate::mapping::hits::{MappingType, SimpleHit, SketchHitInfo};
 

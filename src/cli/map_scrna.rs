@@ -16,9 +16,7 @@ use crate::index::contig_table::ContigTableLike;
 
 use super::DictKind;
 use crate::index::reference_index::{ReferenceIndex, tiny_artifacts_exist};
-use crate::io::fastx::{
-    Collection, CollectionType, reader_with_batch_size,
-};
+use crate::io::fastx::{Collection, CollectionType, reader_with_batch_size};
 use crate::io::map_info::{MapInfoParams, write_map_info};
 use crate::io::rad::{write_rad_header_sc, write_rad_header_sc_multi_bc};
 use crate::io::threads::{MappingStats, OutputInfo};
@@ -48,17 +46,16 @@ pub struct MapScrnaArgs {
     /// Output directory
     #[arg(short = 'o', long)]
     pub output: PathBuf,
-    /// Number of mapping threads
+    /// Total execution-slot budget shared by mapping and gzip decoding
     #[arg(short = 't', long, default_value = "16")]
     pub threads: usize,
     /// Gzip decoder selection: `auto`, `serial`, `parallel`, or `parallel=N`.
     ///
-    /// `auto` (the default) decides from the input: forced rules first, then a
-    /// brief measurement of decode and mapping rates. Override it when you know
-    /// something the probe cannot — a slow network filesystem, a shared node
-    /// where spending cores on decode is antisocial, or to reproduce a
-    /// measurement. `parallel` still yields on inputs that are not regular
-    /// files, where the parallel decoder degrades to sequential anyway.
+    /// `auto` adapts the aggregate mapping/decode split during the real run.
+    /// `serial` gives mapping the full budget. `parallel` forces the parallel
+    /// path but still adapts its split; `parallel=N` fixes N slots per
+    /// decoder-capable input and disables adaptation. Non-regular inputs remain
+    /// serial because the parallel decoder requires positional reads.
     #[arg(long, default_value = "auto", value_name = "MODE")]
     pub decoder: String,
     /// Protocol geometry (e.g., chromium_v3, chromium_v2_5p)
@@ -334,7 +331,7 @@ where
     let sig_info_owned = index.ref_sig_info().cloned();
 
     // Dispatch on K and hit-info type, then run the pipeline via paraseq
-    dispatch_on_k!(k, K => {
+    let outcome = dispatch_on_k!(k, K => {
         if struct_constraints {
             run_scrna_pipeline::<K, SketchHitInfoChained, _, _>(
                 &args.read1, &args.read2,
@@ -342,7 +339,7 @@ where
                 index, strat, opts, protocol, bc_len, umi_len,
                 with_position, &read_length_samples,
                 num_threads, decoder_pref, &progress,
-            )?;
+            )?
         } else {
             run_scrna_pipeline::<K, SketchHitInfoSimple, _, _>(
                 &args.read1, &args.read2,
@@ -350,7 +347,7 @@ where
                 index, strat, opts, protocol, bc_len, umi_len,
                 with_position, &read_length_samples,
                 num_threads, decoder_pref, &progress,
-            )?;
+            )?
         }
     });
 
@@ -410,9 +407,16 @@ where
         num_mapped,
         num_poisoned,
         elapsed_secs: elapsed,
+        mapping_elapsed_secs: outcome.mapping_elapsed_secs,
         sig_info: sig_info_owned.as_ref(),
         piscem_rs_version: crate::VERSION,
-        num_threads,
+        num_threads: outcome.execution_plan.effective_budget,
+        execution_plan: Some(&outcome.execution_plan),
+        broker_report: outcome.broker_report.as_ref(),
+        broker_failure: outcome.broker_failure.as_ref(),
+        producer_measurement: outcome.producer_measurement.as_ref(),
+        consumer_measurement: Some(&outcome.consumer_measurement),
+        pipeline_tuning: outcome.tuning.as_ref(),
         index_path: &args.index,
         k: index_k,
         m: index_m,
@@ -422,112 +426,6 @@ where
 
     Ok(())
 }
-
-/// Run the Tier 1 calibration probe when nothing forces the decoder choice.
-///
-/// Maps a small prefix of the first input on one thread through the real
-/// kernel, so the measured per-thread rate is the rate this index and these
-/// reads actually achieve — not a guess from index size, which two data points
-/// could not support.
-///
-/// Returns `None` when the choice was already forced, when there is no input,
-/// or when the probe itself fails; every one of those falls back to the
-/// ratio rule in `plan_thread_budget`, which is what ran before this existed.
-#[allow(clippy::too_many_arguments)]
-fn calibrate_decoder<
-    const K: usize,
-    S: SketchHitInfo,
-    D: KmerDictionary + Sync,
-    C: ContigTableLike + Sync,
->(
-    first_path: Option<&std::path::PathBuf>,
-    num_files: usize,
-    num_threads: usize,
-    index: &ReferenceIndex<D, C>,
-    opts: &crate::mapping::processors::MappingOpts,
-    strat: SkippingStrategy,
-    pref: crate::io::calibrate::DecoderPreference,
-) -> Option<crate::io::calibrate::Decision>
-where
-    Kmer<K>: KmerBits,
-{
-    use crate::io::calibrate;
-
-    let path = first_path?;
-    let kind = calibrate::classify_input(path);
-    // Tell the user when their flag cannot be carried out, rather than quietly
-    // doing something else.
-    let compression = calibrate::detect_compression(path, kind);
-    if let Some(conflict) = calibrate::preference_conflict(pref, kind, compression) {
-        tracing::warn!("{}", conflict);
-    }
-
-    // An explicit request outranks measurement, but not the forcings: a
-    // preference cannot make a pipe seekable.
-    if let Some(chosen) = calibrate::preference_choice(pref, kind) {
-        tracing::info!(
-            "decoder selected by request: {} ({:?})",
-            if chosen.parallel { "parallel" } else { "serial" },
-            chosen.reason
-        );
-        return Some(chosen);
-    }
-    if let Some(forced) = calibrate::forced_choice(kind, num_files, num_threads) {
-        tracing::debug!("decoder choice forced: {:?}", forced.reason);
-        return Some(forced);
-    }
-
-    // Ambiguous: measure whether decode can actually keep the mapping threads
-    // fed, by running the pipeline's shape in miniature and seeing which side
-    // blocks. Comparing two separately-measured rates does not work here -- the
-    // producer never runs alone, so its isolated rate overstates achieved
-    // supply, and the error grows with -t. See `calibrate::probe_starvation`.
-    //
-    // Mapping state is per-consumer, so each thread builds its own.
-    // One producer against the share of mapping threads *one file* has to feed.
-    // The probe opens a single file, but a real run opens `num_files` and fills
-    // them concurrently, so pitting one producer against every mapping thread
-    // reports starvation that only a single-file run would see. Measured: at 8
-    // files the unscaled probe read 83-91% consumer wait while the parallel
-    // decoder actually lost (0.92x).
-    let per_file_consumers = (num_threads / num_files.max(1)).max(1);
-    let starve = calibrate::probe_starvation(
-        path,
-        per_file_consumers,
-        calibrate::ProbeConfig::default(),
-        |seq| {
-        let mut q = crate::mapping::streaming_query::PiscemStreamingQuery::<K, D>::new(index.dict());
-        let mut hs = crate::mapping::hit_searcher::HitSearcher::new(index);
-        let mut cache = crate::mapping::cache::MappingCache::<S>::new(K);
-        opts.apply_to(&mut cache);
-        let mut poison = crate::mapping::filters::PoisonState::new(index.poison_table());
-        crate::mapping::engine::map_read::<K, S, D, C>(
-            seq, &mut cache, &mut hs, &mut q, index, &mut poison, strat,
-        );
-        },
-    )
-    .ok()
-    .flatten()?;
-
-    let decision = if starve.consumer_wait_fraction > calibrate::STARVATION_THRESHOLD {
-        calibrate::Decision { parallel: true, reason: calibrate::Reason::MeasuredDecodeBound }
-    } else {
-        calibrate::Decision { parallel: false, reason: calibrate::Reason::MeasuredConsumerBound }
-    };
-    tracing::info!(
-        "decoder calibration: {} records over {} windows in {:.0} ms ({}), consumers waited {:.1}% of their time -> {} ({:?})",
-        starve.records,
-        starve.windows,
-        starve.elapsed.as_secs_f64() * 1000.0,
-        starve.stopped_because,
-        starve.consumer_wait_fraction * 100.0,
-        if decision.parallel { "parallel" } else { "serial" },
-        decision.reason
-    );
-
-    Some(decision)
-}
-
 
 #[allow(clippy::too_many_arguments)]
 fn run_scrna_pipeline<
@@ -551,7 +449,7 @@ fn run_scrna_pipeline<
     num_threads: usize,
     decoder_pref: crate::io::calibrate::DecoderPreference,
     progress: &indicatif::ProgressBar,
-) -> Result<()>
+) -> Result<crate::io::fastx::PipelineOutcome>
 where
     Kmer<K>: KmerBits,
 {
@@ -570,62 +468,72 @@ where
         progress,
     );
 
-    // Split the user's thread budget between mapping and decompression.
-    //
-    // `num_threads` here is already the mapping allotment; `decode_budget`
-    // is what the decoders may collectively spend on top of it. Both derive
-    // from the same user-supplied `-t`, see `plan_thread_budget`.
-    let mut plan = crate::io::fastx::plan_thread_budget(num_threads, read1_paths.len() * 2);
-    // Tier 1: when nothing forces the choice, measure instead of assuming.
-    if let Some(decision) = calibrate_decoder::<K, S, D, C>(
-        // Ask the geometry which file carries mappable sequence rather than
-        // assuming read 2. It is read 2 in every current chemistry, but a
-        // custom geometry says where `r` is, and timing the technical read
-        // would measure the wrong sequence.
-        if protocol.bio_read_file() == 0 {
-            read1_paths.first()
-        } else {
-            read2_paths.first()
-        },
-        read1_paths.len() * 2,
+    // The run's input as `paraseq` will see it: one group per logical record.
+    // Both mates are listed because both consume decoder capacity even though
+    // only the biological read is mapped.
+    let groups: Vec<crate::io::calibrate::ReadGroup> = read1_paths
+        .iter()
+        .zip(read2_paths.iter())
+        .map(|(a, b)| vec![a.clone(), b.clone()])
+        .collect();
+
+    // Ask the geometry which file carries mappable sequence rather than
+    let decision = crate::io::calibrate::choose_decoder(&groups, num_threads, decoder_pref);
+    #[cfg_attr(not(feature = "rapidgzip"), allow(unused_mut))]
+    let mut plan = crate::io::fastx::plan_thread_budget(
         num_threads,
-        index,
-        &opts,
-        strat,
+        read1_paths.len() * 2,
+        decision.parallel,
         decoder_pref,
-    ) {
-        // The measured verdict decides. It was previously discarded, on the
-        // record of an earlier rate-comparison probe that scored 4 of 8; that
-        // probe was replaced by `probe_starvation` and the guard was never
-        // revisited, so a better measurement sat behind a worse one's excuse
-        // while still costing its 150 ms. See `calibrate::probe_starvation` for
-        // the record that justifies acting on it.
-        if !decision.parallel {
-            plan.parallel_gzip = false;
-            plan.decode_budget = 0;
-            plan.per_file_ceiling = 0;
-            plan.initial_per_file = 0;
-        } else if let crate::io::calibrate::DecoderPreference::Parallel {
-            workers_per_file: Some(w),
-        } = decoder_pref
-        {
-            // An explicit worker count is a ceiling *and* a starting point:
-            // someone naming a number wants it used, not ratcheted up to.
-            plan.parallel_gzip = true;
-            plan.per_file_ceiling = w;
-            plan.initial_per_file = w;
-            plan.decode_budget = w.saturating_mul(read1_paths.len() * 2).max(1);
-        }
+    )?;
+    if plan.adaptive() {
+        // Real scRNA and Flex normal-tier runs settle near one quarter of the
+        // budget: 2/8, 8--9/32, and 13--16/64. Their generic mapping-biased
+        // one-eighth opening therefore spends about two seconds growing into a
+        // split already known to be safe. This call-site opening removes that
+        // bounded startup tax without changing bulk modalities or fixed pins.
+        plan.decode_slots = scrna_initial_decode_slots(plan.effective_budget);
+        plan.map_threads = plan.effective_budget - plan.decode_slots;
     }
 
-    let mut pairs = Vec::with_capacity(read1_paths.len());
-    // Only exists on the rapidgzip path; without it there is nothing to
-    // supervise and the type would be uninferable.
+    // One pool for the whole run, sized to the entire budget: `workers` is an
+    // immutable maximum and a refused `set_worker_limit` would silently desync
+    // the broker's accounting from the pool's.
+    #[cfg(feature = "rapidgzip")]
+    let decode_pool = if plan.parallel_gzip() {
+        Some(
+            rapidgzip_core::DecoderPool::builder()
+                .workers(plan.effective_budget)
+                .initial_worker_limit(plan.decode_slots)
+                .build()
+                .map_err(|e| anyhow::anyhow!("could not create decoder pool: {e}"))?,
+        )
+    } else {
+        None
+    };
+
     #[cfg(feature = "rapidgzip")]
     let mut handles: Vec<rapidgzip_core::DecoderHandle> = Vec::new();
+    let mut pairs = Vec::with_capacity(read1_paths.len());
     for (r1_path, r2_path) in read1_paths.iter().zip(read2_paths.iter()) {
-        let o1 = crate::io::fastx::open_input(r1_path, plan.per_file_ceiling, plan.initial_per_file)?;
-        let o2 = crate::io::fastx::open_input(r2_path, plan.per_file_ceiling, plan.initial_per_file)?;
+        #[cfg(feature = "rapidgzip")]
+        let (o1, o2) = (
+            crate::io::fastx::open_input_pooled(
+                r1_path,
+                decode_pool.as_ref(),
+                plan.effective_budget,
+            )?,
+            crate::io::fastx::open_input_pooled(
+                r2_path,
+                decode_pool.as_ref(),
+                plan.effective_budget,
+            )?,
+        );
+        #[cfg(not(feature = "rapidgzip"))]
+        let (o1, o2) = (
+            crate::io::fastx::open_input(r1_path, 0)?,
+            crate::io::fastx::open_input(r2_path, 0)?,
+        );
         #[cfg(feature = "rapidgzip")]
         handles.extend([o1.handle.clone(), o2.handle.clone()].into_iter().flatten());
         let r1 = reader_with_batch_size(o1.reader)
@@ -635,38 +543,170 @@ where
         pairs.push((r1, r2));
     }
 
-    // Supervise the decoders under one shared budget. Upstream adapts within a
-    // decoder; this bounds the sum across them, which is the part it does not do.
-    #[cfg(feature = "rapidgzip")]
-    let budget = crate::io::decode_budget::DecodeBudget::spawn(handles, plan.decode_budget);
-
     let mut readers = Vec::with_capacity(pairs.len() * 2);
     for (r1, r2) in pairs {
         readers.push(r1);
         readers.push(r2);
     }
+
+    #[cfg(feature = "rapidgzip")]
+    {
+        plan.reconcile_parallel_decoders(handles.len());
+        if plan.parallel_gzip()
+            && let Some(pool) = &decode_pool
+        {
+            pool.set_worker_limit(plan.decode_slots)
+                .map_err(|e| anyhow::anyhow!("could not apply decoder execution plan: {e}"))?;
+        }
+    }
+
+    tracing::info!(
+        requested_budget = plan.requested_budget,
+        effective_budget = plan.effective_budget,
+        mapping_threads = plan.map_threads,
+        decode_slots = plan.decode_slots,
+        allocation = ?plan.allocation,
+        "thread execution plan"
+    );
+
+    // The mapping side, resizable for the same reason.
+    let map_pool = paraseq::parallel::ThreadPool::with_max(plan.map_threads, plan.effective_budget);
+    #[cfg(feature = "rapidgzip")]
+    let consumer_floor =
+        crate::io::fastx::collection_share_floor(readers.len(), 2, plan.map_threads);
+
+    #[cfg(feature = "rapidgzip")]
+    let broker = match (&decode_pool, plan.adaptive()) {
+        (Some(pool), true) => {
+            match crate::io::broker::DecodeProducer::new(pool.clone(), handles.clone()) {
+                Ok(producer) => {
+                    let built = thread_broker::ThreadBroker::builder_with(
+                        crate::io::broker::MappingConsumer::new(map_pool.clone(), stats),
+                        producer,
+                        crate::io::broker::broker_config_from_environment(
+                            crate::io::fastx::broker_config_for_budget(plan.effective_budget),
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("invalid thread broker probe interval: {e}")
+                        })?,
+                    )
+                    .budget(plan.effective_budget)
+                    .initial_producer_slots(plan.decode_slots)
+                    .min_consumer_threads(consumer_floor)
+                    .steady_state_policy(
+                        crate::io::broker::broker_policy_from_environment()
+                            .map_err(|e| anyhow::anyhow!("invalid thread broker policy: {e}"))?,
+                    )
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("invalid thread broker configuration: {e}"))?;
+                    crate::io::broker::AdvisoryBroker::start(
+                        built,
+                        plan.map_threads,
+                        plan.decode_slots,
+                    )
+                }
+                Err(error) => crate::io::broker::AdvisoryBroker::failed(
+                    crate::io::broker::BrokerFailureStage::ProducerMeasurementStartup,
+                    error,
+                    plan.map_threads,
+                    plan.decode_slots,
+                ),
+            }
+        }
+        _ => crate::io::broker::AdvisoryBroker::disabled(),
+    };
+
+    #[cfg(feature = "rapidgzip")]
+    let fixed_decode_measurement = crate::io::broker::FixedDecodeMeasurement::from_environment(
+        handles.clone(),
+        plan.adaptive(),
+    )
+    .map_err(|e| anyhow::anyhow!("invalid fixed decode measurement control: {e}"))?;
+
+    let measurement_at_start = stats.measurement_snapshot();
+    let wall_start = std::time::Instant::now();
+
     let collection = Collection::new(readers, CollectionType::Paired)
         .map_err(|e| anyhow::anyhow!("failed to create collection: {}", e))?;
     let result = collection
-        .process_parallel_paired(&mut processor, num_threads, None)
+        .process_parallel_paired_pool(&mut processor, &map_pool, None)
         .map_err(|e| anyhow::anyhow!("mapping failed: {}", e));
+    let mapping_elapsed = wall_start.elapsed();
+    let consumer_measurement =
+        stats.log_measurement(measurement_at_start, mapping_elapsed, plan.effective_budget);
 
     #[cfg(feature = "rapidgzip")]
-    if let Some(budget) = budget {
-        let report = budget.finish();
-        tracing::info!(
-            "decoder threads: peak {} worker + {} auxiliary (budget {}, unused {}); \
-             peak busy {}; calibration settled at {:?}",
-            report.peak_worker_threads,
-            report.peak_auxiliary_threads,
-            plan.decode_budget,
-            report.unused_budget,
-            report.peak_busy_workers,
-            report.converged_workers,
-        );
-    }
+    let fixed_producer_measurement =
+        fixed_decode_measurement.map(crate::io::broker::FixedDecodeMeasurement::finish);
 
-    result
+    #[cfg(feature = "rapidgzip")]
+    let mut broker_diagnostics = broker.finish();
+    #[cfg(feature = "rapidgzip")]
+    if let Some(r) = &mut broker_diagnostics.report {
+        if let Some(measurement) = &mut r.producer_measurement {
+            crate::io::broker::refresh_measurement_cpu(measurement, &handles);
+        }
+        tracing::info!(
+            "thread broker: settled at {} mapping / {} decode of {} \
+             ({} moves, {} reverts, {} resurveys, converged {}, {:?} to settle)",
+            r.final_consumer_threads,
+            r.final_producer_limit,
+            plan.effective_budget,
+            r.moves,
+            r.reverts,
+            r.resurveys,
+            r.converged(),
+            r.time_to_converge,
+        );
+        // The measured decode share of total per-read cost, which is what the
+        // split is solved from. Worth logging on its own: if a split looks
+        // wrong, this says whether the model was misinformed or merely
+        // overruled by the cap.
+        if let Some(m) = r.final_model {
+            tracing::info!(
+                "thread broker: decode is {:.0}% of per-read cost -> wanted {} slots, \
+                 usable ceiling {}",
+                m.producer_cost_share * 100.0,
+                m.ideal_producer_slots,
+                if m.useful_cap == usize::MAX {
+                    "none".to_string()
+                } else {
+                    m.useful_cap.to_string()
+                },
+            );
+        }
+    }
+    #[cfg(feature = "rapidgzip")]
+    let broker_report = broker_diagnostics.report;
+    #[cfg(feature = "rapidgzip")]
+    let broker_failure = broker_diagnostics.failure;
+    #[cfg(not(feature = "rapidgzip"))]
+    let broker_report = None;
+    #[cfg(not(feature = "rapidgzip"))]
+    let broker_failure = None;
+
+    #[cfg(feature = "rapidgzip")]
+    let producer_measurement = broker_report
+        .as_ref()
+        .and_then(|report| report.producer_measurement)
+        .or(fixed_producer_measurement);
+    #[cfg(not(feature = "rapidgzip"))]
+    let producer_measurement = None;
+
+    result?;
+    Ok(crate::io::fastx::PipelineOutcome {
+        execution_plan: plan,
+        broker_report,
+        broker_failure,
+        producer_measurement,
+        consumer_measurement,
+        tuning: None,
+        mapping_elapsed_secs: mapping_elapsed.as_secs_f64(),
+    })
+}
+
+fn scrna_initial_decode_slots(budget: usize) -> usize {
+    (budget / 4).clamp(1, budget.saturating_sub(1).max(1))
 }
 
 /// Compute the mode (most frequent value) of a u32 slice.
@@ -680,4 +720,17 @@ fn compute_mode(values: &[u32]) -> u32 {
         .max_by_key(|&(_, count)| count)
         .map(|(val, _)| val)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scrna_initial_decode_slots;
+
+    #[test]
+    fn adaptive_single_cell_opening_tracks_measured_quarter_budget() {
+        assert_eq!(scrna_initial_decode_slots(2), 1);
+        assert_eq!(scrna_initial_decode_slots(8), 2);
+        assert_eq!(scrna_initial_decode_slots(32), 8);
+        assert_eq!(scrna_initial_decode_slots(64), 16);
+    }
 }

@@ -9,8 +9,7 @@
 //! 5. Optionally applies EC-based ambiguous hit filtering
 //! 6. Produces the final accepted hit list
 
-
-use crate::hash::{fixed_map, FixedMap};
+use crate::hash::{FixedMap, fixed_map};
 use sshash_lib::{Kmer, KmerBits, KmerDictionary};
 
 use crate::index::contig_table::ContigTableLike;

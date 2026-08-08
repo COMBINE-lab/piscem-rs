@@ -168,7 +168,7 @@ pub struct RecordComparisonSummary {
 /// Each alignment is represented as a tuple of (ref_id, orientation, pos, frag_len)
 /// and sorted for deterministic comparison.
 #[cfg(any(test, feature = "parity-test"))]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CanonicalBulkRecord {
     pub frag_type: u8,
     pub alignments: Vec<(u32, u8, u32, u16)>, // (ref_id, ori, pos, frag_len)
@@ -548,7 +548,7 @@ fn classify_detail_diff(a: &CanonicalBulkRecord, b: &CanonicalBulkRecord) -> &'s
 ///
 /// Each alignment is (ref_id, direction). Sorted for deterministic comparison.
 #[cfg(any(test, feature = "parity-test"))]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CanonicalScRecord {
     pub bc: u64,
     pub umi: u64,
@@ -625,6 +625,184 @@ pub fn read_sc_rad_records(
     }
 
     Ok((prelude, all_records))
+}
+
+/// A multi-barcode single-cell record (for example, 10x Flex).
+#[cfg(any(test, feature = "parity-test"))]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CanonicalScMultiRecord {
+    pub barcodes: Vec<u64>,
+    pub umi: u64,
+    pub alignments: Vec<(u32, bool, Option<u32>)>,
+}
+
+/// Header metadata needed to parse multi-barcode SC records.
+#[cfg(any(test, feature = "parity-test"))]
+#[derive(Debug)]
+pub struct ScMultiRadHeader {
+    pub is_paired: bool,
+    pub num_refs: u64,
+    pub ref_names: Vec<String>,
+    pub num_chunks: u64,
+    read_tags: Vec<(String, u8)>,
+    with_position: bool,
+}
+
+/// Read a multi-barcode SC RAD header without assuming the single `b` tag
+/// required by libradicl's `AlevinFryRecordContext`.
+#[cfg(any(test, feature = "parity-test"))]
+fn read_sc_multi_rad_header<R: Read>(reader: &mut R) -> Result<ScMultiRadHeader> {
+    let mut buf1 = [0u8; 1];
+    let mut buf2 = [0u8; 2];
+    let mut buf8 = [0u8; 8];
+    reader.read_exact(&mut buf1).context("reading is_paired")?;
+    let is_paired = buf1[0] != 0;
+    reader.read_exact(&mut buf8).context("reading num_refs")?;
+    let num_refs = u64::from_le_bytes(buf8);
+    let mut ref_names = Vec::with_capacity(num_refs as usize);
+    for _ in 0..num_refs {
+        reader
+            .read_exact(&mut buf2)
+            .context("reading ref name length")?;
+        let name_len = u16::from_le_bytes(buf2) as usize;
+        let mut name = vec![0u8; name_len];
+        reader.read_exact(&mut name).context("reading ref name")?;
+        ref_names.push(String::from_utf8_lossy(&name).to_string());
+    }
+    reader.read_exact(&mut buf8).context("reading num_chunks")?;
+    let num_chunks = u64::from_le_bytes(buf8);
+
+    reader
+        .read_exact(&mut buf2)
+        .context("reading num_file_tags")?;
+    let mut file_tags = Vec::new();
+    for _ in 0..u16::from_le_bytes(buf2) {
+        file_tags.push(read_tag_desc(reader)?);
+    }
+
+    reader
+        .read_exact(&mut buf2)
+        .context("reading num_read_tags")?;
+    let mut read_tags = Vec::new();
+    for _ in 0..u16::from_le_bytes(buf2) {
+        read_tags.push(read_tag_desc(reader)?);
+    }
+    if !read_tags.iter().any(|(name, _)| name == "u") {
+        anyhow::bail!("multi-barcode SC RAD has no UMI tag");
+    }
+
+    reader
+        .read_exact(&mut buf2)
+        .context("reading num_aln_tags")?;
+    let mut with_position = false;
+    for _ in 0..u16::from_le_bytes(buf2) {
+        let (name, _) = read_tag_desc(reader)?;
+        with_position |= name == "pos";
+    }
+    for (_, type_id) in file_tags {
+        skip_tag_value(reader, type_id)?;
+    }
+
+    Ok(ScMultiRadHeader {
+        is_paired,
+        num_refs,
+        ref_names,
+        num_chunks,
+        read_tags,
+        with_position,
+    })
+}
+
+#[cfg(any(test, feature = "parity-test"))]
+fn read_rad_integer<R: Read>(reader: &mut R, type_id: u8) -> Result<u64> {
+    match type_id {
+        3 => {
+            let mut bytes = [0u8; 4];
+            reader.read_exact(&mut bytes)?;
+            Ok(u32::from_le_bytes(bytes) as u64)
+        }
+        4 => {
+            let mut bytes = [0u8; 8];
+            reader.read_exact(&mut bytes)?;
+            Ok(u64::from_le_bytes(bytes))
+        }
+        other => anyhow::bail!("SC read tag has unsupported integer type {other}"),
+    }
+}
+
+/// Read all multi-barcode SC RAD records into an order-independent canonical
+/// representation. Barcode components remain separate; concatenating packed
+/// values would make different barcode geometries collide.
+#[cfg(any(test, feature = "parity-test"))]
+pub fn read_sc_multi_rad_records(
+    path: &Path,
+) -> Result<(ScMultiRadHeader, Vec<CanonicalScMultiRecord>)> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let header = read_sc_multi_rad_header(&mut reader)?;
+    let known_chunks = header.num_chunks > 0;
+    let mut chunks_read = 0u64;
+    let mut records = Vec::new();
+
+    loop {
+        if known_chunks && chunks_read >= header.num_chunks {
+            break;
+        }
+        let mut bytes4 = [0u8; 4];
+        match reader.read_exact(&mut bytes4) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error).context("reading SC chunk size"),
+        }
+        let chunk_bytes = u32::from_le_bytes(bytes4) as usize;
+        reader
+            .read_exact(&mut bytes4)
+            .context("reading SC chunk record count")?;
+        let record_count = u32::from_le_bytes(bytes4);
+        let mut data = vec![0u8; chunk_bytes.saturating_sub(8)];
+        reader.read_exact(&mut data).context("reading SC chunk")?;
+        let mut cursor = std::io::Cursor::new(data);
+
+        for _ in 0..record_count {
+            cursor.read_exact(&mut bytes4)?;
+            let alignment_count = u32::from_le_bytes(bytes4);
+            let mut barcodes = Vec::with_capacity(header.read_tags.len().saturating_sub(1));
+            let mut umi = None;
+            for (name, type_id) in &header.read_tags {
+                let value = read_rad_integer(&mut cursor, *type_id)?;
+                if name == "u" {
+                    umi = Some(value);
+                } else {
+                    barcodes.push(value);
+                }
+            }
+
+            let mut alignments = Vec::with_capacity(alignment_count as usize);
+            for _ in 0..alignment_count {
+                cursor.read_exact(&mut bytes4)?;
+                let compressed = u32::from_le_bytes(bytes4);
+                let reference = compressed & 0x7fff_ffff;
+                let forward = compressed & 0x8000_0000 != 0;
+                let position = if header.with_position {
+                    cursor.read_exact(&mut bytes4)?;
+                    Some(u32::from_le_bytes(bytes4))
+                } else {
+                    None
+                };
+                alignments.push((reference, forward, position));
+            }
+            if alignment_count > 0 {
+                alignments.sort_unstable();
+                records.push(CanonicalScMultiRecord {
+                    barcodes,
+                    umi: umi.context("SC record has no UMI value")?,
+                    alignments,
+                });
+            }
+        }
+        chunks_read += 1;
+    }
+    Ok((header, records))
 }
 
 /// Compare two SC RAD files at the record level using multiset comparison.
@@ -785,7 +963,7 @@ fn translate_sc_record(rec: &CanonicalScRecord, id_map: &[u32]) -> CanonicalScRe
 /// Each alignment is (ref_id, type_code, start_pos, frag_len).
 /// Sorted for deterministic comparison.
 #[cfg(any(test, feature = "parity-test"))]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CanonicalAtacRecord {
     pub bc: u64,
     pub alignments: Vec<(u32, u8, u32, u16)>, // (ref_id, type, start_pos, frag_len)

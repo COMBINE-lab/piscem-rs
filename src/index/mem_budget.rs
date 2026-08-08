@@ -109,7 +109,11 @@ fn cgroup_limit_bytes() -> Option<u64> {
         }
         let v: u64 = s.parse().ok()?;
         // cgroup v1 spells "unlimited" as a huge sentinel rather than a word.
-        if v >= i64::MAX as u64 / 2 { None } else { Some(v) }
+        if v >= i64::MAX as u64 / 2 {
+            None
+        } else {
+            Some(v)
+        }
     }
 
     /// Minimum limit over `dir` and every ancestor up to `root`.
@@ -122,7 +126,10 @@ fn cgroup_limit_bytes() -> Option<u64> {
     fn min_along_chain(root: &str, mut dir: PathBuf, file: &str) -> Option<u64> {
         let mut best: Option<u64> = None;
         loop {
-            if let Some(v) = fs::read_to_string(dir.join(file)).ok().and_then(|s| parse(&s)) {
+            if let Some(v) = fs::read_to_string(dir.join(file))
+                .ok()
+                .and_then(|s| parse(&s))
+            {
                 best = Some(best.map_or(v, |b: u64| b.min(v)));
             }
             if dir.as_os_str() == root || !dir.pop() {
@@ -282,10 +289,7 @@ mod tests {
     fn budget_never_exceeds_usable_memory() {
         if let Some(usable) = usable_memory_bytes() {
             let budget = resolve_ram_limit_gib(None) as u64 * BYTES_PER_GIB;
-            assert!(
-                budget <= usable,
-                "budget {budget} exceeds usable {usable}"
-            );
+            assert!(budget <= usable, "budget {budget} exceeds usable {usable}");
         }
     }
 

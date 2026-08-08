@@ -11,7 +11,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
-use crate::hash::{fixed_map, FixedMap};
+use crate::hash::{FixedMap, fixed_map};
 use indicatif::ProgressBar;
 use paraseq::Record;
 use paraseq::parallel::{MultiParallelProcessor, PairedParallelProcessor, ParallelProcessor};
@@ -49,6 +49,17 @@ use crate::mapping::unitig_end_cache::UnitigEndCache;
 
 /// Maximum mapped reads per RAD chunk before flushing (matches C++ max_chunk_reads).
 const MAX_CHUNK_READS: u32 = 5000;
+
+/// Default scATAC progress-publication granularity for broker measurements.
+///
+/// scATAC records are substantially more expensive than bulk/scRNA records, so
+/// the general 256-record default can span several 25 ms controller windows and
+/// quantize measured throughput into zero/256-record bursts. Thirty-two records
+/// keeps publication at roughly one controller window even at the slow split
+/// observed in the real response curve. The value is resolved once per
+/// processor and remains configurable through a validation-only environment
+/// hook so its overhead can be measured against 256 in the same binary.
+pub(crate) const SCATAC_PROGRESS_FLUSH_EVERY: u64 = 64;
 
 // ===========================================================================
 // MappingOpts
@@ -329,6 +340,8 @@ where
             Item = (paraseq::fastx::RefRecord<'r>, paraseq::fastx::RefRecord<'r>),
         >,
     ) -> paraseq::Result<()> {
+        let callback_started = std::time::Instant::now();
+        let mut busy = self.stats.busy.timer();
         let index = self.index;
         let end_cache = self.end_cache;
         let strat = self.strat;
@@ -336,11 +349,20 @@ where
             .state
             .get_or_insert_with(|| CommonThreadState::new(index, end_cache, &self.opts));
         s.ensure_chunk_started();
+        self.stats
+            .components
+            .add_callback_setup(callback_started.elapsed());
 
+        // Times the mapping work itself, for the thread broker. Published every
+        // few hundred reads rather than once per batch: a 16384-record batch
+        // takes far longer than one sampling window, so a per-batch counter
+        // would leave windows reading zero work -- reporting maximum starvation
+        // for a thread mapping flat out. See `thread_broker::BusyMeter`.
         let mut batch_reads: u64 = 0;
         for (rec1, rec2) in record_pairs {
             s.local_reads += 1;
             batch_reads += 1;
+            busy.tick();
             let seq1 = rec1.seq();
             let seq2 = rec2.seq();
 
@@ -378,20 +400,24 @@ where
     }
 
     fn on_batch_complete(&mut self) -> paraseq::Result<()> {
+        let started = std::time::Instant::now();
         let output = self.output;
         if let Some(s) = &mut self.state {
             s.maybe_flush_chunk(output);
         }
+        self.stats.components.add_output_flush(started.elapsed());
         Ok(())
     }
 
     fn on_thread_complete(&mut self) -> paraseq::Result<()> {
+        let started = std::time::Instant::now();
         let output = self.output;
         let stats = self.stats;
         if let Some(s) = &mut self.state {
             s.finalize_chunk(output);
             s.flush_stats(stats);
         }
+        self.stats.components.add_output_flush(started.elapsed());
         Ok(())
     }
 }
@@ -413,6 +439,8 @@ where
         &mut self,
         records: impl Iterator<Item = paraseq::fastx::RefRecord<'r>>,
     ) -> paraseq::Result<()> {
+        let callback_started = std::time::Instant::now();
+        let mut busy = self.stats.busy.timer();
         let index = self.index;
         let end_cache = self.end_cache;
         let strat = self.strat;
@@ -420,11 +448,20 @@ where
             .state
             .get_or_insert_with(|| CommonThreadState::new(index, end_cache, &self.opts));
         s.ensure_chunk_started();
+        self.stats
+            .components
+            .add_callback_setup(callback_started.elapsed());
 
+        // Times the mapping work itself, for the thread broker. Published every
+        // few hundred reads rather than once per batch: a 16384-record batch
+        // takes far longer than one sampling window, so a per-batch counter
+        // would leave windows reading zero work -- reporting maximum starvation
+        // for a thread mapping flat out. See `thread_broker::BusyMeter`.
         let mut batch_reads: u64 = 0;
         for rec in records {
             s.local_reads += 1;
             batch_reads += 1;
+            busy.tick();
             let seq1 = rec.seq();
 
             s.poison_state.paired_for_mapping = false;
@@ -458,20 +495,24 @@ where
     }
 
     fn on_batch_complete(&mut self) -> paraseq::Result<()> {
+        let started = std::time::Instant::now();
         let output = self.output;
         if let Some(s) = &mut self.state {
             s.maybe_flush_chunk(output);
         }
+        self.stats.components.add_output_flush(started.elapsed());
         Ok(())
     }
 
     fn on_thread_complete(&mut self) -> paraseq::Result<()> {
+        let started = std::time::Instant::now();
         let output = self.output;
         let stats = self.stats;
         if let Some(s) = &mut self.state {
             s.finalize_chunk(output);
             s.flush_stats(stats);
         }
+        self.stats.components.add_output_flush(started.elapsed());
         Ok(())
     }
 }
@@ -806,6 +847,8 @@ where
             Item = (paraseq::fastx::RefRecord<'r>, paraseq::fastx::RefRecord<'r>),
         >,
     ) -> paraseq::Result<()> {
+        let callback_started = std::time::Instant::now();
+        let mut busy = self.stats.busy.timer();
         let index = self.index;
         let end_cache = self.end_cache;
         let strat = self.strat;
@@ -845,11 +888,17 @@ where
             SmallVec::new()
         };
         let mut multi_bc_packed: SmallVec<[u64; 2]> = SmallVec::new();
+        self.stats
+            .components
+            .add_callback_setup(callback_started.elapsed());
 
+        // See the note on the other batch loops: published within the batch,
+        // not at its end.
         let mut batch_reads: u64 = 0;
         for (rec1, rec2) in record_pairs {
             s.local_reads += 1;
             batch_reads += 1;
+            busy.tick();
 
             let r1 = rec1.seq();
             let r2 = rec2.seq();
@@ -1104,14 +1153,17 @@ where
     }
 
     fn on_batch_complete(&mut self) -> paraseq::Result<()> {
+        let started = std::time::Instant::now();
         let output = self.output;
         if let Some(st) = &mut self.state {
             st.common.maybe_flush_chunk(output);
         }
+        self.stats.components.add_output_flush(started.elapsed());
         Ok(())
     }
 
     fn on_thread_complete(&mut self) -> paraseq::Result<()> {
+        let started = std::time::Instant::now();
         let output = self.output;
         let stats = self.stats;
         let with_position = self.with_position;
@@ -1132,6 +1184,7 @@ where
                 st.unmapped_bc_counts.flush_to(&mut *file);
             }
         }
+        self.stats.components.add_output_flush(started.elapsed());
         Ok(())
     }
 }
@@ -1176,6 +1229,7 @@ pub struct ScatacProcessor<
     min_overlap: i32,
     is_paired: bool,
     opts: MappingOpts,
+    progress_shard: crate::io::threads::BrokerProgressShard,
     state: Option<ScatacThreadState<'a, K, D, C>>,
 }
 
@@ -1210,6 +1264,7 @@ where
             min_overlap,
             is_paired,
             opts,
+            progress_shard: stats.register_broker_progress_shard(),
             state: None,
         }
     }
@@ -1232,6 +1287,7 @@ where
             min_overlap: self.min_overlap,
             is_paired: self.is_paired,
             opts: self.opts,
+            progress_shard: self.stats.register_broker_progress_shard(),
             state: None,
         }
     }
@@ -1255,6 +1311,19 @@ where
             Item = SmallVec<[paraseq::fastx::RefRecord<'r>; paraseq::MAX_ARITY]>,
         >,
     ) -> paraseq::Result<()> {
+        let callback_started = std::time::Instant::now();
+        let progress_every = self.stats.broker_progress_flush_every();
+        let mut busy = self
+            .stats
+            .busy
+            .timer()
+            .single_writer_progress_counter(self.progress_shard.counter())
+            .progress_every(progress_every)
+            // Fine progress is needed during scATAC calibration, but a clock
+            // read at the same cadence is not. Keep busy-time accounting at
+            // the generic cadence; u64::MAX also disables it for new callbacks
+            // after freeze convergence.
+            .time_every(progress_every.max(thread_broker::DEFAULT_FLUSH_EVERY));
         let index = self.index;
         let end_cache = self.end_cache;
         let binning = self.binning;
@@ -1269,11 +1338,24 @@ where
         });
         let s = &mut st.common;
         s.ensure_chunk_started();
+        self.stats
+            .components
+            .add_callback_setup(callback_started.elapsed());
 
+        // Times the mapping work itself, for the thread broker. Published every
+        // few dozen reads rather than once per batch: even the generic
+        // 256-record publication interval can exceed several controller windows
+        // for expensive scATAC records, while a 16384-record reader batch
+        // takes far longer than one sampling window, so a per-batch counter
+        // would leave windows reading zero work -- reporting maximum starvation
+        // for a thread mapping flat out. See `thread_broker::BusyMeter`.
         let mut batch_reads: u64 = 0;
         for multi in multi_records {
             s.local_reads += 1;
             batch_reads += 1;
+            // Throughput is completed records, not records merely started.
+            // The guard also covers every early `continue` below.
+            let _completed_item = busy.completed_item();
 
             if is_paired {
                 // PE mode: multi[0]=R1, multi[1]=barcode, multi[2]=R2
@@ -1455,14 +1537,17 @@ where
     }
 
     fn on_batch_complete(&mut self) -> paraseq::Result<()> {
+        let started = std::time::Instant::now();
         let output = self.output;
         if let Some(st) = &mut self.state {
             st.common.maybe_flush_chunk(output);
         }
+        self.stats.components.add_output_flush(started.elapsed());
         Ok(())
     }
 
     fn on_thread_complete(&mut self) -> paraseq::Result<()> {
+        let started = std::time::Instant::now();
         let output = self.output;
         let stats = self.stats;
         if let Some(st) = &mut self.state {
@@ -1482,6 +1567,7 @@ where
                 file.write_all(&buf).ok();
             }
         }
+        self.stats.components.add_output_flush(started.elapsed());
         Ok(())
     }
 }
