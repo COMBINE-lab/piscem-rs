@@ -1293,6 +1293,24 @@ impl Drop for BusySampler {
 
 #[cfg(feature = "rapidgzip")]
 impl DecodeProducer {
+    /// Attach to a decoder pool, preferring exact busy-time accounting.
+    ///
+    /// # The sampled branch is a measured-worse fallback, so it announces itself
+    ///
+    /// Reconstructing producer busy time by polling executing-worker counts was
+    /// the original design, and it was rejected: against exact event-time ground
+    /// truth it ran **17–313% off** on sparse, bursty and stored decoder paths,
+    /// no matter how the cadence was tuned. The controller solves the split from
+    /// the ratio of the two stages' busy times, so an error of that size is not a
+    /// noisy input — it is a different answer.
+    ///
+    /// Piscem cannot reach this branch: its `rapidgzip` feature always enables
+    /// `rapidgzip-core/busy-time-accounting`, so the exact counter is present
+    /// whenever the parallel decoder is. The branch exists for a consumer of this
+    /// adapter built against an upstream without that feature — and *that* is
+    /// exactly the case worth being loud about, because such a build would
+    /// otherwise run the controller on the measurements this project already
+    /// threw out, silently, and look identical in every log.
     pub fn new(
         pool: rapidgzip_core::DecoderPool,
         handles: Vec<rapidgzip_core::DecoderHandle>,
@@ -1300,6 +1318,13 @@ impl DecodeProducer {
         let busy = if accounted_busy_nanos(&handles).is_some() {
             DecodeBusyMeasurement::Native
         } else {
+            tracing::warn!(
+                "rapidgzip exposes no exact busy-time accounting, so decode cost is being \
+                 reconstructed by sampling. That path measured 17-313% off against event-time \
+                 ground truth on sparse, bursty and stored inputs, and the thread split is \
+                 derived from it. Build rapidgzip-core with `busy-time-accounting`, or pin the \
+                 decode split explicitly, rather than trusting the adaptive result."
+            );
             DecodeBusyMeasurement::Sampled(BusySampler::start(handles.clone())?)
         };
         Ok(Self {
