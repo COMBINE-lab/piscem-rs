@@ -24,6 +24,25 @@ pub const THREAD_BROKER_POLICY_ENV: &str = "PISCEM_THREAD_BROKER_POLICY";
 #[cfg(feature = "rapidgzip")]
 pub const THREAD_BROKER_PROBE_INTERVAL_ENV: &str = "PISCEM_THREAD_BROKER_PROBE_INTERVAL_MS";
 
+/// Same-binary validation hook for the active controller cadence.
+#[cfg(feature = "rapidgzip")]
+pub const THREAD_BROKER_SAMPLE_INTERVAL_ENV: &str = "PISCEM_THREAD_BROKER_SAMPLE_INTERVAL_MS";
+
+#[cfg(feature = "rapidgzip")]
+fn positive_millis(name: &str, value: &str) -> Result<u64, thread_broker::ResizeError> {
+    let millis = value.parse::<u64>().map_err(|_| {
+        thread_broker::ResizeError::new(format!(
+            "invalid {name}={value:?}; expected a positive integer number of milliseconds"
+        ))
+    })?;
+    if millis == 0 {
+        return Err(thread_broker::ResizeError::new(format!(
+            "invalid {name}=0; interval must be non-zero"
+        )));
+    }
+    Ok(millis)
+}
+
 #[cfg(feature = "rapidgzip")]
 pub fn broker_policy_from_environment()
 -> Result<thread_broker::SteadyStatePolicy, thread_broker::ResizeError> {
@@ -53,21 +72,170 @@ fn parse_broker_policy(
 pub fn broker_config_from_environment(
     mut config: thread_broker::BrokerConfig,
 ) -> Result<thread_broker::BrokerConfig, thread_broker::ResizeError> {
-    let Some(value) = std::env::var(THREAD_BROKER_PROBE_INTERVAL_ENV).ok() else {
-        return Ok(config);
-    };
-    let millis = value.parse::<u64>().map_err(|_| {
-        thread_broker::ResizeError::new(format!(
-            "invalid {THREAD_BROKER_PROBE_INTERVAL_ENV}={value:?}; expected a positive integer number of milliseconds"
-        ))
-    })?;
-    if millis == 0 {
-        return Err(thread_broker::ResizeError::new(format!(
-            "invalid {THREAD_BROKER_PROBE_INTERVAL_ENV}=0; interval must be non-zero"
-        )));
+    if let Ok(value) = std::env::var(THREAD_BROKER_PROBE_INTERVAL_ENV) {
+        let millis = positive_millis(THREAD_BROKER_PROBE_INTERVAL_ENV, &value)?;
+        config.steady_probe_interval = Some(std::time::Duration::from_millis(millis));
     }
-    config.steady_probe_interval = Some(std::time::Duration::from_millis(millis));
+    if let Ok(value) = std::env::var(THREAD_BROKER_SAMPLE_INTERVAL_ENV) {
+        let millis = positive_millis(THREAD_BROKER_SAMPLE_INTERVAL_ENV, &value)?;
+        config.sample_interval = std::time::Duration::from_millis(millis);
+        config.warmup = config.warmup.max(config.sample_interval.saturating_mul(2));
+    }
     Ok(config)
+}
+
+/// Where an advisory broker failure occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerFailureStage {
+    /// The producer's decision-quality measurement adapter could not start.
+    ProducerMeasurementStartup,
+    /// The initial split or controller thread could not be started.
+    ControllerStartup,
+    /// The running controller stopped before the application finished.
+    ControllerRuntime,
+}
+
+/// Machine-readable evidence that adaptation was unavailable or stopped early.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BrokerFailure {
+    pub stage: BrokerFailureStage,
+    pub message: String,
+}
+
+impl BrokerFailure {
+    #[cfg(feature = "rapidgzip")]
+    fn new(stage: BrokerFailureStage, error: impl std::fmt::Display) -> Self {
+        Self {
+            stage,
+            message: error.to_string(),
+        }
+    }
+}
+
+/// Final state of the advisory broker subsystem.
+pub struct BrokerDiagnostics {
+    pub report: Option<thread_broker::BrokerReport>,
+    pub failure: Option<BrokerFailure>,
+}
+
+/// A broker that may be absent because its advisory instrumentation failed.
+///
+/// # The broker must never be able to fail a run
+///
+/// Every [`thread_broker::BrokerErrorKind`] — a refused resize, a resize
+/// acknowledgement that timed out, a sampler that could not be spawned, a
+/// sampler that panicked — is a failure of *thread allocation*, not of mapping.
+/// The reads that were mapped were mapped correctly, and the split in force when
+/// the broker stopped stays in force, under budget, for the rest of the run. The
+/// only thing lost is further adaptation.
+///
+/// Propagating the error instead was worse than it looked. Mapping finishes, and
+/// then the `?` unwinds past the RAD chunk-count backpatch and past
+/// `write_map_info`. The placeholder written at header time is zero, so the run
+/// leaves behind a RAD file that parses cleanly and declares **no chunks at
+/// all** — an empty result from a job that actually succeeded, after all the
+/// expensive work was done.
+///
+/// That is not hypothetical. `ResizeTimedOut` fires when a shrink is not
+/// acknowledged within [`thread_broker::BrokerConfig::resize_timeout`], and the
+/// scATAC reader batch was cut from 16384 to 1024 records precisely because
+/// acknowledgement was not completing inside it. A slower disk, a larger batch
+/// or a loaded machine reaches the same timeout again.
+///
+/// So: warn loudly, retain the failure independently of any partial report, and
+/// let the mapping result decide the exit status. Configuration errors and
+/// explicitly requested validation instrumentation are different: those are
+/// checked before work starts and remain fatal.
+#[cfg(feature = "rapidgzip")]
+pub struct AdvisoryBroker {
+    running: Option<thread_broker::RunningBroker>,
+    startup_failure: Option<BrokerFailure>,
+}
+
+#[cfg(feature = "rapidgzip")]
+impl AdvisoryBroker {
+    pub fn disabled() -> Self {
+        Self {
+            running: None,
+            startup_failure: None,
+        }
+    }
+
+    pub fn failed(
+        stage: BrokerFailureStage,
+        error: impl std::fmt::Display,
+        planned_mapping_threads: usize,
+        planned_decode_slots: usize,
+    ) -> Self {
+        let failure = BrokerFailure::new(stage, error);
+        tracing::warn!(
+            stage = ?failure.stage,
+            error = %failure.message,
+            planned_mapping_threads,
+            planned_decode_slots,
+            "thread broker unavailable; mapping continues without adaptation at the current safe pool limits"
+        );
+        Self {
+            running: None,
+            startup_failure: Some(failure),
+        }
+    }
+
+    pub fn start<C, P>(
+        broker: thread_broker::ThreadBroker<C, P>,
+        planned_mapping_threads: usize,
+        planned_decode_slots: usize,
+    ) -> Self
+    where
+        C: thread_broker::Consumer + 'static,
+        P: thread_broker::Producer + 'static,
+    {
+        match broker.start() {
+            Ok(running) => Self {
+                running: Some(running),
+                startup_failure: None,
+            },
+            Err(error) => Self::failed(
+                BrokerFailureStage::ControllerStartup,
+                error,
+                planned_mapping_threads,
+                planned_decode_slots,
+            ),
+        }
+    }
+
+    pub fn finish(self) -> BrokerDiagnostics {
+        if let Some(failure) = self.startup_failure {
+            return BrokerDiagnostics {
+                report: None,
+                failure: Some(failure),
+            };
+        }
+        let Some(running) = self.running else {
+            return BrokerDiagnostics {
+                report: None,
+                failure: None,
+            };
+        };
+        match running.finish() {
+            Ok(report) => BrokerDiagnostics {
+                report: Some(report),
+                failure: None,
+            },
+            Err(error) => {
+                let failure = BrokerFailure::new(BrokerFailureStage::ControllerRuntime, &error);
+                tracing::warn!(
+                        error = %failure.message,
+                        "thread broker stopped early; mapping output is unaffected and the run continues without further adaptation"
+                );
+                BrokerDiagnostics {
+                    report: error.report().cloned(),
+                    failure: Some(failure),
+                }
+            }
+        }
+    }
 }
 
 /// The mapping side.
@@ -194,7 +362,15 @@ impl Consumer for MappingConsumer {
 pub struct DecodeProducer {
     pool: rapidgzip_core::DecoderPool,
     handles: Vec<rapidgzip_core::DecoderHandle>,
-    busy: BusySampler,
+    busy: DecodeBusyMeasurement,
+}
+
+#[cfg(feature = "rapidgzip")]
+enum DecodeBusyMeasurement {
+    /// Native cumulative event-time accounting; no polling thread exists.
+    Native,
+    /// Compatibility fallback for an older rapidgzip build.
+    Sampled(BusySampler),
 }
 
 /// Nominal high-resolution polling period, active only while the broker is
@@ -208,8 +384,31 @@ const CALIBRATION_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::fr
 #[cfg(feature = "rapidgzip")]
 const MONITORING_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// Turns instantaneous executing-worker counts into cumulative busy time on a
-/// phase-aware sampler.
+/// Validation-only destination for the sampled/exact producer busy-time trace.
+/// It is accepted only together with [`FIXED_DECODE_MEASUREMENT_ENV`] and an
+/// upstream `busy-time-accounting` build.
+#[cfg(feature = "rapidgzip")]
+pub const FIXED_DECODE_MEASUREMENT_TRACE_ENV: &str = "PISCEM_FIXED_DECODE_MEASUREMENT_TRACE";
+
+#[cfg(feature = "rapidgzip")]
+#[derive(Clone, Copy, serde::Serialize)]
+struct BusyTracePoint {
+    elapsed_nanos: u64,
+    sampled_busy_nanos: u64,
+    accounted_busy_nanos: u64,
+}
+
+#[cfg(feature = "rapidgzip")]
+#[derive(serde::Serialize)]
+struct BusyTrace {
+    calibration_interval_micros: u64,
+    monitoring_interval_micros: u64,
+    decoder_paths: Vec<String>,
+    points: Vec<BusyTracePoint>,
+}
+
+/// Compatibility and fixed-control adapter that turns instantaneous
+/// executing-worker counts into cumulative busy time.
 ///
 /// This deliberately sums the lock-free per-decoder `busy_workers` snapshots,
 /// not pool-permit occupancy. A rapidgzip worker can retain a permit across a
@@ -217,7 +416,8 @@ const MONITORING_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// conservatively exceed actual decode time. Per-decoder busy state changes at
 /// the CPU-region boundary the broker intends to measure.
 ///
-/// This remains a sampled estimate. A jittered cadence averaging three
+/// This remains a sampled estimate. Production builds with rapidgzip's native
+/// cumulative signal do not construct it. A jittered cadence averaging three
 /// milliseconds is used only while a decision is open; steady state polls every
 /// 25 ms by default and may poll more sparsely under an explicit low-frequency
 /// responsive policy. Both sample counts and time spent taking observations are
@@ -238,6 +438,7 @@ struct BusySampler {
     cpu_accounting_failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     calibration_interval: std::time::Duration,
     monitoring_interval_nanos: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    trace: Option<std::sync::Arc<std::sync::Mutex<Vec<BusyTracePoint>>>>,
     join: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -249,22 +450,61 @@ impl BusySampler {
     fn start(
         handles: Vec<rapidgzip_core::DecoderHandle>,
     ) -> Result<Self, thread_broker::ResizeError> {
-        Self::start_with(
+        Self::start_handles(handles, false)
+    }
+
+    fn start_traced(
+        handles: Vec<rapidgzip_core::DecoderHandle>,
+    ) -> Result<Self, thread_broker::ResizeError> {
+        Self::start_handles(handles, true)
+    }
+
+    fn start_handles(
+        handles: Vec<rapidgzip_core::DecoderHandle>,
+        trace: bool,
+    ) -> Result<Self, thread_broker::ResizeError> {
+        Self::start_with_observer(
             CALIBRATION_SAMPLE_INTERVAL,
             MONITORING_SAMPLE_INTERVAL,
+            trace,
             move || {
-                handles
-                    .iter()
-                    .map(|handle| handle.stats().busy_workers)
-                    .sum()
+                let mut busy = 0usize;
+                let mut accounted = Some(0u64);
+                for handle in &handles {
+                    let stats = handle.stats();
+                    busy = busy.saturating_add(stats.busy_workers);
+                    accounted =
+                        accounted
+                            .zip(stats.accounted_busy_time)
+                            .and_then(|(total, duration)| {
+                                let nanos = u64::try_from(duration.as_nanos()).ok()?;
+                                total.checked_add(nanos)
+                            });
+                }
+                (busy, accounted)
             },
         )
     }
 
+    #[cfg(test)]
     fn start_with(
         calibration_interval: std::time::Duration,
         monitoring_interval: std::time::Duration,
         busy_workers: impl Fn() -> usize + Send + 'static,
+    ) -> Result<Self, thread_broker::ResizeError> {
+        Self::start_with_observer(
+            calibration_interval,
+            monitoring_interval,
+            false,
+            move || (busy_workers(), None),
+        )
+    }
+
+    fn start_with_observer(
+        calibration_interval: std::time::Duration,
+        monitoring_interval: std::time::Duration,
+        record_trace: bool,
+        observe: impl Fn() -> (usize, Option<u64>) + Send + 'static,
     ) -> Result<Self, thread_broker::ResizeError> {
         use std::sync::atomic::Ordering;
 
@@ -281,6 +521,8 @@ impl BusySampler {
         let monitoring_interval_nanos = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
             monitoring_interval.as_nanos() as u64,
         ));
+        let trace = record_trace
+            .then(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::<BusyTracePoint>::new())));
         let thread_nanos = std::sync::Arc::clone(&nanos);
         let thread_stop = std::sync::Arc::clone(&stop);
         let thread_mode = std::sync::Arc::clone(&mode);
@@ -291,18 +533,30 @@ impl BusySampler {
         let thread_cpu_available = std::sync::Arc::clone(&cpu_available);
         let thread_cpu_accounting_failures = std::sync::Arc::clone(&cpu_accounting_failures);
         let thread_monitoring_interval_nanos = std::sync::Arc::clone(&monitoring_interval_nanos);
+        let thread_trace = trace.as_ref().map(std::sync::Arc::clone);
         let join = std::thread::Builder::new()
             .name("decode-busy-sampler".into())
             .spawn(move || {
                 let cpu_timer = thread_broker::ThreadCpuTimer::start();
                 let mut sampled_at = std::time::Instant::now();
+                let trace_started = sampled_at;
                 let observation_started = std::time::Instant::now();
-                let mut busy = busy_workers();
+                let (mut busy, initial_accounted) = observe();
                 let mut calibration_jitter_index = 0usize;
                 thread_observation_nanos.fetch_add(
                     observation_started.elapsed().as_nanos() as u64,
                     Ordering::Relaxed,
                 );
+                if let (Some(trace), Some(accounted_busy_nanos)) =
+                    (&thread_trace, initial_accounted)
+                    && let Ok(mut trace) = trace.lock()
+                {
+                    trace.push(BusyTracePoint {
+                        elapsed_nanos: 0,
+                        sampled_busy_nanos: 0,
+                        accounted_busy_nanos,
+                    });
+                }
                 loop {
                     let interval = if thread_mode.load(Ordering::Acquire) == Self::CALIBRATION {
                         // Mean multiplier is exactly one. The deliberately
@@ -320,15 +574,28 @@ impl BusySampler {
                     std::thread::park_timeout(interval);
                     let now = std::time::Instant::now();
                     let observation_started = std::time::Instant::now();
-                    let observed_busy = busy_workers();
+                    let (observed_busy, accounted_busy_nanos) = observe();
                     thread_observation_nanos.fetch_add(
                         observation_started.elapsed().as_nanos() as u64,
                         Ordering::Relaxed,
                     );
                     let elapsed = now.saturating_duration_since(sampled_at).as_nanos() as u64;
                     let endpoint_sum = busy.saturating_add(observed_busy) as u64;
-                    thread_nanos
-                        .fetch_add(elapsed.saturating_mul(endpoint_sum) / 2, Ordering::Relaxed);
+                    let increment = elapsed.saturating_mul(endpoint_sum) / 2;
+                    let sampled_busy_nanos = thread_nanos
+                        .fetch_add(increment, Ordering::Relaxed)
+                        .saturating_add(increment);
+                    if let (Some(trace), Some(accounted_busy_nanos)) =
+                        (&thread_trace, accounted_busy_nanos)
+                        && let Ok(mut trace) = trace.lock()
+                    {
+                        trace.push(BusyTracePoint {
+                            elapsed_nanos: now.saturating_duration_since(trace_started).as_nanos()
+                                as u64,
+                            sampled_busy_nanos,
+                            accounted_busy_nanos,
+                        });
+                    }
                     sampled_at = now;
                     busy = observed_busy;
                     if thread_mode.load(Ordering::Acquire) == Self::CALIBRATION {
@@ -367,6 +634,7 @@ impl BusySampler {
             cpu_accounting_failures,
             calibration_interval,
             monitoring_interval_nanos,
+            trace,
             join: std::sync::Mutex::new(Some(join)),
         })
     }
@@ -414,6 +682,7 @@ impl BusySampler {
 
         thread_broker::ProducerMeasurementStats {
             busy_nanos: self.nanos.load(Ordering::Relaxed),
+            accounted_busy_nanos: None,
             completed_worker_cpu_nanos: None,
             completed_auxiliary_cpu_nanos: None,
             cpu_accounting_failures: None,
@@ -437,6 +706,19 @@ impl BusySampler {
         }
     }
 
+    fn trace(&self, decoder_paths: Vec<String>) -> Option<BusyTrace> {
+        let points = self.trace.as_ref()?.lock().ok()?.clone();
+        Some(BusyTrace {
+            calibration_interval_micros: self.calibration_interval.as_micros() as u64,
+            monitoring_interval_micros: self
+                .monitoring_interval_nanos
+                .load(std::sync::atomic::Ordering::Acquire)
+                / 1_000,
+            decoder_paths,
+            points,
+        })
+    }
+
     fn stop_and_join(&self) {
         use std::sync::atomic::Ordering;
 
@@ -457,16 +739,18 @@ impl BusySampler {
 ///
 /// This is intentionally an environment-only validation hook rather than a
 /// user-facing scheduling control. With a pinned aggregate decode allocation,
-/// unset/`off` runs no sampler, `calibration` runs the high-resolution cadence,
-/// and `monitoring` runs the settled cadence. The mapping/decode allocation is
-/// identical in all three cases.
+/// unset/`off` emits no measurement, `native` snapshots the production exact
+/// counter without a sampler, `calibration` runs the compatibility
+/// high-resolution sampler, and `monitoring` runs its settled cadence. The
+/// mapping/decode allocation is identical in all cases.
 #[cfg(feature = "rapidgzip")]
 pub const FIXED_DECODE_MEASUREMENT_ENV: &str = "PISCEM_FIXED_DECODE_MEASUREMENT";
 
 #[cfg(feature = "rapidgzip")]
 pub struct FixedDecodeMeasurement {
-    sampler: BusySampler,
+    sampler: Option<BusySampler>,
     handles: Vec<rapidgzip_core::DecoderHandle>,
+    trace_path: Option<std::path::PathBuf>,
 }
 
 #[cfg(feature = "rapidgzip")]
@@ -476,9 +760,23 @@ impl FixedDecodeMeasurement {
         adaptive: bool,
     ) -> Result<Option<Self>, thread_broker::ResizeError> {
         let value = std::env::var(FIXED_DECODE_MEASUREMENT_ENV).ok();
-        let Some(mode) = parse_fixed_measurement_mode(value.as_deref())? else {
-            return Ok(None);
+        let native = value.as_deref() == Some("native");
+        let mode = if native {
+            None
+        } else {
+            parse_fixed_measurement_mode(value.as_deref())?
         };
+        let trace_path = std::env::var_os(FIXED_DECODE_MEASUREMENT_TRACE_ENV)
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from);
+        if !native && mode.is_none() {
+            if trace_path.is_some() {
+                return Err(thread_broker::ResizeError::new(format!(
+                    "{FIXED_DECODE_MEASUREMENT_TRACE_ENV} requires {FIXED_DECODE_MEASUREMENT_ENV}=calibration or monitoring"
+                )));
+            }
+            return Ok(None);
+        }
         if adaptive {
             return Err(thread_broker::ResizeError::new(format!(
                 "{FIXED_DECODE_MEASUREMENT_ENV} is a fixed-split overhead control and cannot be combined with adaptive decoding"
@@ -489,14 +787,71 @@ impl FixedDecodeMeasurement {
                 "{FIXED_DECODE_MEASUREMENT_ENV} requires at least one parallel decoder handle"
             )));
         }
-        let sampler = BusySampler::start(handles.clone())?;
-        sampler.set_mode(mode);
-        Ok(Some(Self { sampler, handles }))
+        if native {
+            if trace_path.is_some() {
+                return Err(thread_broker::ResizeError::new(format!(
+                    "{FIXED_DECODE_MEASUREMENT_TRACE_ENV} compares sampled and exact signals and cannot be combined with {FIXED_DECODE_MEASUREMENT_ENV}=native"
+                )));
+            }
+            if accounted_busy_nanos(&handles).is_none() {
+                return Err(thread_broker::ResizeError::new(format!(
+                    "{FIXED_DECODE_MEASUREMENT_ENV}=native requires rapidgzip exact busy-time accounting"
+                )));
+            }
+            return Ok(Some(Self {
+                sampler: None,
+                handles,
+                trace_path: None,
+            }));
+        }
+        if trace_path.is_some()
+            && handles
+                .iter()
+                .any(|handle| handle.stats().accounted_busy_time.is_none())
+        {
+            return Err(thread_broker::ResizeError::new(format!(
+                "{FIXED_DECODE_MEASUREMENT_TRACE_ENV} requires rapidgzip exact busy-time accounting"
+            )));
+        }
+        let sampler = if trace_path.is_some() {
+            BusySampler::start_traced(handles.clone())?
+        } else {
+            BusySampler::start(handles.clone())?
+        };
+        sampler.set_mode(mode.expect("non-native fixed measurement mode"));
+        Ok(Some(Self {
+            sampler: Some(sampler),
+            handles,
+            trace_path,
+        }))
     }
 
     pub fn finish(self) -> thread_broker::ProducerMeasurementStats {
-        self.sampler.stop_and_join();
-        measurement_stats_with_cpu(self.sampler.stats(), &self.handles)
+        let Some(sampler) = self.sampler else {
+            return native_measurement_stats(&self.handles);
+        };
+        sampler.stop_and_join();
+        if let Some(path) = &self.trace_path {
+            let decoder_paths = self
+                .handles
+                .iter()
+                .map(|handle| format!("{:?}", handle.stats().path))
+                .collect();
+            let result = sampler
+                .trace(decoder_paths)
+                .ok_or_else(|| "decode busy-time trace was unavailable".to_owned())
+                .and_then(|trace| {
+                    serde_json::to_vec_pretty(&trace)
+                        .map_err(|error| error.to_string())
+                        .and_then(|contents| {
+                            std::fs::write(path, contents).map_err(|error| error.to_string())
+                        })
+                });
+            if let Err(error) = result {
+                tracing::error!(path = %path.display(), %error, "could not write decode busy-time trace");
+            }
+        }
+        measurement_stats_with_cpu(sampler.stats(), &self.handles)
     }
 }
 
@@ -509,7 +864,34 @@ fn measurement_stats_with_cpu(
     measurement
 }
 
-/// Refresh lifetime CPU counters after mapping has ended.
+#[cfg(feature = "rapidgzip")]
+fn duration_sum(mut durations: impl Iterator<Item = Option<std::time::Duration>>) -> Option<u64> {
+    durations.try_fold(0u64, |total, duration| {
+        let nanos = u64::try_from(duration?.as_nanos()).ok()?;
+        total.checked_add(nanos)
+    })
+}
+
+#[cfg(feature = "rapidgzip")]
+fn accounted_busy_nanos(handles: &[rapidgzip_core::DecoderHandle]) -> Option<u64> {
+    duration_sum(
+        handles
+            .iter()
+            .map(|handle| handle.stats().accounted_busy_time),
+    )
+}
+
+#[cfg(feature = "rapidgzip")]
+fn native_measurement_stats(
+    handles: &[rapidgzip_core::DecoderHandle],
+) -> thread_broker::ProducerMeasurementStats {
+    let mut measurement = thread_broker::ProducerMeasurementStats::default();
+    refresh_measurement_cpu(&mut measurement, handles);
+    measurement.busy_nanos = measurement.accounted_busy_nanos.unwrap_or(0);
+    measurement
+}
+
+/// Refresh exact busy time and lifetime CPU counters after mapping has ended.
 ///
 /// A freeze-after-convergence broker intentionally releases its sampler early,
 /// so its report cannot yet contain CPU time from producer workers that finish
@@ -520,28 +902,16 @@ pub fn refresh_measurement_cpu(
     measurement: &mut thread_broker::ProducerMeasurementStats,
     handles: &[rapidgzip_core::DecoderHandle],
 ) {
-    fn duration_sum(
-        mut durations: impl Iterator<Item = Option<std::time::Duration>>,
-    ) -> Option<u64> {
-        durations.try_fold(0u64, |total, duration| {
-            let nanos = u64::try_from(duration?.as_nanos()).ok()?;
-            total.checked_add(nanos)
-        })
-    }
-
-    measurement.completed_worker_cpu_nanos = duration_sum(
-        handles
-            .iter()
-            .map(|handle| handle.stats().completed_worker_cpu_time),
-    );
-    measurement.completed_auxiliary_cpu_nanos = duration_sum(
-        handles
-            .iter()
-            .map(|handle| handle.stats().completed_auxiliary_cpu_time),
-    );
-    measurement.cpu_accounting_failures = handles
+    let stats: Vec<_> = handles.iter().map(|handle| handle.stats()).collect();
+    measurement.accounted_busy_nanos =
+        duration_sum(stats.iter().map(|stats| stats.accounted_busy_time));
+    measurement.completed_worker_cpu_nanos =
+        duration_sum(stats.iter().map(|stats| stats.completed_worker_cpu_time));
+    measurement.completed_auxiliary_cpu_nanos =
+        duration_sum(stats.iter().map(|stats| stats.completed_auxiliary_cpu_time));
+    measurement.cpu_accounting_failures = stats
         .iter()
-        .map(|handle| handle.stats().cpu_accounting_failures)
+        .map(|stats| stats.cpu_accounting_failures)
         .try_fold(0usize, |total, failures| total.checked_add(failures?));
 }
 
@@ -554,7 +924,7 @@ fn parse_fixed_measurement_mode(
         Some("calibration") => Ok(Some(thread_broker::ProducerMeasurementMode::Calibration)),
         Some("monitoring") => Ok(Some(thread_broker::ProducerMeasurementMode::Monitoring)),
         Some(value) => Err(thread_broker::ResizeError::new(format!(
-            "{FIXED_DECODE_MEASUREMENT_ENV} must be off, calibration, or monitoring, not {value:?}"
+            "{FIXED_DECODE_MEASUREMENT_ENV} must be off, native, calibration, or monitoring, not {value:?}"
         ))),
     }
 }
@@ -562,8 +932,9 @@ fn parse_fixed_measurement_mode(
 #[cfg(all(test, feature = "rapidgzip"))]
 mod busy_sampler_tests {
     use super::{
-        BusySampler, CALIBRATION_SAMPLE_INTERVAL, MONITORING_SAMPLE_INTERVAL, MappingConsumer,
-        parse_broker_policy, parse_fixed_measurement_mode,
+        AdvisoryBroker, BrokerFailureStage, BusySampler, CALIBRATION_SAMPLE_INTERVAL,
+        MONITORING_SAMPLE_INTERVAL, MappingConsumer, parse_broker_policy,
+        parse_fixed_measurement_mode, positive_millis,
     };
     use crate::io::threads::MappingStats;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -796,6 +1167,121 @@ mod busy_sampler_tests {
         );
         assert!(parse_broker_policy(Some("freeze")).is_err());
     }
+
+    #[test]
+    fn controller_interval_controls_require_positive_milliseconds() {
+        assert_eq!(positive_millis("TEST_INTERVAL", "73").unwrap(), 73);
+        assert!(positive_millis("TEST_INTERVAL", "0").is_err());
+        assert!(positive_millis("TEST_INTERVAL", "1.5").is_err());
+        assert!(positive_millis("TEST_INTERVAL", "nope").is_err());
+    }
+
+    struct RefusingConsumer;
+
+    impl thread_broker::Consumer for RefusingConsumer {
+        fn set_threads(&self, _n: usize) -> Result<(), thread_broker::ResizeError> {
+            Err(thread_broker::ResizeError::new("injected refusal"))
+        }
+
+        fn live_threads(&self) -> usize {
+            1
+        }
+
+        fn work(&self) -> thread_broker::Work {
+            thread_broker::Work::default()
+        }
+    }
+
+    struct StaticProducer;
+
+    impl thread_broker::Producer for StaticProducer {
+        fn set_limit(&self, _n: usize) -> Result<(), thread_broker::ResizeError> {
+            Ok(())
+        }
+
+        fn limit(&self) -> usize {
+            1
+        }
+
+        fn active_slots(&self) -> usize {
+            0
+        }
+
+        fn pressure(&self) -> thread_broker::ProducerPressure {
+            thread_broker::ProducerPressure::Satisfied
+        }
+
+        fn work(&self) -> thread_broker::Work {
+            thread_broker::Work::default()
+        }
+    }
+
+    struct PanickingConsumer;
+
+    impl thread_broker::Consumer for PanickingConsumer {
+        fn set_threads(&self, _n: usize) -> Result<(), thread_broker::ResizeError> {
+            Ok(())
+        }
+
+        fn live_threads(&self) -> usize {
+            1
+        }
+
+        fn work(&self) -> thread_broker::Work {
+            panic!("injected advisory controller panic")
+        }
+    }
+
+    #[test]
+    fn advisory_measurement_start_failure_is_retained() {
+        let diagnostics = AdvisoryBroker::failed(
+            BrokerFailureStage::ProducerMeasurementStartup,
+            thread_broker::ResizeError::new("injected sampler spawn failure"),
+            1,
+            1,
+        )
+        .finish();
+
+        assert!(diagnostics.report.is_none());
+        let failure = diagnostics.failure.expect("failure telemetry");
+        assert_eq!(
+            failure.stage,
+            BrokerFailureStage::ProducerMeasurementStartup
+        );
+        assert!(failure.message.contains("sampler spawn"));
+    }
+
+    #[test]
+    fn advisory_initial_resize_failure_is_retained_without_propagation() {
+        let built = thread_broker::ThreadBroker::builder(RefusingConsumer, StaticProducer)
+            .budget(2)
+            .initial_producer_slots(1)
+            .build()
+            .unwrap();
+        let diagnostics = AdvisoryBroker::start(built, 1, 1).finish();
+
+        assert!(diagnostics.report.is_none());
+        let failure = diagnostics.failure.expect("failure telemetry");
+        assert_eq!(failure.stage, BrokerFailureStage::ControllerStartup);
+        assert!(failure.message.contains("refused"));
+    }
+
+    #[test]
+    fn advisory_controller_panic_is_retained_without_propagation() {
+        let built = thread_broker::ThreadBroker::builder(PanickingConsumer, StaticProducer)
+            .budget(2)
+            .initial_producer_slots(1)
+            .build()
+            .unwrap();
+        let advisory = AdvisoryBroker::start(built, 1, 1);
+        std::thread::sleep(Duration::from_millis(10));
+        let diagnostics = advisory.finish();
+
+        assert!(diagnostics.report.is_none());
+        let failure = diagnostics.failure.expect("failure telemetry");
+        assert_eq!(failure.stage, BrokerFailureStage::ControllerRuntime);
+        assert!(failure.message.contains("panicked"));
+    }
 }
 
 #[cfg(feature = "rapidgzip")]
@@ -811,7 +1297,11 @@ impl DecodeProducer {
         pool: rapidgzip_core::DecoderPool,
         handles: Vec<rapidgzip_core::DecoderHandle>,
     ) -> Result<Self, thread_broker::ResizeError> {
-        let busy = BusySampler::start(handles.clone())?;
+        let busy = if accounted_busy_nanos(&handles).is_some() {
+            DecodeBusyMeasurement::Native
+        } else {
+            DecodeBusyMeasurement::Sampled(BusySampler::start(handles.clone())?)
+        };
         Ok(Self {
             busy,
             pool,
@@ -853,12 +1343,21 @@ impl Producer for DecodeProducer {
     }
 
     fn auxiliary_threads(&self) -> usize {
-        // rapidgzip coordinators/scanners plus this adapter's busy-time sampler.
-        self.pool.stats().auxiliary_threads.saturating_add(1)
+        // Native cumulative accounting needs no polling thread. Retain the
+        // compatibility allowance only for an older sampled adapter.
+        self.pool
+            .stats()
+            .auxiliary_threads
+            .saturating_add(usize::from(matches!(
+                &self.busy,
+                DecodeBusyMeasurement::Sampled(_)
+            )))
     }
 
     fn set_measurement_mode(&self, mode: thread_broker::ProducerMeasurementMode) {
-        self.busy.set_mode(mode);
+        if let DecodeBusyMeasurement::Sampled(busy) = &self.busy {
+            busy.set_mode(mode);
+        }
     }
 
     fn set_monitoring_interval(&self, interval: std::time::Duration) {
@@ -866,25 +1365,40 @@ impl Producer for DecodeProducer {
         // 25 ms already passed the measured <=1% steady-state overhead gate.
         // Longer responsive probe intervals can safely lower the observation
         // rate while retaining roughly four samples per controller window.
-        self.busy
-            .set_monitoring_interval(interval.max(MONITORING_SAMPLE_INTERVAL));
+        if let DecodeBusyMeasurement::Sampled(busy) = &self.busy {
+            busy.set_monitoring_interval(interval.max(MONITORING_SAMPLE_INTERVAL));
+        }
     }
 
     fn measurement_stats(&self) -> Option<thread_broker::ProducerMeasurementStats> {
-        Some(measurement_stats_with_cpu(self.busy.stats(), &self.handles))
+        Some(match &self.busy {
+            DecodeBusyMeasurement::Native => native_measurement_stats(&self.handles),
+            DecodeBusyMeasurement::Sampled(busy) => {
+                measurement_stats_with_cpu(busy.stats(), &self.handles)
+            }
+        })
     }
 
     fn finish_measurement(&self) -> Option<thread_broker::ProducerMeasurementStats> {
-        self.busy.stop_and_join();
-        Some(measurement_stats_with_cpu(self.busy.stats(), &self.handles))
+        Some(match &self.busy {
+            DecodeBusyMeasurement::Native => native_measurement_stats(&self.handles),
+            DecodeBusyMeasurement::Sampled(busy) => {
+                busy.stop_and_join();
+                measurement_stats_with_cpu(busy.stats(), &self.handles)
+            }
+        })
     }
 
     /// Decode time with blocking excluded, plus bytes as a progress measure.
     ///
-    /// Busy time is sampled independently of the broker's decision cadence; a
-    /// slow or irregular caller therefore cannot alias the estimate.
+    /// Busy time comes from rapidgzip's cumulative executing-region counter and
+    /// is therefore independent of the broker's decision cadence. The sampled
+    /// branch remains only as a compatibility fallback for an older upstream.
     fn work(&self) -> Work {
-        let busy_nanos = self.busy.nanos();
+        let busy_nanos = match &self.busy {
+            DecodeBusyMeasurement::Native => accounted_busy_nanos(&self.handles).unwrap_or(0),
+            DecodeBusyMeasurement::Sampled(busy) => busy.nanos(),
+        };
         // Only ever compared against itself over time, and never against the
         // consumer's count, so decompressed bytes are a perfectly good unit even
         // though the consumer counts reads.

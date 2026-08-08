@@ -24,12 +24,16 @@ requested and applied allocations are emitted in `map_info.json`.
 
 The broker reports final phase, requested and actual occupancy, empirical cap
 reason, uncertainty, bounded trajectories, rejection evidence, and consumer
-measurement components. Resize, timeout, and sampler failures now fail the
-mapping command instead of returning a successful zero/default report.
+measurement components. Configuration errors still fail before mapping starts.
+Runtime tuning failures (resize refusal/timeout, measurement startup, or broker
+panic) are advisory: they retain structured failure telemetry, leave the last
+valid under-budget split in force, and cannot suppress RAD finalization or mask
+the mapping result.
 
 Responsive mode offers an opt-in bounded nonlinear response fallback for
-workloads such as scATAC where adding mapping workers can reduce throughput;
-piscem enables it only for scATAC. scATAC uses a
+workloads such as scATAC where adding mapping workers can reduce throughput.
+Piscem enables that search for small-budget scATAC and exposes an application
+cap on the explored producer allocation. scATAC uses a
 64-record completed-progress publisher only during this decision phase and
 returns to the generic 256-record cadence after convergence. Busy-time clock
 reads remain at 256 records even during calibration. Progress is written to
@@ -43,10 +47,24 @@ fine-publication work once settled. Freeze-after-full-calibration first runs the
 bounded nonlinear/local search, then performs the same teardown; it is the
 appropriate freeze policy where the one-point model can miss the response
 curve.
-The adaptive scATAC opening is the midpoint rather than the generic
-mapping-biased split, providing a safe anchor for that response search without
-changing serial or pinned controls.
 
-Release remains blocked until the cumulative producer-measurement, full
-modality/oracle, overhead, and upstream-dependency gates in
-`THREAD-BROKER-AUDIT.md` pass.
+Measured on a crossover-balanced 14--20 second scATAC workload, direct
+controller-plus-sampler CPU was 4.965 ms for 25 ms responsive monitoring,
+1.408 ms for 5 s sparse-responsive monitoring, and 0.401 ms for model-only
+freeze. A later same-controller eight-pair comparison reduced median
+administrative CPU from 4.902 to 2.623 ms with sparse monitoring, while its
+mapping ratio versus 25 ms monitoring was 0.992 (upper-95 1.021). Model-only
+freeze was cheapest but chose a poor split on this non-monotone surface;
+full-calibration freeze instead stayed within 1.016 median/1.037 upper-95 of
+the oracle and used at most 2.582 ms of administrative CPU. Sparse-responsive
+is therefore the closest policy to the original low-overhead responsive design.
+Adaptive scATAC opens with four aggregate decoder slots, the stable region in
+the measured fixed-split surface. At larger budgets the ordinary cost model can
+still grow above four, but the optional nonlinear startup search is disabled
+because its noisy probes did not amortize. Serial and pinned controls are
+unchanged. scRNA and Flex use a measured quarter-budget opening.
+
+The exact cumulative rapidgzip signal is feature-gated upstream; its disabled
+build compiles the hot-path accounting out, and its enabled build passed the
+paired no-measurable-overhead gate. Release remains blocked on the unreleased
+dependency pins documented in the completion ledger.

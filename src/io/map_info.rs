@@ -24,8 +24,10 @@ pub struct MapInfoParams<'a> {
     /// decoder-handle reconciliation.
     pub execution_plan: Option<&'a crate::io::fastx::ExecutionPlan>,
     pub broker_report: Option<&'a thread_broker::BrokerReport>,
+    pub broker_failure: Option<&'a crate::io::broker::BrokerFailure>,
     pub producer_measurement: Option<&'a thread_broker::ProducerMeasurementStats>,
     pub consumer_measurement: Option<&'a crate::io::threads::ConsumerMeasurement>,
+    pub pipeline_tuning: Option<&'a crate::io::fastx::PipelineTuning>,
     pub index_path: &'a Path,
     pub k: usize,
     pub m: usize,
@@ -77,11 +79,17 @@ pub fn write_map_info(params: &MapInfoParams) -> Result<()> {
     if let Some(report) = params.broker_report {
         info["thread_broker"] = serde_json::to_value(report)?;
     }
+    if let Some(failure) = params.broker_failure {
+        info["thread_broker_failure"] = serde_json::to_value(failure)?;
+    }
     if let Some(measurement) = params.producer_measurement {
         info["producer_measurement"] = serde_json::to_value(measurement)?;
     }
     if let Some(measurement) = params.consumer_measurement {
         info["consumer_measurement"] = serde_json::to_value(measurement)?;
+    }
+    if let Some(tuning) = params.pipeline_tuning {
+        info["pipeline_tuning"] = serde_json::to_value(tuning)?;
     }
 
     let file = std::fs::File::create(params.path)?;
@@ -113,8 +121,10 @@ mod tests {
             num_threads: 8,
             execution_plan: None,
             broker_report: None,
+            broker_failure: None,
             producer_measurement: None,
             consumer_measurement: None,
+            pipeline_tuning: None,
             index_path: &index_path,
             k: 31,
             m: 19,
@@ -166,8 +176,10 @@ mod tests {
             num_threads: plan.effective_budget,
             execution_plan: Some(&plan),
             broker_report: None,
+            broker_failure: None,
             producer_measurement: None,
             consumer_measurement: None,
+            pipeline_tuning: None,
             index_path: &index_path,
             k: 31,
             m: 19,
@@ -213,6 +225,7 @@ mod tests {
         };
         let producer_measurement = thread_broker::ProducerMeasurementStats {
             busy_nanos: 17,
+            accounted_busy_nanos: Some(19),
             completed_worker_cpu_nanos: Some(13),
             completed_auxiliary_cpu_nanos: Some(4),
             cpu_accounting_failures: Some(0),
@@ -225,6 +238,14 @@ mod tests {
             observation_nanos: 7,
             calibration_interval_micros: 2_000,
             monitoring_interval_micros: 25_000,
+        };
+        let broker_failure = crate::io::broker::BrokerFailure {
+            stage: crate::io::broker::BrokerFailureStage::ControllerRuntime,
+            message: "injected resize timeout".to_string(),
+        };
+        let tuning = crate::io::fastx::PipelineTuning {
+            reader_batch_size: 1024,
+            progress_flush_every: 64,
         };
 
         write_map_info(&MapInfoParams {
@@ -240,8 +261,10 @@ mod tests {
             num_threads: 8,
             execution_plan: None,
             broker_report: Some(&report),
+            broker_failure: Some(&broker_failure),
             producer_measurement: Some(&producer_measurement),
             consumer_measurement: Some(&measurement),
+            pipeline_tuning: Some(&tuning),
             index_path: &index_path,
             k: 31,
             m: 19,
@@ -254,13 +277,24 @@ mod tests {
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(value["thread_broker"]["final_phase"], "steady");
         assert_eq!(
+            value["thread_broker_failure"]["stage"],
+            "controller_runtime"
+        );
+        assert_eq!(
+            value["thread_broker_failure"]["message"],
+            "injected resize timeout"
+        );
+        assert_eq!(
             value["thread_broker"]["final_model"]["useful_cap_reason"],
             "slack"
         );
         assert_eq!(value["consumer_measurement"]["busy_nanos"], 11);
         assert_eq!(value["producer_measurement"]["final_mode"], "monitoring");
         assert_eq!(value["producer_measurement"]["calibration_samples"], 5);
+        assert_eq!(value["producer_measurement"]["accounted_busy_nanos"], 19);
         assert_eq!(value["consumer_measurement"]["callback_setup_nanos"], 3);
         assert_eq!(value["consumer_measurement"]["output_flush_nanos"], 2);
+        assert_eq!(value["pipeline_tuning"]["reader_batch_size"], 1024);
+        assert_eq!(value["pipeline_tuning"]["progress_flush_every"], 64);
     }
 }

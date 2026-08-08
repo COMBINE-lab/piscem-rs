@@ -96,6 +96,45 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Minimum viable adoption
+//!
+//! A first integration does **not** need to tune every [`BrokerConfig`] field.
+//! The minimum contract is:
+//!
+//! 1. Define one real execution-slot budget shared by both pools. Construct the
+//!    pools so every permitted split obeys that budget, choose any valid opening
+//!    split, and set only `.budget(...)` plus real consumer/producer floors.
+//! 2. Implement cumulative [`Work`] counters on both adapters. Busy time must
+//!    exclude queue/source blocking; counters must be monotonic; progress must
+//!    publish often enough that ordinary decision windows are not empty.
+//! 3. Make resize acknowledgement truthful. [`Consumer::live_threads`] and
+//!    [`Producer::active_slots`] must continue to include work admitted before a
+//!    shrink until it actually retires. Batch geometry must let that happen
+//!    inside [`BrokerConfig::resize_timeout`].
+//! 4. Implement [`Producer::pressure`] as a directional classification, not a
+//!    desired thread count. If the producer has native cumulative busy time,
+//!    the measurement-mode and monitoring hooks can keep their defaults.
+//! 5. Keep broker lifecycle failure separate from application correctness. A
+//!    configuration error should fail before work starts; a runtime tuning
+//!    failure normally leaves the last valid split in force and should not make
+//!    successfully produced output disappear.
+//!
+//! Leave warm-up, sampling, smoothing, blackout, ratification, cap history,
+//! deadband, resurvey, and regression tolerance at their defaults initially.
+//! Likewise leave nonlinear probing off. Choose a [`SteadyStatePolicy`] only
+//! from the application's workload contract: responsive for possible regime
+//! changes, or a freeze policy for stable long runs where recurring work should
+//! become zero.
+//!
+//! Tune cadence or batch/progress granularity only after measurement shows a
+//! concrete failure: stale/empty decision windows, shrink acknowledgement near
+//! the timeout, poor oracle-gap/convergence results, or material overhead.
+//! Qualify a new adapter with canonical-output equality, a pinned-split sweep,
+//! source-bound and inelastic cases, a mid-run regime change, and both absolute
+//! administrative CPU and whole-process fractional overhead on representative
+//! long runs. That is the adopter boundary; modality-specific knobs belong in
+//! the application until repeated integrations demonstrate a generic policy.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -254,10 +293,14 @@ pub trait Producer: Send + Sync {
 
     /// Why the producer is or is not keeping up.
     ///
-    /// Used only to *veto* growth — see [`ProducerPressure::SourceBound`] and
-    /// [`ProducerPressure::Inelastic`]. It is deliberately not used to size the
-    /// split, because pressure signals saturate: they cannot distinguish "just
-    /// enough" from "far too much".
+    /// Used only as a directional guard; it never selects a target. Source-bound
+    /// or inelastic evidence may cap growth. A live [`ProducerPressure::Starved`]
+    /// signal may veto a model-requested shrink while the current limit is
+    /// demonstrably occupied, which protects against allocation-dependent cost
+    /// under-reporting. That exception can retain the current split but cannot
+    /// grow it or choose a larger one. Pressure signals are deliberately not
+    /// used to size the split because they saturate: they cannot distinguish
+    /// "just enough" from "far too much".
     fn pressure(&self) -> ProducerPressure;
 
     /// Cumulative work. See [`Work`].
@@ -306,11 +349,16 @@ pub enum SteadyStatePolicy {
     FreezeAfterFullCalibration,
 }
 
-/// Bounded diagnostics for producer-side busy-time sampling.
+/// Bounded diagnostics for producer-side busy-time measurement.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ProducerMeasurementStats {
-    /// Integrated sampled executing-worker time.
+    /// Cumulative executing-worker time used by the controller. This is exact
+    /// when `accounted_busy_nanos` is present and sampled otherwise.
     pub busy_nanos: u64,
+    /// Exact event-time executing-worker integral, when the producer supplies
+    /// one. Production adapters may use this as `busy_nanos`; retaining it here
+    /// makes the signal source and sampled-fallback diagnostics explicit.
+    pub accounted_busy_nanos: Option<u64>,
     /// CPU time from completed producer worker-thread lifetimes, when the
     /// adapter supports optional component accounting.
     pub completed_worker_cpu_nanos: Option<u64>,
@@ -355,11 +403,14 @@ impl ThreadCpuTimer {
 
 /// Whether more producer concurrency would buy anything.
 ///
-/// # This vetoes growth; it does not size the split
+/// # This guards direction; it does not size the split
 ///
-/// Only [`Self::SourceBound`] and [`Self::Inelastic`] change a decision, and only
-/// by capping how far the producer may grow. The other two are diagnostic. That
-/// restriction is deliberate and hard-won.
+/// [`Self::SourceBound`] and [`Self::Inelastic`] may cap how far the producer
+/// grows. [`Self::Starved`] has one bounded exception: it may retain the current
+/// limit when the cost model asks to shrink a producer that is demonstrably
+/// using its present capacity. It cannot choose or increase the target, so the
+/// cost-share model remains the only sizing mechanism. [`Self::Satisfied`] is
+/// diagnostic. This one-sided restriction is deliberate and hard-won.
 ///
 /// Every variant here is a *saturating* signal, and an earlier version of this
 /// crate sized the split from one. It does not work, and the reason is
@@ -385,6 +436,11 @@ pub enum ProducerPressure {
     /// decision at a time. Nothing reads it now — the split is solved, not
     /// stepped — and a demand estimate is a poor thing to keep alive with no
     /// consumer to keep it honest.
+    ///
+    /// May veto removal of an occupied current slot when allocation-dependent
+    /// producer work makes the low-allocation cost estimate incomplete. The
+    /// controller counts that event and requires persistent evidence; this
+    /// variant never requests growth.
     Starved,
     /// Keeping up with the consumer. More slots would idle.
     Satisfied,
@@ -434,7 +490,7 @@ impl std::fmt::Display for ResizeError {
 
 impl std::error::Error for ResizeError {}
 
-/// Which side was being resized or drained.
+/// Which pipeline side was involved in a broker operation or failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeSide {
     Consumer,
@@ -454,6 +510,12 @@ pub enum BrokerErrorKind {
         target: usize,
         observed: usize,
         timeout: Duration,
+    },
+    /// An adapter violated [`Work`]'s cumulative-counter contract.
+    WorkCountersRegressed {
+        side: ResizeSide,
+        previous: Work,
+        observed: Work,
     },
     ThreadSpawn(std::io::Error),
     ThreadPanicked,
@@ -504,6 +566,14 @@ impl std::fmt::Display for BrokerError {
             } => write!(
                 f,
                 "thread broker timed out after {timeout:?} waiting for {side:?} to shrink to {target} (observed {observed})"
+            ),
+            BrokerErrorKind::WorkCountersRegressed {
+                side,
+                previous,
+                observed,
+            } => write!(
+                f,
+                "thread broker observed decreasing {side:?} work counters: {previous:?} -> {observed:?}"
             ),
             BrokerErrorKind::ThreadSpawn(source) => {
                 write!(f, "could not spawn thread-broker sampler: {source}")
@@ -613,6 +683,10 @@ pub struct BrokerConfig {
     /// contains pre-move windows when the broker next decides.
     pub blackout_samples: usize,
     /// Windows of throughput evidence gathered before a move is ratified.
+    /// The default ten-window block spans one second at the default 100 ms
+    /// cadence. Applications should validate its power against stationary
+    /// windows from their real workload; a deliberately changing or pausing
+    /// workload is not a statistically identifiable ratification population.
     pub ratify_samples: usize,
     /// Windows used by an optional nonlinear response probe.
     ///
@@ -628,6 +702,13 @@ pub struct BrokerConfig {
     /// measured allocation-dependent scaling, not a tax every model-floor job
     /// should pay. Freeze-after-convergence skips it even when configured.
     pub nonlinear_probes: bool,
+    /// Optional upper bound for producer slots visited by nonlinear probes.
+    ///
+    /// This bounds startup exploration independently of the ordinary cost
+    /// model. It is useful when an application has measured a local nonlinear
+    /// region but short jobs cannot amortize a geometric walk to the budget
+    /// boundary. `None` preserves full geometric coverage.
+    pub nonlinear_max_producer_slots: Option<usize>,
     /// Post-resize blackout used only before a nonlinear response probe.
     ///
     /// Some allocation changes take longer to reach representative throughput
@@ -669,7 +750,7 @@ pub struct BrokerConfig {
     /// ratio rather than from the outcome, so watching the model detects change
     /// in both directions with one mechanism instead of two.
     pub resurvey_distance: usize,
-    /// Consecutive samples the drift must persist before a settled split is
+    /// Wall-clock time model drift must persist before a settled split is
     /// re-opened.
     ///
     /// Distance alone is not enough, and the reason is that the noise in the
@@ -680,11 +761,11 @@ pub struct BrokerConfig {
     /// identical workload, identical noise in the *share*, twice the noise in
     /// threads.
     ///
-    /// Requiring persistence separates the two cleanly, because it keys on
-    /// something that actually distinguishes them: sampling noise does not
-    /// survive a second of consecutive windows, and a real regime change does.
-    /// It also costs nothing when there is no drift.
-    pub resurvey_samples: usize,
+    /// Requiring duration-based persistence separates the two cleanly, because
+    /// it keys on something that actually distinguishes them: sampling noise
+    /// does not survive a second of consecutive windows, and a real regime
+    /// change does. It also costs nothing when there is no drift.
+    pub resurvey_persistence: Duration,
     /// Maximum time to wait for the shrinking side to release capacity before
     /// aborting the broker. The other side is never grown before this
     /// acknowledgement arrives.
@@ -728,13 +809,14 @@ impl Default for BrokerConfig {
             smoothing_windows: 3,
             deadband_threads: 1,
             blackout_samples: 4,
-            ratify_samples: 4,
+            ratify_samples: 10,
             nonlinear_probe_samples: 4,
             nonlinear_probes: false,
+            nonlinear_max_producer_slots: None,
             nonlinear_blackout_samples: 4,
             regression_tolerance: 0.05,
             resurvey_distance: 1,
-            resurvey_samples: 8,
+            resurvey_persistence: Duration::from_millis(800),
             resize_timeout: Duration::from_secs(2),
             max_buffer_drift_items: 1 << 20,
             max_buffer_drift_fraction: 0.05,
@@ -882,6 +964,12 @@ impl<C: Consumer, P: Producer> ThreadBrokerBuilder<C, P> {
         self
     }
 
+    /// See [`BrokerConfig::nonlinear_max_producer_slots`].
+    pub fn nonlinear_max_producer_slots(mut self, slots: Option<usize>) -> Self {
+        self.config.nonlinear_max_producer_slots = slots;
+        self
+    }
+
     /// See [`BrokerConfig::nonlinear_blackout_samples`].
     pub fn nonlinear_blackout_samples(mut self, samples: usize) -> Self {
         self.config.nonlinear_blackout_samples = samples;
@@ -900,9 +988,9 @@ impl<C: Consumer, P: Producer> ThreadBrokerBuilder<C, P> {
         self
     }
 
-    /// See [`BrokerConfig::resurvey_samples`].
-    pub fn resurvey_samples(mut self, samples: usize) -> Self {
-        self.config.resurvey_samples = samples;
+    /// See [`BrokerConfig::resurvey_persistence`].
+    pub fn resurvey_persistence(mut self, duration: Duration) -> Self {
+        self.config.resurvey_persistence = duration;
         self
     }
 
@@ -982,6 +1070,13 @@ impl<C: Consumer, P: Producer> ThreadBrokerBuilder<C, P> {
                 "nonlinear_probe_samples must be non-zero",
             ));
         }
+        if c.nonlinear_max_producer_slots
+            .is_some_and(|maximum| maximum < c.min_producer_slots)
+        {
+            return Err(BrokerConfigError(
+                "nonlinear_max_producer_slots must be at least min_producer_slots",
+            ));
+        }
         if c.nonlinear_blackout_samples < c.smoothing_windows {
             return Err(BrokerConfigError(
                 "nonlinear_blackout_samples must be at least smoothing_windows",
@@ -990,8 +1085,8 @@ impl<C: Consumer, P: Producer> ThreadBrokerBuilder<C, P> {
         // Re-opening is made harder by persistence. Its distance may equal the
         // movement deadband so a one-slot regime change remains observable on
         // small budgets.
-        if c.resurvey_samples == 0 {
-            return Err(BrokerConfigError("resurvey_samples must be non-zero"));
+        if c.resurvey_persistence.is_zero() {
+            return Err(BrokerConfigError("resurvey_persistence must be non-zero"));
         }
         if c.resize_timeout.is_zero() {
             return Err(BrokerConfigError("resize_timeout must be non-zero"));

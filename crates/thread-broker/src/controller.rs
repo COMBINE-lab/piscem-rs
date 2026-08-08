@@ -48,6 +48,15 @@ pub struct BrokerReport {
     /// Actual live/active occupancy observed at every recorded sample.
     pub actual_consumer_trajectory: Vec<usize>,
     pub actual_producer_trajectory: Vec<usize>,
+    /// Controller elapsed time for each retained trajectory point.
+    pub trajectory_elapsed: Vec<Duration>,
+    /// Times at which the inferred producer ceiling or its evidence changed.
+    pub cap_trajectory: Vec<CapObservation>,
+    /// Real pipeline-throughput windows retained while a decision was open.
+    /// Steady-state probes are excluded, so this remains bounded startup or
+    /// resurvey evidence rather than recurring telemetry overhead.
+    pub throughput_trace: Vec<f64>,
+    pub throughput_trace_dropped: usize,
     /// Oldest samples discarded after reaching `trace_capacity`.
     pub trace_samples_dropped: usize,
     /// Splits applied, including reverts.
@@ -96,10 +105,11 @@ pub struct BrokerReport {
     /// Largest observed sum of live consumer workers and active producer slots.
     pub peak_controlled_slots: usize,
     /// Peak live threads explicitly outside the controlled slot budget: the
-    /// broker sampler itself plus producer-reported coordinators/samplers.
+    /// controller itself plus producer-reported coordinators/optional samplers.
     pub peak_auxiliary_threads: usize,
-    /// Diagnostics from adapters that reconstruct producer busy time by
-    /// sampling. `None` for native cumulative counters.
+    /// Producer measurement diagnostics. Native cumulative counters report
+    /// zero samples and observation time; sampled adapters also report their
+    /// cadence and sampler CPU.
     pub producer_measurement: Option<ProducerMeasurementStats>,
     /// Rejected targets and the workload epoch in which they failed.
     pub rejections: Vec<Rejection>,
@@ -131,7 +141,13 @@ impl BrokerReport {
             && self.terminal_error.is_none()
     }
 
-    fn record_sample(&mut self, requested: Split, actual: Split, capacity: usize) {
+    fn record_sample(
+        &mut self,
+        requested: Split,
+        actual: Split,
+        elapsed: Duration,
+        capacity: usize,
+    ) {
         let unchanged = self.consumer_trajectory.last() == Some(&requested.0)
             && self.producer_trajectory.last() == Some(&requested.1)
             && self.actual_consumer_trajectory.last() == Some(&actual.0)
@@ -144,13 +160,53 @@ impl BrokerReport {
             self.producer_trajectory.remove(0);
             self.actual_consumer_trajectory.remove(0);
             self.actual_producer_trajectory.remove(0);
+            self.trajectory_elapsed.remove(0);
             self.trace_samples_dropped += 1;
         }
         self.consumer_trajectory.push(requested.0);
         self.producer_trajectory.push(requested.1);
         self.actual_consumer_trajectory.push(actual.0);
         self.actual_producer_trajectory.push(actual.1);
+        self.trajectory_elapsed.push(elapsed);
     }
+
+    fn record_cap(
+        &mut self,
+        elapsed: Duration,
+        useful_cap: usize,
+        reason: ProducerCapReason,
+        capacity: usize,
+    ) {
+        let unchanged = self.cap_trajectory.last().is_some_and(|observation| {
+            observation.useful_cap == useful_cap && observation.reason == reason
+        });
+        if unchanged {
+            return;
+        }
+        if self.cap_trajectory.len() == capacity {
+            self.cap_trajectory.remove(0);
+        }
+        self.cap_trajectory.push(CapObservation {
+            elapsed,
+            useful_cap,
+            reason,
+        });
+    }
+
+    fn record_throughput(&mut self, throughput: f64, capacity: usize) {
+        if self.throughput_trace.len() == capacity {
+            self.throughput_trace.remove(0);
+            self.throughput_trace_dropped += 1;
+        }
+        self.throughput_trace.push(throughput);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct CapObservation {
+    pub elapsed: Duration,
+    pub useful_cap: usize,
+    pub reason: ProducerCapReason,
 }
 
 /// The solved model at one instant.
@@ -261,7 +317,7 @@ enum Phase {
     },
     /// Settled. Sleeping until the model's answer moves a long way, and stays
     /// moved.
-    Steady { drifted_for: usize },
+    Steady { drifted_for: Duration },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,10 +337,10 @@ impl Phase {
         }
     }
 
-    fn drift_samples(&self) -> usize {
+    fn drift_duration(&self) -> Duration {
         match self {
             Self::Steady { drifted_for } => *drifted_for,
-            _ => 0,
+            _ => Duration::ZERO,
         }
     }
 
@@ -408,7 +464,12 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                 self.steady_state_policy,
                 SteadyStatePolicy::Responsive | SteadyStatePolicy::FreezeAfterFullCalibration
             );
-        let mut nonlinear_targets = nonlinear_probe_targets(self.budget, cfg.min_consumer_threads);
+        let mut nonlinear_targets = nonlinear_probe_targets(
+            self.budget,
+            cfg.min_consumer_threads,
+            initial.1,
+            cfg.nonlinear_max_producer_slots,
+        );
         let mut nonlinear_probe_complete = !nonlinear_probe_enabled;
         let mut nonlinear_override = false;
         // The achieved estimate at the last retained nonlinear point. Reusing
@@ -434,6 +495,12 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
         let mut nonlinear_next_blackout_samples: Option<usize> = None;
         let mut nonlinear_interior_target: Option<usize> = None;
         let mut nonlinear_interior_extensions_used = 0usize;
+        // Model drift is meaningful only relative to the model that established
+        // the settled split. Comparing only the newly rounded target makes a
+        // stable share near a slot boundary alternate forever between adjacent
+        // integers. Keep the settled evidence so reopening requires either a
+        // material share change or a changed empirical cap.
+        let mut settled_model: Option<Model> = None;
 
         while !stop.is_set() {
             // Establish convergence with one ordinary-cadence clean steady
@@ -454,6 +521,26 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
             report.controller_samples += 1;
             let consumer = self.consumer.work();
             let producer = self.producer.work();
+            for (side, previous, observed) in [
+                (ResizeSide::Consumer, prev_consumer, consumer),
+                (ResizeSide::Producer, prev_producer, producer),
+            ] {
+                if observed.busy_nanos < previous.busy_nanos || observed.items < previous.items {
+                    let actual = (self.consumer.live_threads(), self.producer.active_slots());
+                    return Err(runtime_failure(
+                        BrokerErrorKind::WorkCountersRegressed {
+                            side,
+                            previous,
+                            observed,
+                        },
+                        report,
+                        split,
+                        actual,
+                        phase.public(),
+                        epoch,
+                    ));
+                }
+            }
             let window = sampled_at.saturating_duration_since(prev_at);
             let dc = consumer.delta(prev_consumer);
             let dp = producer.delta(prev_producer);
@@ -503,13 +590,23 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
             // look as fast as a smooth one. Keep rate and cost eligibility
             // deliberately separate.
             let rate_clean = flow_stable && !resizing && !window.is_zero();
+            if rate_clean && !matches!(phase, Phase::Steady { .. }) {
+                report.record_throughput(throughput, cfg.trace_capacity);
+            }
             if clean {
                 costs.push(dc.busy_nanos, dp.busy_nanos);
-                caps.observe(dp, window, split.1, pressure);
+                caps.observe_slack(dp, window, split.1);
             } else if !resizing && !usable {
                 report.rejected_windows += 1;
             } else if !resizing && !flow_stable {
                 report.flow_transient_windows += 1;
+            }
+            // Source/elasticity pressure describes producer admission directly;
+            // unlike busy-derived slack, it does not require equivalent work to
+            // have crossed the downstream buffer. Requiring stable flow here
+            // delayed a persistent source ceiling by 5--12 seconds on Gate G.
+            if !resizing {
+                caps.observe_pressure(window, split.1, pressure);
             }
             if rate_clean && matches!(phase, Phase::Survey | Phase::Steady { .. }) {
                 recent.push(dc.items, window);
@@ -663,6 +760,7 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                 );
                                 if !improved
                                     && nonlinear_interior_target == Some(target)
+                                    && target < from.1
                                     && nonlinear_interior_extensions_used < 4
                                 {
                                     // Unlike coarse publication, this is not a
@@ -718,7 +816,9 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                     }
                                     settled_rate = Some(achieved.mean);
                                     costs.clear();
-                                    Phase::Steady { drifted_for: 0 }
+                                    Phase::Steady {
+                                        drifted_for: Duration::ZERO,
+                                    }
                                 } else {
                                     let comparison =
                                         compare_rates(baseline, achieved, cfg.regression_tolerance);
@@ -736,6 +836,13 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                     if comparison == RatificationOutcome::Inconclusive {
                                         report.inconclusive_ratifications += 1;
                                     }
+                                    // The optional response search has a higher
+                                    // burden than an ordinary model move: every
+                                    // retained point must prove improvement. A
+                                    // failed point brackets the local peak; do
+                                    // not keep spending startup moves on more
+                                    // extreme allocations in the same direction.
+                                    nonlinear_targets.clear();
                                     costs.clear();
                                     if nonlinear_targets.is_empty() {
                                         let best = nonlinear_best_split.unwrap_or(from);
@@ -766,7 +873,9 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                         nonlinear_best_split = None;
                                         recent.clear();
                                         if split == restore {
-                                            Phase::Steady { drifted_for: 0 }
+                                            Phase::Steady {
+                                                drifted_for: Duration::ZERO,
+                                            }
                                         } else {
                                             report.reverts += 1;
                                             match self.begin_move(
@@ -775,7 +884,7 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                                 Phase::Blackout {
                                                     left: cfg.blackout_samples,
                                                     next: Box::new(Phase::Steady {
-                                                        drifted_for: 0,
+                                                        drifted_for: Duration::ZERO,
                                                     }),
                                                 },
                                             ) {
@@ -822,7 +931,7 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                                 Phase::Blackout {
                                                     left: cfg.nonlinear_blackout_samples,
                                                     next: Box::new(Phase::Steady {
-                                                        drifted_for: 0,
+                                                        drifted_for: Duration::ZERO,
                                                     }),
                                                 },
                                             ) {
@@ -846,7 +955,9 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                                 }
                                             }
                                         } else {
-                                            Phase::Steady { drifted_for: 0 }
+                                            Phase::Steady {
+                                                drifted_for: Duration::ZERO,
+                                            }
                                         }
                                     }
                                 }
@@ -897,7 +1008,9 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                         from,
                                         Phase::Blackout {
                                             left: cfg.blackout_samples,
-                                            next: Box::new(Phase::Steady { drifted_for: 0 }),
+                                            next: Box::new(Phase::Steady {
+                                                drifted_for: Duration::ZERO,
+                                            }),
                                         },
                                     ) {
                                         Ok((interim, phase)) => {
@@ -1043,6 +1156,20 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                             && solved.as_ref().is_some_and(|s| {
                                 let far_enough = s.target.abs_diff(split.1)
                                     >= s.snapshot.effective_resurvey_distance;
+                                let changed_since_settling = settled_model.is_none_or(|settled| {
+                                    let combined_uncertainty = settled
+                                        .producer_cost_share_uncertainty
+                                        + s.snapshot.producer_cost_share_uncertainty;
+                                    let share_changed = (settled.producer_cost_share
+                                        - s.snapshot.producer_cost_share)
+                                        .abs()
+                                        > combined_uncertainty.max(0.05);
+                                    let cap_changed = settled.useful_cap != s.snapshot.useful_cap
+                                        && (settled.useful_cap_reason != ProducerCapReason::None
+                                            || s.snapshot.useful_cap_reason
+                                                != ProducerCapReason::None);
+                                    share_changed || cap_changed
+                                });
                                 let pressure_allows =
                                     !(s.target < split.1 && pressure == ProducerPressure::Starved);
                                 let changed_since_rejection =
@@ -1051,7 +1178,10 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                             > (2.0 * s.snapshot.producer_cost_share_uncertainty)
                                                 .max(0.05)
                                     });
-                                far_enough && pressure_allows && changed_since_rejection
+                                far_enough
+                                    && changed_since_settling
+                                    && pressure_allows
+                                    && changed_since_rejection
                             });
                         let current_rate = recent.estimate();
                         // A common-mode rate change with an unchanged cost share
@@ -1081,6 +1211,8 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                     && !rejected.is_empty()
                                     && (regressed || improved))
                         });
+                        let next_drift =
+                            consecutive_drift_duration(drifted_for, window, cfg.sample_interval);
                         match model_drifted || throughput_drifted {
                             // Distance alone is not enough: the noise in the solved
                             // target grows with the budget while a fixed distance
@@ -1088,7 +1220,7 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                             // band that 32 threads never approaches. Persistence is
                             // what tells the two apart -- noise does not survive a
                             // second of consecutive windows, a regime change does.
-                            true if drifted_for + 1 >= cfg.resurvey_samples => {
+                            true if next_drift >= cfg.resurvey_persistence => {
                                 tracing::debug!(
                                     "thread-broker: persistent workload change at producer split {} \
                                  (model target {}, throughput {:.0}/s); re-opening",
@@ -1107,24 +1239,40 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                 nonlinear_next_blackout_samples = None;
                                 nonlinear_interior_target = None;
                                 nonlinear_interior_extensions_used = 0;
-                                nonlinear_targets =
-                                    nonlinear_probe_targets(self.budget, cfg.min_consumer_threads);
+                                nonlinear_targets = nonlinear_probe_targets(
+                                    self.budget,
+                                    cfg.min_consumer_threads,
+                                    split.1,
+                                    cfg.nonlinear_max_producer_slots,
+                                );
                                 nonlinear_probe_complete = !nonlinear_probe_enabled;
                                 report.time_to_converge = None;
-                                surveyed = 0;
+                                settled_model = None;
+                                // Persistent drift was itself measured from a
+                                // full clean cost window. Reuse that evidence
+                                // and require one fresh confirmation instead of
+                                // paying another complete smoothing horizon;
+                                // this keeps recovery under one second without
+                                // weakening the 800 ms false-resurvey guard.
+                                surveyed = cfg.smoothing_windows.saturating_sub(1);
                                 settled_rate = None;
                                 Phase::Survey
                             }
                             true => Phase::Steady {
-                                drifted_for: drifted_for + 1,
+                                drifted_for: next_drift,
                             },
                             false => {
+                                if settled_model.is_none() {
+                                    settled_model = solved.map(|model| model.snapshot);
+                                }
                                 if report.time_to_converge.is_none() {
                                     report.time_to_converge =
                                         Some(sampled_at.saturating_duration_since(warm_ended));
                                 }
                                 settled_rate.get_or_insert(current_rate.mean);
-                                Phase::Steady { drifted_for: 0 }
+                                Phase::Steady {
+                                    drifted_for: Duration::ZERO,
+                                }
                             }
                         }
                     }
@@ -1158,6 +1306,12 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                             // the old starvation hill climber.
                             let current_capacity_used =
                                 producer_capacity_used(active, split.1, dp.busy_nanos, window);
+                            let source_growth_wait = target > split.1
+                                && matches!(
+                                    pressure,
+                                    ProducerPressure::SourceBound | ProducerPressure::Inelastic
+                                )
+                                && model.snapshot.useful_cap_reason == ProducerCapReason::None;
                             let pressure_veto = target < split.1
                                 && pressure == ProducerPressure::Starved
                                 && current_capacity_used;
@@ -1174,7 +1328,14 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                             // Keep surveying until starvation has persisted as
                             // long as other cap evidence before accepting the
                             // current split as the bounded nonlinear correction.
-                            if pressure_veto && pressure_vetoed_for < cfg.cap_persistence {
+                            if source_growth_wait {
+                                // Direct source pressure can arrive before its
+                                // duration-based cap is mature. Do not race a
+                                // large growth move against that evidence; keep
+                                // surveying until the signal either clears or
+                                // establishes the current grant as the cap.
+                                Phase::Survey
+                            } else if pressure_veto && pressure_vetoed_for < cfg.cap_persistence {
                                 Phase::Survey
                             } else if nonlinear_probe_enabled
                                 && !nonlinear_probe_complete
@@ -1189,11 +1350,15 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                 // floor and then climbing back through it.
                                 report.final_model = Some(model.snapshot);
                                 settled_rate = Some(recent.estimate().mean);
-                                Phase::Steady { drifted_for: 0 }
+                                Phase::Steady {
+                                    drifted_for: Duration::ZERO,
+                                }
                             } else if distance < model.snapshot.effective_deadband_threads {
                                 report.final_model = Some(model.snapshot);
                                 settled_rate = Some(recent.estimate().mean);
-                                Phase::Steady { drifted_for: 0 }
+                                Phase::Steady {
+                                    drifted_for: Duration::ZERO,
+                                }
                             } else {
                                 let from = split;
                                 tracing::debug!(
@@ -1262,7 +1427,19 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                 measurement_mode = next_measurement_mode;
             }
 
-            report.record_sample(split, (live, active), cfg.trace_capacity);
+            report.record_sample(
+                split,
+                (live, active),
+                sampled_at.saturating_duration_since(started),
+                cfg.trace_capacity,
+            );
+            let (useful_cap, useful_cap_reason) = caps.useful();
+            report.record_cap(
+                sampled_at.saturating_duration_since(started),
+                useful_cap,
+                useful_cap_reason,
+                cfg.trace_capacity,
+            );
 
             tracing::trace!(
                 "thread-broker: {:?} idle {:.1}% pressure {:?} {:.0} items/s \
@@ -1285,7 +1462,12 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                 SteadyStatePolicy::FreezeAfterConvergence
                     | SteadyStatePolicy::FreezeAfterFullCalibration
             ) && report.time_to_converge.is_some()
-                && matches!(phase, Phase::Steady { drifted_for: 0 })
+                && matches!(
+                    phase,
+                    Phase::Steady {
+                        drifted_for: Duration::ZERO
+                    }
+                )
             {
                 report.monitoring_stopped_after_convergence = true;
                 break;
@@ -1304,7 +1486,7 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
         report.final_epoch = epoch;
         report.final_phase = phase.public();
         report.nonlinear_override = nonlinear_override;
-        report.current_drift = steady_probe_interval * phase.drift_samples() as u32;
+        report.current_drift = phase.drift_duration();
         report.controller_elapsed = now().saturating_duration_since(started);
         report.producer_measurement = self.producer.finish_measurement();
         report.controller_cpu_nanos = controller_cpu
@@ -1416,18 +1598,23 @@ impl Recent {
 fn nonlinear_probe_targets(
     budget: usize,
     min_consumer_threads: usize,
+    initial_producer_slots: usize,
+    configured_maximum: Option<usize>,
 ) -> std::collections::VecDeque<usize> {
     let mut targets = std::collections::VecDeque::new();
-    let mut consumers = (budget / 2).max(min_consumer_threads);
-    loop {
-        let producer = budget.saturating_sub(consumers);
-        if producer > 0 && targets.back() != Some(&producer) {
-            targets.push_back(producer);
-        }
-        if consumers == min_consumer_threads {
-            break;
-        }
-        consumers = (consumers / 2).max(min_consumer_threads);
+    let max_producer = budget
+        .saturating_sub(min_consumer_threads)
+        .max(1)
+        .min(configured_maximum.unwrap_or(usize::MAX));
+    let mut producer = initial_producer_slots.clamp(1, max_producer);
+    while producer < max_producer {
+        // Grow locally before visiting an endpoint. Starting a 32-thread
+        // scATAC run at four producer slots must not make its first experiment
+        // 16 slots away; 4 -> 6 -> 9 ... retains geometric coverage while a
+        // first failed point can cheaply bracket the local optimum.
+        let step = producer.div_ceil(2).max(1);
+        producer = producer.saturating_add(step).min(max_producer);
+        targets.push_back(producer);
     }
     targets
 }
@@ -1450,6 +1637,8 @@ fn interior_neighbor(anchor: usize, other: usize) -> Option<usize> {
 struct RateEstimate {
     mean: f64,
     half_width: f64,
+    samples: usize,
+    zero_samples: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1466,6 +1655,12 @@ fn compare_rates(
 ) -> RatificationOutcome {
     if baseline.mean <= 0.0 {
         return RatificationOutcome::Kept;
+    }
+    // One output flush or I/O pause is evidence that this block is noisy, not
+    // evidence that the target is bad. Sustained zero progress remains visible
+    // (and can still regress); only the isolated case is forced inconclusive.
+    if achieved.samples > 1 && achieved.zero_samples == 1 {
+        return RatificationOutcome::Inconclusive;
     }
 
     let boundary = baseline.mean * (1.0 - tolerance);
@@ -1513,7 +1708,12 @@ impl RateEstimate {
         } else {
             f64::INFINITY
         };
-        Self { mean, half_width }
+        Self {
+            mean,
+            half_width,
+            samples: rates.len(),
+            zero_samples: rates.iter().filter(|rate| **rate == 0.0).count(),
+        }
     }
 
     fn lower(self) -> f64 {
@@ -1690,6 +1890,8 @@ struct Caps {
     slack_for: Duration,
     slack_age: Duration,
     slack_peak: f64,
+    slack_limit: Option<usize>,
+    slack_candidate: Option<(usize, usize)>,
     slack_cap: Option<usize>,
     saturated_for: Duration,
     saturated_age: Duration,
@@ -1704,6 +1906,8 @@ impl Caps {
             slack_for: Duration::ZERO,
             slack_age: Duration::ZERO,
             slack_peak: 0.0,
+            slack_limit: None,
+            slack_candidate: None,
             slack_cap: None,
             saturated_for: Duration::ZERO,
             saturated_age: Duration::ZERO,
@@ -1711,7 +1915,10 @@ impl Caps {
         }
     }
 
-    fn observe(&mut self, dp: Work, window: Duration, producer_limit: usize, p: ProducerPressure) {
+    /// Observe busy-derived slack only when producer and consumer progress is
+    /// comparable. Buffer fill/drain can otherwise make ordinary pipeline lag
+    /// look like unused producer concurrency.
+    fn observe_slack(&mut self, dp: Work, window: Duration, producer_limit: usize) {
         // Concurrency the producer actually achieved this window, in
         // thread-equivalents. Busy time excludes blocking, so this is work done
         // rather than slots held.
@@ -1719,25 +1926,73 @@ impl Caps {
         // One quiet sample is a lull, not scalability evidence. Require the
         // same condition continuously for a duration independent of sampling
         // cadence before turning it into a cap.
+        if self.slack_limit != Some(producer_limit) {
+            self.slack_for = Duration::ZERO;
+            self.slack_peak = 0.0;
+            self.slack_limit = Some(producer_limit);
+        }
         if producer_limit as f64 > achieved + 1.0 {
             self.slack_for += window;
             self.slack_age = Duration::ZERO;
             self.slack_peak = self.slack_peak.max(achieved);
             if self.slack_for >= self.persistence {
-                self.slack_cap = Some(self.slack_peak.ceil() as usize + 1);
+                let observed_cap = self.slack_peak.ceil() as usize + 1;
+                if producer_limit >= observed_cap.saturating_mul(2) {
+                    // A grant at least twice the sustained ceiling is already
+                    // a decisive exploration. This lets an initially invisible
+                    // source ceiling recover after one oversized model move.
+                    self.slack_cap = Some(observed_cap);
+                    self.slack_candidate = Some((producer_limit, observed_cap));
+                } else {
+                    match self.slack_candidate {
+                        Some((prior_limit, prior_cap))
+                            if prior_limit != producer_limit
+                                && prior_limit > prior_cap
+                                && producer_limit > observed_cap
+                                && prior_cap.abs_diff(observed_cap) <= 1 =>
+                        {
+                            // One mildly under-filled grant can be a batching or
+                            // barrier artifact: real scRNA used more concurrency
+                            // and halved wall time when its grant grew. Comparable
+                            // ceilings at two distinct grants, each with real
+                            // headroom above its inferred ceiling, make it a
+                            // hard cap. A grant equal to the inferred cap
+                            // cannot confirm its own saturation.
+                            self.slack_cap = Some(prior_cap.max(observed_cap));
+                        }
+                        Some((prior_limit, _)) if prior_limit != producer_limit => {
+                            self.slack_cap = None;
+                            self.slack_candidate = Some((producer_limit, observed_cap));
+                        }
+                        None => {
+                            self.slack_candidate = Some((producer_limit, observed_cap));
+                        }
+                        _ => {}
+                    }
+                }
             }
         } else {
             self.slack_for = Duration::ZERO;
             self.slack_peak = 0.0;
             self.slack_age += window;
             if self.slack_age >= self.history {
+                self.slack_candidate = None;
                 self.slack_cap = None;
             }
         }
+    }
 
-        // The only thing `ProducerPressure` is used for. It is a saturating
-        // signal -- it cannot tell "just enough" from "far too much" -- so it
-        // may veto growth but must never size the split.
+    /// Observe the producer's direct source/elasticity classification.
+    ///
+    /// This evidence is independent of downstream buffer equivalence. It still
+    /// requires duration-based persistence and expires after contradictory
+    /// observations, so a lone source lull cannot become a lasting cap.
+    fn observe_pressure(&mut self, window: Duration, producer_limit: usize, p: ProducerPressure) {
+        // Cap history uses only the source/elasticity half of
+        // `ProducerPressure`. It is a saturating signal -- it cannot tell "just
+        // enough" from "far too much" -- so it may cap growth but must never
+        // size the split. `Starved`'s separate bounded shrink veto lives at the
+        // decision point, where it can retain but never increase the target.
         match p {
             ProducerPressure::SourceBound | ProducerPressure::Inelastic => {
                 self.saturated_for += window;
@@ -1757,6 +2012,12 @@ impl Caps {
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    fn observe(&mut self, dp: Work, window: Duration, producer_limit: usize, p: ProducerPressure) {
+        self.observe_slack(dp, window, producer_limit);
+        self.observe_pressure(window, producer_limit, p);
     }
 
     /// The largest producer limit worth asking for, or `usize::MAX` if nothing
@@ -1835,6 +2096,25 @@ fn rate_per_second(items: u64, window: Duration) -> f64 {
     items as f64 / secs
 }
 
+/// Duration represented by consecutive drift observations.
+///
+/// The first sparse steady-state probe says only that drift exists *now*; it
+/// cannot prove that drift was present throughout the entire sleep since the
+/// previous clean probe. Credit it with one active-cadence window. A second
+/// consecutive observation spans real elapsed time and may then satisfy the
+/// wall-clock persistence guard.
+fn consecutive_drift_duration(
+    previous: Duration,
+    observation_window: Duration,
+    active_interval: Duration,
+) -> Duration {
+    if previous.is_zero() {
+        observation_window.min(active_interval)
+    } else {
+        previous.saturating_add(observation_window)
+    }
+}
+
 fn fmt_cap(cap: usize) -> String {
     if cap == usize::MAX {
         "none".into()
@@ -1880,8 +2160,8 @@ impl std::fmt::Debug for PhaseName<'_> {
 mod tests {
     use super::{
         BrokerPhase, BrokerReport, Caps, Costs, Phase, ProducerCapReason, RateEstimate,
-        RatificationKind, RatificationOutcome, Recent, compare_rates, nonlinear_probe_improved,
-        producer_capacity_used,
+        RatificationKind, RatificationOutcome, Recent, compare_rates, consecutive_drift_duration,
+        nonlinear_probe_improved, nonlinear_probe_targets, producer_capacity_used,
     };
     use crate::{BrokerConfig, ProducerMeasurementMode, ProducerPressure, ResizeSide, Work};
     use std::time::{Duration, Instant};
@@ -1941,18 +2221,45 @@ mod tests {
                 .as_nanos()
                 .div_ceil(window.as_nanos());
             for _ in 0..samples {
-                caps.observe(work_at(2, window), window, 8, ProducerPressure::Satisfied);
+                caps.observe(work_at(6, window), window, 8, ProducerPressure::Satisfied);
             }
-            assert_eq!(caps.useful(), (3, ProducerCapReason::Slack));
+            assert_eq!(
+                caps.useful(),
+                (usize::MAX, ProducerCapReason::None),
+                "one grant must remain provisional"
+            );
+
+            for _ in 0..samples {
+                caps.observe(work_at(6, window), window, 12, ProducerPressure::Satisfied);
+            }
+            assert_eq!(caps.useful(), (7, ProducerCapReason::Slack));
 
             let expiry = Duration::from_secs(1)
                 .as_nanos()
                 .div_ceil(window.as_nanos());
             for _ in 0..expiry {
-                caps.observe(work_at(8, window), window, 8, ProducerPressure::Starved);
+                caps.observe(work_at(12, window), window, 12, ProducerPressure::Starved);
             }
             assert_eq!(caps.useful(), (usize::MAX, ProducerCapReason::None));
         }
+    }
+
+    #[test]
+    fn adjacent_grant_cannot_confirm_its_own_inferred_cap() {
+        let mut caps = Caps::new(Duration::from_secs(1), Duration::from_millis(300));
+        let window = Duration::from_millis(100);
+        for _ in 0..3 {
+            caps.observe(work_at(6, window), window, 8, ProducerPressure::Satisfied);
+        }
+        assert_eq!(caps.useful(), (usize::MAX, ProducerCapReason::None));
+        for _ in 0..3 {
+            caps.observe(work_at(6, window), window, 7, ProducerPressure::Satisfied);
+        }
+        assert_eq!(
+            caps.useful(),
+            (usize::MAX, ProducerCapReason::None),
+            "a grant equal to the inferred cap has no headroom to confirm saturation"
+        );
     }
 
     #[test]
@@ -1988,6 +2295,15 @@ mod tests {
                 "{window:?} sampling retained a lull cap after 800 ms of contrary evidence"
             );
         }
+    }
+
+    #[test]
+    fn direct_pressure_cap_does_not_wait_for_flow_stability() {
+        let mut caps = Caps::new(Duration::from_millis(800), Duration::from_millis(300));
+        for _ in 0..3 {
+            caps.observe_pressure(Duration::from_millis(100), 2, ProducerPressure::Inelastic);
+        }
+        assert_eq!(caps.useful(), (2, ProducerCapReason::Source));
     }
 
     #[test]
@@ -2031,7 +2347,7 @@ mod tests {
             for seed in 1..=1_000 {
                 let mut noise = Noise::new(seed ^ ((budget as u64) << 32));
                 let mut costs = Costs::new(cfg.smoothing_windows);
-                let mut drifted_for = 0;
+                let mut drifted_for = Duration::ZERO;
                 let mut false_resurvey = false;
                 for _ in 0..300 {
                     push_noisy_share(&mut costs, base_share, &mut noise);
@@ -2039,10 +2355,10 @@ mod tests {
                         if solved.target.abs_diff(base_target)
                             >= solved.snapshot.effective_resurvey_distance
                         {
-                            drifted_for += 1;
-                            false_resurvey |= drifted_for >= cfg.resurvey_samples;
+                            drifted_for += Duration::from_millis(100);
+                            false_resurvey |= drifted_for >= cfg.resurvey_persistence;
                         } else {
-                            drifted_for = 0;
+                            drifted_for = Duration::ZERO;
                         }
                     }
                 }
@@ -2054,7 +2370,7 @@ mod tests {
                     let shift = ((budget as f64 * 0.10).ceil() as usize).max(1);
                     let changed_target = (base_target + shift).min(budget - 1);
                     let changed_share = changed_target as f64 / budget as f64;
-                    drifted_for = 0;
+                    drifted_for = Duration::ZERO;
                     let mut detected = false;
                     for _ in 0..20 {
                         push_noisy_share(&mut costs, changed_share, &mut noise);
@@ -2062,10 +2378,10 @@ mod tests {
                             if solved.target.abs_diff(base_target)
                                 >= solved.snapshot.effective_resurvey_distance
                             {
-                                drifted_for += 1;
-                                detected |= drifted_for >= cfg.resurvey_samples;
+                                drifted_for += Duration::from_millis(100);
+                                detected |= drifted_for >= cfg.resurvey_persistence;
                             } else {
-                                drifted_for = 0;
+                                drifted_for = Duration::ZERO;
                             }
                         }
                     }
@@ -2090,10 +2406,23 @@ mod tests {
     fn report_trace_is_bounded_and_convergence_is_terminal_state_aware() {
         let mut report = BrokerReport::default();
         for producer in 1..=10 {
-            report.record_sample((16 - producer, producer), (15 - producer, producer), 3);
+            report.record_sample(
+                (16 - producer, producer),
+                (15 - producer, producer),
+                Duration::from_millis(producer as u64),
+                3,
+            );
         }
         assert_eq!(report.producer_trajectory, vec![8, 9, 10]);
         assert_eq!(report.actual_producer_trajectory, vec![8, 9, 10]);
+        assert_eq!(
+            report.trajectory_elapsed,
+            vec![
+                Duration::from_millis(8),
+                Duration::from_millis(9),
+                Duration::from_millis(10),
+            ]
+        );
         assert_eq!(report.trace_samples_dropped, 7);
 
         report.time_to_converge = Some(Duration::from_secs(1));
@@ -2146,7 +2475,9 @@ mod tests {
                 left: 1,
                 next: Box::new(Phase::Survey),
             },
-            Phase::Steady { drifted_for: 0 },
+            Phase::Steady {
+                drifted_for: Duration::ZERO,
+            },
         ] {
             assert_eq!(
                 phase.measurement_mode(),
@@ -2174,10 +2505,12 @@ mod tests {
         let baseline = RateEstimate {
             mean: 6_386.0,
             half_width: 3_066.0,
+            ..RateEstimate::default()
         };
         let achieved = RateEstimate {
             mean: 12_453.0,
             half_width: 2_688.0,
+            ..RateEstimate::default()
         };
         assert!(nonlinear_probe_improved(baseline, achieved, 0.05));
 
@@ -2187,6 +2520,7 @@ mod tests {
             RateEstimate {
                 mean: 12_000.0,
                 half_width: 4_000.0,
+                ..RateEstimate::default()
             },
             0.05,
         ));
@@ -2195,13 +2529,59 @@ mod tests {
             RateEstimate {
                 mean: 100.0,
                 half_width: 0.1,
+                ..RateEstimate::default()
             },
             RateEstimate {
                 mean: 104.0,
                 half_width: 0.1,
+                ..RateEstimate::default()
             },
             0.05,
         ));
+    }
+
+    #[test]
+    fn nonlinear_probe_maximum_bounds_geometric_exploration() {
+        assert_eq!(
+            nonlinear_probe_targets(64, 1, 6, Some(9))
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![9]
+        );
+        assert_eq!(
+            nonlinear_probe_targets(8, 1, 4, None)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![6, 7]
+        );
+    }
+
+    #[test]
+    fn isolated_zero_progress_cannot_create_rejection_evidence() {
+        let baseline = RateEstimate::from_rates([100.0; 10].into_iter());
+        let mut achieved = [100.0; 10];
+        achieved[4] = 0.0;
+        let achieved = RateEstimate::from_rates(achieved.into_iter());
+        assert_eq!(
+            compare_rates(baseline, achieved, 0.05),
+            RatificationOutcome::Inconclusive
+        );
+    }
+
+    #[test]
+    fn one_sparse_probe_cannot_satisfy_resurvey_persistence() {
+        let active = Duration::from_millis(100);
+        let sparse = Duration::from_secs(5);
+        let first = consecutive_drift_duration(Duration::ZERO, sparse, active);
+        assert_eq!(first, active);
+        assert!(first < Duration::from_millis(800));
+
+        // A second consecutive observation really does establish that the
+        // drift persisted across the sparse interval.
+        assert_eq!(
+            consecutive_drift_duration(first, sparse, active),
+            Duration::from_millis(5_100)
+        );
     }
 
     #[test]

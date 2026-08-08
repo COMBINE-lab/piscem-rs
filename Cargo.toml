@@ -60,8 +60,12 @@ default = ["mimalloc"]
 parity-test = ["dep:libradicl"]
 # Parallel gzip decoding via the pure-Rust COMBINE-lab/rapidgzip-rust.
 # No C++ toolchain required. See RESULTS.md.
-rapidgzip = ["dep:rapidgzip-core"]
+rapidgzip = ["dep:rapidgzip-core", "rapidgzip-core/busy-time-accounting"]
 rapidgzip-cpu-accounting = ["rapidgzip", "rapidgzip-core/cpu-accounting"]
+# Compatibility alias retained for the local sampled-versus-exact validation
+# harness. Exact event-time accounting is part of the normal `rapidgzip`
+# integration because it is the production broker signal.
+rapidgzip-busy-time-accounting = ["rapidgzip"]
 
 [dependencies]
 seq_geom_parser = { version = "1.1.0", path = "crates/seq_geom_parser" }
@@ -116,10 +120,11 @@ mimalloc = { version = "0.1.48", optional = true }
 # and decouples marker admission from the runtime throttle, so a low limit no
 # longer latches `DecoderPath::Sequential`. Together with the paraseq fork this
 # is what makes the decode/map split converge-able rather than predict-able.
-# The shared-pool and optional lifetime CPU-accounting changes are merged on
-# COMBINE-lab/rapidgzip-rust main. Pinned to the reviewed implementation used by
-# the broker audit; revert to a released crates.io version once that lands.
-rapidgzip-core = { git = "https://github.com/COMBINE-lab/rapidgzip-rust.git", rev = "dee928f90c9ab389bee11db62d59c97bcda6469e", optional = true }
+# The shared pool, lifetime CPU accounting, and exact cumulative executing-time
+# signal are merged on COMBINE-lab/rapidgzip-rust main. Pinned to the gated
+# implementation used by the broker audit; revert to a released crates.io
+# version once that lands.
+rapidgzip-core = { git = "https://github.com/COMBINE-lab/rapidgzip-rust.git", rev = "276a41f77fb927e24cb0898a638a08b21eb048c6", optional = true }
 
 thread-broker = { path = "crates/thread-broker" }
 

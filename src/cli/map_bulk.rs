@@ -327,8 +327,10 @@ where
         num_threads: outcome.execution_plan.effective_budget,
         execution_plan: Some(&outcome.execution_plan),
         broker_report: outcome.broker_report.as_ref(),
+        broker_failure: outcome.broker_failure.as_ref(),
         producer_measurement: outcome.producer_measurement.as_ref(),
         consumer_measurement: Some(&outcome.consumer_measurement),
+        pipeline_tuning: outcome.tuning.as_ref(),
         index_path: &args.index,
         k: index_k,
         m: index_m,
@@ -475,29 +477,43 @@ where
 
     #[cfg(feature = "rapidgzip")]
     let broker = match (&decode_pool, plan.adaptive()) {
-        (Some(pool), true) => Some(
-            thread_broker::ThreadBroker::builder_with(
-                crate::io::broker::MappingConsumer::new(map_pool.clone(), stats),
-                crate::io::broker::DecodeProducer::new(pool.clone(), handles.clone())
-                    .map_err(|e| anyhow::anyhow!("could not start decode measurement: {e}"))?,
-                crate::io::broker::broker_config_from_environment(
-                    crate::io::fastx::broker_config_for_budget(plan.effective_budget),
-                )
-                .map_err(|e| anyhow::anyhow!("invalid thread broker probe interval: {e}"))?,
-            )
-            .budget(plan.effective_budget)
-            .initial_producer_slots(plan.decode_slots)
-            .min_consumer_threads(consumer_floor)
-            .steady_state_policy(
-                crate::io::broker::broker_policy_from_environment()
-                    .map_err(|e| anyhow::anyhow!("invalid thread broker policy: {e}"))?,
-            )
-            .build()
-            .map_err(|e| anyhow::anyhow!("invalid thread broker configuration: {e}"))?
-            .start()
-            .map_err(|e| anyhow::anyhow!("could not start thread broker: {e}"))?,
-        ),
-        _ => None,
+        (Some(pool), true) => {
+            match crate::io::broker::DecodeProducer::new(pool.clone(), handles.clone()) {
+                Ok(producer) => {
+                    let built = thread_broker::ThreadBroker::builder_with(
+                        crate::io::broker::MappingConsumer::new(map_pool.clone(), stats),
+                        producer,
+                        crate::io::broker::broker_config_from_environment(
+                            crate::io::fastx::broker_config_for_budget(plan.effective_budget),
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("invalid thread broker probe interval: {e}")
+                        })?,
+                    )
+                    .budget(plan.effective_budget)
+                    .initial_producer_slots(plan.decode_slots)
+                    .min_consumer_threads(consumer_floor)
+                    .steady_state_policy(
+                        crate::io::broker::broker_policy_from_environment()
+                            .map_err(|e| anyhow::anyhow!("invalid thread broker policy: {e}"))?,
+                    )
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("invalid thread broker configuration: {e}"))?;
+                    crate::io::broker::AdvisoryBroker::start(
+                        built,
+                        plan.map_threads,
+                        plan.decode_slots,
+                    )
+                }
+                Err(error) => crate::io::broker::AdvisoryBroker::failed(
+                    crate::io::broker::BrokerFailureStage::ProducerMeasurementStartup,
+                    error,
+                    plan.map_threads,
+                    plan.decode_slots,
+                ),
+            }
+        }
+        _ => crate::io::broker::AdvisoryBroker::disabled(),
     };
 
     #[cfg(feature = "rapidgzip")]
@@ -535,10 +551,9 @@ where
         fixed_decode_measurement.map(crate::io::broker::FixedDecodeMeasurement::finish);
 
     #[cfg(feature = "rapidgzip")]
-    let broker_report = if let Some(broker) = broker {
-        let mut r = broker
-            .finish()
-            .map_err(|e| anyhow::anyhow!("thread broker failed: {e}"))?;
+    let mut broker_diagnostics = broker.finish();
+    #[cfg(feature = "rapidgzip")]
+    if let Some(r) = &mut broker_diagnostics.report {
         if let Some(measurement) = &mut r.producer_measurement {
             crate::io::broker::refresh_measurement_cpu(measurement, &handles);
         }
@@ -581,12 +596,15 @@ where
                 },
             );
         }
-        Some(r)
-    } else {
-        None
-    };
+    }
+    #[cfg(feature = "rapidgzip")]
+    let broker_report = broker_diagnostics.report;
+    #[cfg(feature = "rapidgzip")]
+    let broker_failure = broker_diagnostics.failure;
     #[cfg(not(feature = "rapidgzip"))]
     let broker_report = None;
+    #[cfg(not(feature = "rapidgzip"))]
+    let broker_failure = None;
 
     #[cfg(feature = "rapidgzip")]
     let producer_measurement = broker_report
@@ -600,8 +618,10 @@ where
     Ok(crate::io::fastx::PipelineOutcome {
         execution_plan: plan,
         broker_report,
+        broker_failure,
         producer_measurement,
         consumer_measurement,
+        tuning: None,
         mapping_elapsed_secs: mapping_elapsed.as_secs_f64(),
     })
 }

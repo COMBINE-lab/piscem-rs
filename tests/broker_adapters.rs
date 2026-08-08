@@ -99,9 +99,9 @@ fn a_throttled_decoder_reports_starvation() {
 
 /// The one measurement the whole control law rests on.
 ///
-/// `busy_nanos` must be *decode time with blocking excluded*, integrated from
-/// the pool's instantaneous busy-slot count. Two properties make it usable, and
-/// neither is guaranteed by the type:
+/// `busy_nanos` must be *decode time with blocking excluded*, integrated by
+/// rapidgzip's native executing-region counter. Two properties make it usable,
+/// and neither is guaranteed by the type:
 ///
 /// * it must actually accumulate — a counter stuck at zero silently reads as
 ///   "decoding is free", and the model would then hand the entire budget to

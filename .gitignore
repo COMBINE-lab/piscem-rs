@@ -42,6 +42,7 @@ test_data/
 PLAN-adaptive-scheduling.md
 DESIGN-thread-broker.md
 COMPLETION-thread-broker.md
+thread-broker-review-2.md
 
 # Raw thread-broker oracle runs are large, machine-local evidence.
 benchmark_results/
@@ -51,12 +52,33 @@ benchmark_results/
 # COMPLETION-thread-broker.md; they are deliberately not release artifacts.
 scripts/__pycache__/
 scripts/scatac_progress_overhead.py
+scripts/scatac_policy_geometry.py
 scripts/thread_broker_oracle.py
 scripts/thread_broker_oracle.example.json
+scripts/thread_broker_oracle.formal.json
+scripts/thread_broker_oracle.normal.json
+scripts/thread_broker_oracle.light.json
+scripts/thread_broker_oracle.normal-selective.json
+scripts/thread_broker_oracle.long-normal.json
 scripts/thread_broker_overhead.py
 scripts/thread_broker_overhead.example.json
 scripts/thread_broker_policy_overhead.py
 scripts/thread_broker_policy_overhead.example.json
+scripts/thread_broker_policy_overhead.formal.json
+scripts/thread_broker_policy_overhead.normal.json
+scripts/thread_broker_policy_overhead.light.json
+scripts/thread_broker_fifo_matrix.py
+scripts/rapidgzip_busy_time_overhead.py
+scripts/thread_broker_measurement_gate.py
+scripts/thread_broker_measurement_gate.example.json
+scripts/thread_broker_gate_fixtures.py
+scripts/thread_broker_flow_gate.py
+scripts/thread_broker_flow_gate.example.json
+scripts/thread_broker_flow_gate.formal.json
+scripts/thread_broker_flow_gate.recovery.formal.json
+scripts/thread_broker_flow_gate.normal.json
+scripts/thread_broker_flow_gate.recovery.normal.json
+scripts/thread_broker_ratification_replay.py
 examples/canonical_rad.rs
 examples/fastq_prefix.rs
 tests/cli_help.rs

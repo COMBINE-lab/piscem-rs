@@ -34,13 +34,15 @@ pub use paraseq::parallel::{
 /// at steady state.
 pub const READER_BATCH_SIZE: usize = 16384;
 
-/// scATAC batch size, chosen to preserve the resizable-pool acknowledgement
-/// bound under its much more expensive per-record mapping callback.
+/// scATAC batch size, chosen for its much more expensive per-record mapping
+/// callback.
 ///
 /// A worker can retire only after completing the batch it owns; 16K scATAC
 /// records exceeded the broker's two-second drain timeout on a real
-/// negative-scaling workload. Other modalities retain [`READER_BATCH_SIZE`]
-/// because their measured throughput plateau favors the larger batch.
+/// negative-scaling workload. The size is not only a broker concession: on the
+/// two-million-record gate, 1K also beat 16K for serial scATAC by 7.7% wall,
+/// 6.8% CPU, and 6.1% RSS, while aggregate-pinned remained within 1.8% and used
+/// less memory. Progress publication, unlike batching, is policy-scoped.
 pub const SCATAC_READER_BATCH_SIZE: usize = 1024;
 
 /// Build a paraseq fastx Reader with the shared piscem batch size.
@@ -50,11 +52,12 @@ pub fn reader_with_batch_size<R: std::io::Read>(
     paraseq::fastx::Reader::new_with_batch_size(inner, READER_BATCH_SIZE)
 }
 
-/// Build a scATAC reader with resize-bounded work granularity.
+/// Build a scATAC reader at the policy-selected batch size.
 pub fn scatac_reader<R: std::io::Read>(
     inner: R,
+    batch_size: usize,
 ) -> Result<paraseq::fastx::Reader<R>, paraseq::Error> {
-    paraseq::fastx::Reader::new_with_batch_size(inner, SCATAC_READER_BATCH_SIZE)
+    paraseq::fastx::Reader::new_with_batch_size(inner, batch_size)
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +84,138 @@ pub struct OpenedInput {
     pub reader: Box<dyn std::io::Read + Send>,
     #[cfg(feature = "rapidgzip")]
     pub handle: Option<rapidgzip_core::DecoderHandle>,
+}
+
+/// Validation-only finite decoded-stream lull schedule: `MIB:MS[,MS...]`.
+///
+/// This is deliberately not a user-facing performance option. Gate G uses it
+/// to inject each listed 0.25--1.0 s flow lull once, separated by `MIB`
+/// decoded MiB, into otherwise regular files. This preserves rapidgzip's real
+/// positional decoder path, then leaves a clean tail in which controller
+/// recovery from source/flow transients can be observed.
+pub const VALIDATION_READ_LULL_ENV: &str = "PISCEM_VALIDATION_READ_LULL";
+pub const VALIDATION_READ_LULL_TRACE_ENV: &str = "PISCEM_VALIDATION_READ_LULL_TRACE";
+pub const VALIDATION_READ_LULL_MATCH_ENV: &str = "PISCEM_VALIDATION_READ_LULL_MATCH";
+
+#[cfg(any(feature = "rapidgzip", test))]
+struct ValidationLullReader {
+    inner: Box<dyn std::io::Read + Send>,
+    every_bytes: u64,
+    durations: Vec<std::time::Duration>,
+    decoded_bytes: u64,
+    next_lull: u64,
+    lull_index: usize,
+    started: std::time::Instant,
+    trace_path: Option<std::path::PathBuf>,
+}
+
+#[cfg(any(feature = "rapidgzip", test))]
+impl std::io::Read for ValidationLullReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buf)?;
+        self.decoded_bytes = self.decoded_bytes.saturating_add(count as u64);
+        if count != 0 && self.decoded_bytes >= self.next_lull {
+            let duration = self.durations[self.lull_index];
+            let started_nanos = self.started.elapsed().as_nanos() as u64;
+            std::thread::sleep(duration);
+            if let Some(path) = &self.trace_path {
+                use std::io::Write as _;
+                let mut trace = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                let mut contents = serde_json::to_vec(&serde_json::json!({
+                    "started_nanos": started_nanos,
+                    "ended_nanos": self.started.elapsed().as_nanos() as u64,
+                    "duration_nanos": duration.as_nanos() as u64,
+                    "decoded_bytes": self.decoded_bytes,
+                }))
+                .map_err(std::io::Error::other)?;
+                contents.push(b'\n');
+                // One append write keeps traces from separate paired readers
+                // record-aligned when a validation run intentionally stalls
+                // more than one stream.
+                trace.write_all(&contents)?;
+            }
+            self.lull_index += 1;
+            self.next_lull = if self.lull_index == self.durations.len() {
+                u64::MAX
+            } else {
+                self.next_lull.saturating_add(self.every_bytes)
+            };
+        }
+        Ok(count)
+    }
+}
+
+#[cfg(any(feature = "rapidgzip", test))]
+fn parse_validation_lull_schedule(value: &str) -> Result<(u64, Vec<std::time::Duration>)> {
+    let (mib, durations) = value.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!("{VALIDATION_READ_LULL_ENV} must have the form MIB:MS[,MS...]")
+    })?;
+    let mib = mib.parse::<u64>().map_err(|error| {
+        anyhow::anyhow!("invalid MiB interval in {VALIDATION_READ_LULL_ENV}={value:?}: {error}")
+    })?;
+    if mib == 0 {
+        anyhow::bail!("{VALIDATION_READ_LULL_ENV} MiB interval must be positive");
+    }
+    let durations: Vec<_> = durations
+        .split(',')
+        .map(|duration| {
+            duration.parse::<u64>().map(std::time::Duration::from_millis).map_err(
+                |error| {
+                    anyhow::anyhow!(
+                        "invalid millisecond duration in {VALIDATION_READ_LULL_ENV}={value:?}: {error}"
+                    )
+                },
+            )
+        })
+        .collect::<Result<_>>()?;
+    if durations.is_empty() || durations.contains(&std::time::Duration::ZERO) {
+        anyhow::bail!("{VALIDATION_READ_LULL_ENV} durations must be positive");
+    }
+    Ok((mib.saturating_mul(1024 * 1024), durations))
+}
+
+#[cfg(feature = "rapidgzip")]
+fn validation_lull_schedule() -> Result<Option<(u64, Vec<std::time::Duration>)>> {
+    let Some(value) = std::env::var_os(VALIDATION_READ_LULL_ENV) else {
+        return Ok(None);
+    };
+    Ok(Some(parse_validation_lull_schedule(
+        &value.to_string_lossy(),
+    )?))
+}
+
+#[cfg(feature = "rapidgzip")]
+fn wrap_validation_lulls(mut opened: OpenedInput, path: &Path) -> Result<OpenedInput> {
+    let Some((every_bytes, durations)) = validation_lull_schedule()? else {
+        return Ok(opened);
+    };
+    if let Some(pattern) = std::env::var_os(VALIDATION_READ_LULL_MATCH_ENV)
+        && !pattern.is_empty()
+        && !path.to_string_lossy().contains(&*pattern.to_string_lossy())
+    {
+        return Ok(opened);
+    }
+    tracing::warn!(
+        every_bytes,
+        durations = ?durations,
+        "validation-only decoded-stream lulls enabled"
+    );
+    opened.reader = Box::new(ValidationLullReader {
+        inner: opened.reader,
+        every_bytes,
+        durations,
+        decoded_bytes: 0,
+        next_lull: every_bytes,
+        lull_index: 0,
+        started: std::time::Instant::now(),
+        trace_path: std::env::var_os(VALIDATION_READ_LULL_TRACE_ENV)
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from),
+    });
+    Ok(opened)
 }
 
 #[cfg(feature = "rapidgzip")]
@@ -238,13 +373,15 @@ pub fn open_input_pooled(
     decoder_threads: usize,
 ) -> Result<OpenedInput> {
     let path = path.as_ref();
-    if let Some(pool) = pool
+    let opened = if let Some(pool) = pool
         && crate::io::calibrate::classify_input(path) == crate::io::calibrate::InputKind::Regular
         && let Some(opened) = open_gz_pooled(path, pool, decoder_threads)?
     {
-        return Ok(opened);
-    }
-    open_input(path, 0)
+        opened
+    } else {
+        open_input(path, 0)?
+    };
+    wrap_validation_lulls(opened, path)
 }
 
 /// Open a single file with automatic decompression (gzip, zstd, etc.).
@@ -328,11 +465,24 @@ pub struct ExecutionPlan {
 pub struct PipelineOutcome {
     pub execution_plan: ExecutionPlan,
     pub broker_report: Option<thread_broker::BrokerReport>,
+    /// Advisory lifecycle failure, retained even when no partial broker report
+    /// exists (for example, a measurement or controller thread spawn failure).
+    pub broker_failure: Option<crate::io::broker::BrokerFailure>,
     pub producer_measurement: Option<thread_broker::ProducerMeasurementStats>,
     pub consumer_measurement: crate::io::threads::ConsumerMeasurement,
+    /// Application-side cadence/batch choices needed to reproduce a run.
+    pub tuning: Option<PipelineTuning>,
     /// Real mapping-pipeline wall time, excluding index load and output
     /// backpatching, for reproducible fixed-split comparisons.
     pub mapping_elapsed_secs: f64,
+}
+
+/// Application-side scheduling geometry recorded beside the generic execution
+/// plan. `None` for modalities that use their global reader/progress defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct PipelineTuning {
+    pub reader_batch_size: usize,
+    pub progress_flush_every: u64,
 }
 
 /// Controller cadence chosen from the effective execution budget.
@@ -634,13 +784,62 @@ impl std::io::Read for MultiReader {
 mod tests {
     use super::{
         DecodeAllocation, DecodePinSource, build_execution_plan, collection_share_floor,
-        environment_allocation,
+        environment_allocation, parse_validation_lull_schedule,
     };
+    use std::io::Read as _;
 
     #[test]
     fn test_open_concatenated_readers_empty() {
         let result = super::open_concatenated_readers(&[]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn validation_lull_schedule_is_strict() {
+        let (bytes, durations) = parse_validation_lull_schedule("64:250,500,1000").unwrap();
+        assert_eq!(bytes, 64 * 1024 * 1024);
+        assert_eq!(
+            durations,
+            [250, 500, 1000].map(std::time::Duration::from_millis)
+        );
+        for invalid in ["", "64", "0:250", "64:", "64:0", "x:250", "64:x"] {
+            assert!(
+                parse_validation_lull_schedule(invalid).is_err(),
+                "accepted invalid schedule {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_lull_reader_preserves_bytes_and_exhausts_finite_durations() {
+        let payload = b"abcdefghijkl";
+        let mut reader = super::ValidationLullReader {
+            inner: Box::new(std::io::Cursor::new(payload.to_vec())),
+            every_bytes: 4,
+            durations: vec![
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_millis(2),
+            ],
+            decoded_bytes: 0,
+            next_lull: 4,
+            lull_index: 0,
+            started: std::time::Instant::now(),
+            trace_path: None,
+        };
+        let started = std::time::Instant::now();
+        let mut decoded = Vec::new();
+        let mut chunk = [0u8; 4];
+        loop {
+            let read = reader.read(&mut chunk).unwrap();
+            if read == 0 {
+                break;
+            }
+            decoded.extend_from_slice(&chunk[..read]);
+        }
+        assert_eq!(decoded, payload);
+        assert_eq!(reader.lull_index, 2);
+        assert_eq!(reader.next_lull, u64::MAX);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(3));
     }
 
     #[test]

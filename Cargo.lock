@@ -2185,7 +2185,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 [[package]]
 name = "rapidgzip-core"
 version = "0.2.1"
-source = "git+https://github.com/COMBINE-lab/rapidgzip-rust.git?rev=dee928f90c9ab389bee11db62d59c97bcda6469e#dee928f90c9ab389bee11db62d59c97bcda6469e"
+source = "git+https://github.com/COMBINE-lab/rapidgzip-rust.git?rev=276a41f77fb927e24cb0898a638a08b21eb048c6#276a41f77fb927e24cb0898a638a08b21eb048c6"
 dependencies = [
  "bon",
  "cpu-time",

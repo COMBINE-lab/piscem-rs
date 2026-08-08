@@ -177,6 +177,16 @@ struct BufferedProducer {
     buffered: Arc<AtomicU64>,
 }
 
+struct ResettingConsumer {
+    pipeline: Arc<Pipeline>,
+    calls: AtomicUsize,
+}
+
+struct ResettingProducer {
+    pipeline: Arc<Pipeline>,
+    calls: AtomicUsize,
+}
+
 type RefusalRule = fn(target: usize, call: usize) -> bool;
 
 struct FaultyConsumer {
@@ -308,6 +318,52 @@ impl Producer for BufferedProducer {
 
     fn work(&self) -> Work {
         FakeProducer(Arc::clone(&self.pipeline)).work()
+    }
+}
+
+impl Consumer for ResettingConsumer {
+    fn set_threads(&self, n: usize) -> Result<(), thread_broker::ResizeError> {
+        FakeConsumer(Arc::clone(&self.pipeline)).set_threads(n)
+    }
+
+    fn live_threads(&self) -> usize {
+        FakeConsumer(Arc::clone(&self.pipeline)).live_threads()
+    }
+
+    fn work(&self) -> Work {
+        let work = FakeConsumer(Arc::clone(&self.pipeline)).work();
+        if self.calls.fetch_add(1, Ordering::Relaxed) == 3 {
+            Work::default()
+        } else {
+            work
+        }
+    }
+}
+
+impl Producer for ResettingProducer {
+    fn set_limit(&self, n: usize) -> Result<(), thread_broker::ResizeError> {
+        FakeProducer(Arc::clone(&self.pipeline)).set_limit(n)
+    }
+
+    fn limit(&self) -> usize {
+        FakeProducer(Arc::clone(&self.pipeline)).limit()
+    }
+
+    fn active_slots(&self) -> usize {
+        FakeProducer(Arc::clone(&self.pipeline)).active_slots()
+    }
+
+    fn work(&self) -> Work {
+        let work = FakeProducer(Arc::clone(&self.pipeline)).work();
+        if self.calls.fetch_add(1, Ordering::Relaxed) == 3 {
+            Work::default()
+        } else {
+            work
+        }
+    }
+
+    fn pressure(&self) -> ProducerPressure {
+        FakeProducer(Arc::clone(&self.pipeline)).pressure()
     }
 }
 
@@ -1219,6 +1275,64 @@ fn sampler_panics_are_returned_instead_of_default_reports() {
             .unwrap();
     let error = broker.finish().expect_err("panic must surface");
     assert!(matches!(error.kind(), BrokerErrorKind::ThreadPanicked));
+}
+
+#[test]
+fn decreasing_consumer_counters_are_a_structured_failure() {
+    let p = Pipeline::new(1_000.0, 1_000.0, 30, 2);
+    let broker = ThreadBroker::builder_with(
+        ResettingConsumer {
+            pipeline: Arc::clone(&p),
+            calls: AtomicUsize::new(0),
+        },
+        FakeProducer(p),
+        quick(),
+    )
+    .budget(32)
+    .initial_producer_slots(2)
+    .build()
+    .unwrap()
+    .start()
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    let error = broker.finish().expect_err("counter reset must surface");
+    assert!(matches!(
+        error.kind(),
+        BrokerErrorKind::WorkCountersRegressed {
+            side: ResizeSide::Consumer,
+            ..
+        }
+    ));
+    assert!(error.report().is_some());
+}
+
+#[test]
+fn decreasing_producer_counters_are_a_structured_failure() {
+    let p = Pipeline::new(1_000.0, 1_000.0, 30, 2);
+    let broker = ThreadBroker::builder_with(
+        FakeConsumer(Arc::clone(&p)),
+        ResettingProducer {
+            pipeline: p,
+            calls: AtomicUsize::new(0),
+        },
+        quick(),
+    )
+    .budget(32)
+    .initial_producer_slots(2)
+    .build()
+    .unwrap()
+    .start()
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    let error = broker.finish().expect_err("counter reset must surface");
+    assert!(matches!(
+        error.kind(),
+        BrokerErrorKind::WorkCountersRegressed {
+            side: ResizeSide::Producer,
+            ..
+        }
+    ));
+    assert!(error.report().is_some());
 }
 
 #[test]
