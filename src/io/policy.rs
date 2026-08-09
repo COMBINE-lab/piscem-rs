@@ -135,3 +135,16 @@ mod tests {
         assert!(!ThreadPolicy::default().parallel_decode.engages(1024, 0));
     }
 }
+
+#[cfg(test)]
+mod show {
+    use super::*;
+    #[test]
+    #[ignore = "prints the canonical policy document"]
+    fn canonical_form() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&ThreadPolicy::default()).unwrap()
+        );
+    }
+}
