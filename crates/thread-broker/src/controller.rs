@@ -17,7 +17,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::{
-    BrokerError, BrokerErrorKind, Consumer, Producer, ProducerMeasurementMode,
+    BrokerError, BrokerErrorKind, Consumer, OpeningPolicy, Producer, ProducerMeasurementMode,
     ProducerMeasurementStats, ProducerPressure, ResizeSide, SteadyStatePolicy, Stop, ThreadBroker,
     Work, idle_fraction, now,
 };
@@ -41,6 +41,8 @@ pub struct BrokerReport {
     pub controller_cpu_accounting_failures: usize,
     /// Effective cadence between responsive steady-state probes.
     pub steady_probe_interval: Duration,
+    /// Cost and result of the optional startup-only opening bracket.
+    pub opening_bracket: OpeningBracketReport,
     /// Consumer threads at each decision, in order.
     pub consumer_trajectory: Vec<usize>,
     /// Producer limit at each decision, in order.
@@ -63,17 +65,13 @@ pub struct BrokerReport {
     pub moves: usize,
     /// Moves undone because throughput got worse.
     pub reverts: usize,
-    /// Guarded response-curve probes attempted after the isolated cost model
-    /// collapsed to the producer floor.
+    /// Guarded local candidates attempted after the opening rejected or could
+    /// not distinguish the model's differing answer.
     pub nonlinear_probes: usize,
     /// Probe targets retained because their throughput confidence interval was
     /// strictly better than the previous split.
     pub nonlinear_probe_improvements: usize,
-    /// Extra probe horizons used to distinguish an interior candidate's
-    /// post-resize ramp from its settled throughput. Bounded to four per local
-    /// refinement and never used during steady-state monitoring.
-    pub nonlinear_probe_extensions: usize,
-    /// Whether the final split is held by measured nonlinear response evidence
+    /// Whether the final split is held by measured opening-bracket evidence
     /// rather than the allocation-independent cost model.
     pub nonlinear_override: bool,
     /// Ratifications whose uncertainty interval could not establish a
@@ -119,6 +117,41 @@ pub struct BrokerReport {
     pub terminal_error: Option<String>,
     /// Last solved model, for diagnosing a split that looks wrong.
     pub final_model: Option<Model>,
+}
+
+/// Auditable cost and result of [`OpeningPolicy::Bracket`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct OpeningBracketReport {
+    /// Candidate allocations whose evidence horizon completed. The already
+    /// measured opening is not counted.
+    pub points_measured: usize,
+    /// Clean throughput samples consumed by candidate evidence horizons.
+    pub samples: usize,
+    /// Wall time from first stable disagreement until the bracket completed.
+    pub wall_nanos: u64,
+    pub outcome: OpeningBracketOutcome,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpeningBracketOutcome {
+    #[default]
+    NotConfigured,
+    /// The first stable model answer matched the opening, so no bracket work
+    /// was performed.
+    ModelAgreed,
+    /// The model's differing answer was measured and retained.
+    ModelSelected,
+    /// The model answer and local alternatives failed to beat the opening.
+    OpeningRetained,
+    /// A measured local alternative beat both the model answer and opening.
+    AlternativeSelected,
+    /// The configured wall budget ended the experiment.
+    BudgetExhausted,
+    /// Mapping ended before the experiment reached a decision.
+    Incomplete,
+    /// The model-only freeze policy deliberately skipped calibration.
+    SkippedBySteadyPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
@@ -306,6 +339,9 @@ enum Phase {
     },
     /// A move was just applied; measurements are contaminated until it settles.
     Blackout { left: usize, next: Box<Phase> },
+    /// The opening bracket exhausted its wall budget. Restore the last proven
+    /// split before returning to ordinary steady-state control.
+    OpeningBracketRestore { restore: Split },
     /// The move has settled. Is throughput actually better?
     Ratify {
         left: usize,
@@ -323,6 +359,7 @@ enum Phase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RatificationKind {
     Model,
+    OpeningModel,
     NonlinearProbe,
 }
 
@@ -331,7 +368,7 @@ impl Phase {
         match self {
             Self::Survey => BrokerPhase::Survey,
             Self::Draining { .. } => BrokerPhase::Draining,
-            Self::Blackout { .. } => BrokerPhase::Blackout,
+            Self::Blackout { .. } | Self::OpeningBracketRestore { .. } => BrokerPhase::Blackout,
             Self::Ratify { .. } => BrokerPhase::Ratifying,
             Self::Steady { .. } => BrokerPhase::Steady,
         }
@@ -346,7 +383,9 @@ impl Phase {
 
     fn measurement_mode(&self) -> ProducerMeasurementMode {
         match self {
-            Self::Survey | Self::Ratify { .. } => ProducerMeasurementMode::Calibration,
+            Self::Survey | Self::Ratify { .. } | Self::OpeningBracketRestore { .. } => {
+                ProducerMeasurementMode::Calibration
+            }
             Self::Draining { .. } | Self::Blackout { .. } | Self::Steady { .. } => {
                 ProducerMeasurementMode::Monitoring
             }
@@ -410,9 +449,26 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
         let controller_cpu = crate::ThreadCpuTimer::start();
         let cfg = self.config;
         let steady_probe_interval = cfg.steady_probe_interval.unwrap_or(cfg.sample_interval);
+        let opening_bracket = match cfg.opening_policy {
+            OpeningPolicy::Fixed => None,
+            OpeningPolicy::Bracket(bracket) => Some(bracket),
+        };
+        let opening_bracket_enabled = opening_bracket.is_some()
+            && matches!(
+                self.steady_state_policy,
+                SteadyStatePolicy::Responsive | SteadyStatePolicy::FreezeAfterFullCalibration
+            );
         let mut report = BrokerReport {
             steady_state_policy: self.steady_state_policy,
             steady_probe_interval,
+            opening_bracket: OpeningBracketReport {
+                outcome: match (opening_bracket, opening_bracket_enabled) {
+                    (None, _) => OpeningBracketOutcome::NotConfigured,
+                    (Some(_), false) => OpeningBracketOutcome::SkippedBySteadyPolicy,
+                    (Some(_), true) => OpeningBracketOutcome::Incomplete,
+                },
+                ..OpeningBracketReport::default()
+            },
             ..BrokerReport::default()
         };
 
@@ -441,7 +497,10 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
         // the baseline made the test a coin flip: one unlucky window sets a bar
         // the move cannot clear, or an unusually good one hides a genuine
         // regression.
-        let mut recent = Recent::new(cfg.ratify_samples);
+        let opening_bracket_samples = opening_bracket
+            .map(|bracket| duration_samples(bracket.horizon, cfg.sample_interval))
+            .unwrap_or(0);
+        let mut recent = Recent::new(cfg.ratify_samples.max(opening_bracket_samples));
         let mut caps = Caps::new(cfg.cap_history, cfg.cap_persistence);
         // Targets that were tried and made throughput worse. FDP calls this the
         // tabu set; without it a model that keeps recomputing the same answer
@@ -459,18 +518,10 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
         // no one-point service-cost estimate can identify. The cheaper
         // convergence freeze is explicitly model-only; full-calibration freeze
         // runs the same bounded probe as responsive mode before stopping.
-        let nonlinear_probe_enabled = cfg.nonlinear_probes
-            && matches!(
-                self.steady_state_policy,
-                SteadyStatePolicy::Responsive | SteadyStatePolicy::FreezeAfterFullCalibration
-            );
-        let mut nonlinear_targets = nonlinear_probe_targets(
-            self.budget,
-            cfg.min_consumer_threads,
-            initial.1,
-            cfg.nonlinear_max_producer_slots,
-        );
-        let mut nonlinear_probe_complete = !nonlinear_probe_enabled;
+        let mut nonlinear_targets = std::collections::VecDeque::new();
+        let mut nonlinear_probe_complete = !opening_bracket_enabled;
+        let mut opening_bracket_started: Option<Instant> = None;
+        let mut opening_bracket_points_started = 0usize;
         let mut nonlinear_override = false;
         // The achieved estimate at the last retained nonlinear point. Reusing
         // it makes the next probe compare adjacent points on the response
@@ -478,23 +529,9 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
         // baseline for the first point.
         let mut nonlinear_rate: Option<RateEstimate> = None;
         // Best *proven* point in the current bounded exploration. An
-        // inconclusive intermediate point is allowed to lead to the next
-        // geometric target, but is never made the rollback destination.
+        // inconclusive candidate is never made the rollback destination.
         let mut nonlinear_best_split: Option<Split> = None;
-        // The best point before the current best. If the next geometric point
-        // fails, these two retained points bracket an unmeasured discrete
-        // neighbor (for example 4 -> 6 skips 5) that must be refined before the
-        // response curve can be called complete.
-        let mut nonlinear_previous_best: Option<Split> = None;
         let mut nonlinear_tried = std::collections::HashSet::new();
-        // A local interior probe grows the consumer side after the response
-        // search has deliberately visited a producer-heavy endpoint. Give
-        // that one transition a longer stabilization blackout; its new
-        // consumer threads otherwise pay cold-start cost in the candidate
-        // interval while the retained baseline is already warm.
-        let mut nonlinear_next_blackout_samples: Option<usize> = None;
-        let mut nonlinear_interior_target: Option<usize> = None;
-        let mut nonlinear_interior_extensions_used = 0usize;
         // Model drift is meaningful only relative to the model that established
         // the settled split. Comparing only the newly rounded target makes a
         // stable share near a slot boundary alternate forever between adjacent
@@ -507,12 +544,26 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
             // window. Only an already-converged responsive broker adopts the
             // sparse cadence; otherwise a five-minute probe interval would also
             // delay convergence (and freeze) by five minutes.
-            let interval =
+            let mut interval =
                 if matches!(phase, Phase::Steady { .. }) && report.time_to_converge.is_some() {
                     steady_probe_interval
                 } else {
                     cfg.sample_interval
                 };
+            // A wall-bounded startup bracket must not inherit a long steady
+            // sleep just as its deadline arrives. Wake on the deadline itself;
+            // an in-flight drain remains governed by resize_timeout because it
+            // is unsafe to grow the opposite pool before shrink acknowledgement.
+            if !matches!(phase, Phase::Draining { .. })
+                && !nonlinear_probe_complete
+                && let (Some(bracket), Some(bracket_started)) =
+                    (opening_bracket, opening_bracket_started)
+            {
+                let remaining = bracket
+                    .total_budget
+                    .saturating_sub(now().saturating_duration_since(bracket_started));
+                interval = interval.min(remaining);
+            }
             if stop.wait_timeout(interval) {
                 break;
             }
@@ -626,8 +677,62 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
             if !matches!(phase, Phase::Survey) {
                 pressure_vetoed_for = Duration::ZERO;
             }
+            let opening_bracket_expired = !nonlinear_probe_complete
+                && opening_bracket.is_some_and(|bracket| {
+                    opening_bracket_started.is_some_and(|started| {
+                        sampled_at.saturating_duration_since(started) >= bracket.total_budget
+                    })
+                });
 
             phase = match phase {
+                Phase::OpeningBracketRestore { restore } => {
+                    nonlinear_probe_complete = true;
+                    nonlinear_targets.clear();
+                    finish_opening_bracket(
+                        &mut report,
+                        &mut opening_bracket_started,
+                        OpeningBracketOutcome::BudgetExhausted,
+                        sampled_at,
+                    );
+                    settled_rate = nonlinear_rate.map(|rate| rate.mean);
+                    recent.clear();
+                    if split == restore {
+                        Phase::Steady {
+                            drifted_for: Duration::ZERO,
+                        }
+                    } else {
+                        report.reverts += 1;
+                        match self.begin_move(
+                            split,
+                            restore,
+                            Phase::Blackout {
+                                left: cfg.blackout_samples,
+                                next: Box::new(Phase::Steady {
+                                    drifted_for: Duration::ZERO,
+                                }),
+                            },
+                        ) {
+                            Ok((interim, phase)) => {
+                                split = interim;
+                                phase
+                            }
+                            Err(kind) => {
+                                report.final_consumer_threads = split.0;
+                                report.final_producer_limit = split.1;
+                                report.final_consumer_live = live;
+                                report.final_producer_active = active;
+                                return Err(runtime_failure(
+                                    kind,
+                                    report,
+                                    split,
+                                    (live, active),
+                                    BrokerPhase::Blackout,
+                                    epoch,
+                                ));
+                            }
+                        }
+                    }
+                }
                 Phase::Draining {
                     side,
                     to,
@@ -707,7 +812,11 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                 }
 
                 Phase::Blackout { left, next } => {
-                    if !rate_clean {
+                    if opening_bracket_expired {
+                        Phase::OpeningBracketRestore {
+                            restore: nonlinear_best_split.unwrap_or(initial),
+                        }
+                    } else if !rate_clean {
                         Phase::Blackout { left, next }
                     } else if left > 1 {
                         Phase::Blackout {
@@ -730,7 +839,11 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                     mut rates,
                     kind,
                 } => {
-                    if !rate_clean {
+                    if opening_bracket_expired {
+                        Phase::OpeningBracketRestore {
+                            restore: nonlinear_best_split.unwrap_or(initial),
+                        }
+                    } else if !rate_clean {
                         Phase::Ratify {
                             left,
                             from,
@@ -741,6 +854,12 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                         }
                     } else {
                         rates.push(rate_per_second(dc.items, window));
+                        if matches!(
+                            kind,
+                            RatificationKind::OpeningModel | RatificationKind::NonlinearProbe
+                        ) {
+                            report.opening_bracket.samples += 1;
+                        }
                         if left > 1 {
                             Phase::Ratify {
                                 left: left - 1,
@@ -752,47 +871,19 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                             }
                         } else {
                             let achieved = RateEstimate::from_rates(rates.iter().copied());
+                            if matches!(
+                                kind,
+                                RatificationKind::OpeningModel | RatificationKind::NonlinearProbe
+                            ) {
+                                report.opening_bracket.points_measured += 1;
+                            }
                             if kind == RatificationKind::NonlinearProbe {
                                 let improved = nonlinear_probe_improved(
                                     baseline,
                                     achieved,
                                     cfg.regression_tolerance,
                                 );
-                                if !improved
-                                    && nonlinear_interior_target == Some(target)
-                                    && target < from.1
-                                    && nonlinear_interior_extensions_used < 4
-                                {
-                                    // Unlike coarse publication, this is not a
-                                    // signal-resolution problem: the candidate
-                                    // has just grown consumer threads and the
-                                    // resolved 25 ms windows still show a real
-                                    // ramp. Extend this one startup experiment
-                                    // in bounded horizons rather than changing
-                                    // any recurring cadence.
-                                    nonlinear_interior_extensions_used += 1;
-                                    report.nonlinear_probe_extensions += 1;
-                                    tracing::debug!(
-                                        "thread-broker: extending interior producer {} probe \
-                                         with confirmation horizon {} ({:.0} vs {:.0} items/s)",
-                                        target,
-                                        nonlinear_interior_extensions_used,
-                                        achieved.mean,
-                                        baseline.mean,
-                                    );
-                                    // Judge successive settled horizons, not a
-                                    // cumulative block that permanently carries
-                                    // the candidate's cold-start windows.
-                                    rates.clear();
-                                    Phase::Ratify {
-                                        left: cfg.nonlinear_probe_samples,
-                                        from,
-                                        target,
-                                        baseline,
-                                        rates,
-                                        kind,
-                                    }
-                                } else if improved {
+                                if improved {
                                     tracing::debug!(
                                         "thread-broker: nonlinear probe kept producer {} -> {} \
                                          ({:.0} [{:.0}, {:.0}] vs {:.0} [{:.0}, {:.0}] items/s)",
@@ -808,14 +899,23 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                     report.nonlinear_probe_improvements += 1;
                                     nonlinear_override = true;
                                     nonlinear_rate = Some(achieved);
-                                    nonlinear_previous_best = nonlinear_best_split;
                                     nonlinear_best_split = Some(split);
-                                    if nonlinear_interior_target == Some(target) {
-                                        nonlinear_interior_target = None;
-                                        nonlinear_interior_extensions_used = 0;
-                                    }
                                     settled_rate = Some(achieved.mean);
                                     costs.clear();
+                                    // The model has already lost to the
+                                    // opening. The first local point is on the
+                                    // opposite side of that rejected answer;
+                                    // once it proves an improvement, continuing
+                                    // back toward the rejected model cannot
+                                    // justify another startup move.
+                                    nonlinear_probe_complete = true;
+                                    nonlinear_targets.clear();
+                                    finish_opening_bracket(
+                                        &mut report,
+                                        &mut opening_bracket_started,
+                                        OpeningBracketOutcome::AlternativeSelected,
+                                        sampled_at,
+                                    );
                                     Phase::Steady {
                                         drifted_for: Duration::ZERO,
                                     }
@@ -836,39 +936,27 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                     if comparison == RatificationOutcome::Inconclusive {
                                         report.inconclusive_ratifications += 1;
                                     }
-                                    // The optional response search has a higher
-                                    // burden than an ordinary model move: every
-                                    // retained point must prove improvement. A
-                                    // failed point brackets the local peak; do
-                                    // not keep spending startup moves on more
-                                    // extreme allocations in the same direction.
-                                    nonlinear_targets.clear();
+                                    // Every optional point has the higher
+                                    // burden of proving improvement. A failure
+                                    // does not discard a queued candidate on
+                                    // the other side of the opening: that point
+                                    // is what turns a one-sided guess into a
+                                    // bracket.
                                     costs.clear();
                                     if nonlinear_targets.is_empty() {
-                                        let best = nonlinear_best_split.unwrap_or(from);
-                                        let refinement = nonlinear_previous_best
-                                            .and_then(|previous| {
-                                                interior_neighbor(best.1, previous.1)
-                                            })
-                                            .or_else(|| interior_neighbor(best.1, target));
-                                        if let Some(candidate) = refinement
-                                            && !nonlinear_tried.contains(&candidate)
-                                        {
-                                            nonlinear_targets.push_front(candidate);
-                                            nonlinear_interior_target = Some(candidate);
-                                            nonlinear_interior_extensions_used = 0;
-                                            nonlinear_next_blackout_samples = Some(
-                                                cfg.nonlinear_blackout_samples.saturating_mul(2),
-                                            );
-                                        }
-                                    }
-                                    if nonlinear_targets.is_empty() {
-                                        if nonlinear_interior_target == Some(target) {
-                                            nonlinear_interior_target = None;
-                                            nonlinear_interior_extensions_used = 0;
-                                        }
                                         nonlinear_probe_complete = true;
                                         let restore = nonlinear_best_split.unwrap_or(from);
+                                        let outcome = if nonlinear_override {
+                                            OpeningBracketOutcome::AlternativeSelected
+                                        } else {
+                                            OpeningBracketOutcome::OpeningRetained
+                                        };
+                                        finish_opening_bracket(
+                                            &mut report,
+                                            &mut opening_bracket_started,
+                                            outcome,
+                                            sampled_at,
+                                        );
                                         settled_rate = nonlinear_rate.map(|rate| rate.mean);
                                         nonlinear_best_split = None;
                                         recent.clear();
@@ -909,27 +997,19 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                             }
                                         }
                                     } else {
-                                        // The response can be non-monotone: an
-                                        // inconclusive half-budget point does
-                                        // not rule out a strong gain after
-                                        // reducing consumers again. Continue
-                                        // from here, but compare the next point
-                                        // with the last proven baseline. If a
-                                        // failed endpoint exposed an interior
-                                        // neighbor, physically restore that
-                                        // retained baseline before probing it.
-                                        // Otherwise the new point inherits the
-                                        // cold-start cost of growing consumers
-                                        // from the failed endpoint while being
-                                        // compared with a warm rate measured at
-                                        // the retained split.
+                                        // Restore the last proven point before
+                                        // measuring the queued candidate on the
+                                        // other side of the opening. Otherwise
+                                        // it inherits cold-start cost from a
+                                        // failed endpoint while being compared
+                                        // with a warm baseline.
                                         let restore = nonlinear_best_split.unwrap_or(from);
                                         if split != restore {
                                             match self.begin_move(
                                                 split,
                                                 restore,
                                                 Phase::Blackout {
-                                                    left: cfg.nonlinear_blackout_samples,
+                                                    left: cfg.blackout_samples,
                                                     next: Box::new(Phase::Steady {
                                                         drifted_for: Duration::ZERO,
                                                     }),
@@ -977,29 +1057,20 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                 // and still ships disabled by default.
                                 let comparison =
                                     compare_rates(baseline, achieved, cfg.regression_tolerance);
-                                let nonlinear_floor_validation = nonlinear_probe_enabled
-                                    && target == cfg.min_producer_slots
-                                    && from.1 > target;
-                                let floor_validation_requires_search =
-                                    nonlinear_floor_validation_requires_search(
-                                        nonlinear_probe_enabled,
-                                        cfg.min_producer_slots,
-                                        from.1,
-                                        target,
-                                        comparison,
-                                    );
-                                let unresolved_floor_validation = floor_validation_requires_search
+                                let opening_model_validation =
+                                    kind == RatificationKind::OpeningModel;
+                                let unresolved_opening_model = opening_model_validation
                                     && comparison == RatificationOutcome::Inconclusive;
                                 if comparison == RatificationOutcome::Regressed
-                                    || unresolved_floor_validation
+                                    || unresolved_opening_model
                                 {
                                     tracing::debug!(
                                         "thread-broker: reverting producer {} -> {} after {} \
                                          ({:.0} vs {:.0} items/s)",
                                         target,
                                         from.1,
-                                        if unresolved_floor_validation {
-                                            "inconclusive nonlinear floor validation"
+                                        if unresolved_opening_model {
+                                            "inconclusive opening-model validation"
                                         } else {
                                             "measured regression"
                                         },
@@ -1024,21 +1095,33 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                     } else {
                                         report.inconclusive_ratifications += 1;
                                     }
-                                    // An opt-in nonlinear policy validates the
-                                    // model's floor answer in the direction the
-                                    // model actually wants to move. If that
-                                    // measured shrink regresses, the opening is
-                                    // now a proven baseline and the existing
-                                    // upward/local response search has a reason
-                                    // to run. This distinguishes negative
-                                    // consumer scaling from an ordinary
-                                    // mapping-heavy split without treating an
-                                    // arbitrary opening as permanent evidence.
-                                    if nonlinear_floor_validation {
+                                    // A failed model candidate makes the
+                                    // opening the retained baseline. Spend the
+                                    // remaining point budget on the adjacent
+                                    // candidate away from the rejected model,
+                                    // then the adjacent candidate toward it if
+                                    // the first local test fails.
+                                    // This brackets both t32 (model wins below
+                                    // the opening) and t8 (the peak is just
+                                    // above it) without a geometric sweep.
+                                    if opening_model_validation {
                                         nonlinear_rate = Some(baseline);
                                         nonlinear_best_split = Some(from);
                                         nonlinear_tried.insert(from.1);
                                         nonlinear_tried.insert(target);
+                                        let bracket = opening_bracket.expect(
+                                            "opening model validation requires bracket config",
+                                        );
+                                        nonlinear_targets = opening_bracket_targets(
+                                            self.budget,
+                                            cfg.min_consumer_threads,
+                                            cfg.min_producer_slots,
+                                            from.1,
+                                            target,
+                                            bracket
+                                                .max_points
+                                                .saturating_sub(opening_bracket_points_started),
+                                        );
                                     }
                                     settled_rate = Some(baseline.mean);
                                     report.reverts += 1;
@@ -1076,18 +1159,21 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                     if comparison == RatificationOutcome::Inconclusive {
                                         report.inconclusive_ratifications += 1;
                                     }
-                                    // The floor-directed move itself is the
-                                    // cheapest discriminator. Once it has been
-                                    // retained, an upward response probe would
-                                    // only pay to revisit the opening it just
-                                    // improved on. A clear regression takes the
-                                    // branch above and enables that search.
-                                    if nonlinear_probe_enabled && target == cfg.min_producer_slots {
+                                    // The differing model answer was measured
+                                    // and retained. The bracket has answered
+                                    // its only question, so it must not add an
+                                    // exploratory tax after agreement.
+                                    if opening_model_validation {
                                         nonlinear_probe_complete = true;
                                         nonlinear_targets.clear();
                                         nonlinear_rate = None;
                                         nonlinear_best_split = None;
-                                        nonlinear_previous_best = None;
+                                        finish_opening_bracket(
+                                            &mut report,
+                                            &mut opening_bracket_started,
+                                            OpeningBracketOutcome::ModelSelected,
+                                            sampled_at,
+                                        );
                                     }
                                     // Kept. Re-survey once: the rates may have been
                                     // measured under a split that distorted them, and
@@ -1102,6 +1188,10 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                         }
                     }
                 }
+
+                Phase::Steady { .. } if opening_bracket_expired => Phase::OpeningBracketRestore {
+                    restore: nonlinear_best_split.unwrap_or(initial),
+                },
 
                 Phase::Steady { drifted_for } => {
                     // Keep solving, but act only on a large drift. The model is
@@ -1118,12 +1208,19 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                     if let Some(s) = &solved {
                         report.final_model = Some(s.snapshot);
                     }
+                    let bracket = opening_bracket;
+                    let bracket_budget_expired = bracket.is_some_and(|bracket| {
+                        opening_bracket_started.is_some_and(|started| {
+                            sampled_at.saturating_duration_since(started)
+                                + bracket.horizon.saturating_mul(2)
+                                > bracket.total_budget
+                        })
+                    });
+                    let bracket_has_point_budget = bracket
+                        .is_some_and(|bracket| opening_bracket_points_started < bracket.max_points);
                     let probe_target = if !nonlinear_probe_complete
-                        && (nonlinear_best_split.is_some()
-                            || nonlinear_override
-                            || solved
-                                .as_ref()
-                                .is_some_and(|model| model.target == cfg.min_producer_slots))
+                        && !bracket_budget_expired
+                        && bracket_has_point_budget
                     {
                         let target = loop {
                             match nonlinear_targets.pop_front() {
@@ -1138,35 +1235,61 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                         };
                         if target.is_none() {
                             nonlinear_probe_complete = true;
+                            let outcome = if nonlinear_override {
+                                OpeningBracketOutcome::AlternativeSelected
+                            } else {
+                                OpeningBracketOutcome::OpeningRetained
+                            };
+                            finish_opening_bracket(
+                                &mut report,
+                                &mut opening_bracket_started,
+                                outcome,
+                                sampled_at,
+                            );
                         }
                         target
                     } else {
-                        nonlinear_probe_complete = true;
+                        if !nonlinear_probe_complete {
+                            nonlinear_probe_complete = true;
+                            nonlinear_targets.clear();
+                            let outcome = if bracket_budget_expired {
+                                OpeningBracketOutcome::BudgetExhausted
+                            } else if nonlinear_override {
+                                OpeningBracketOutcome::AlternativeSelected
+                            } else {
+                                OpeningBracketOutcome::OpeningRetained
+                            };
+                            finish_opening_bracket(
+                                &mut report,
+                                &mut opening_bracket_started,
+                                outcome,
+                                sampled_at,
+                            );
+                        }
                         None
                     };
 
                     if let Some(target) = probe_target {
+                        opening_bracket_points_started += 1;
                         report.nonlinear_probes += 1;
                         let from = split;
                         let to = (self.budget - target, target);
-                        // A nonlinear probe is optional and must prove a real
+                        // A local bracket point is optional and must prove a real
                         // improvement, unlike a model-directed move which only
                         // has to avoid regression. Progress publishers must be
                         // fine grained enough that the ordinary ratification
                         // horizon is representative; stretching the horizon to
                         // compensate for bursty publication only delays the
                         // decision and hides the real measurement problem.
-                        let probe_samples = cfg.nonlinear_probe_samples;
-                        let probe_blackout_samples = nonlinear_next_blackout_samples
-                            .take()
-                            .unwrap_or(cfg.nonlinear_blackout_samples);
+                        let probe_samples = opening_bracket_samples;
+                        let probe_blackout_samples = cfg.blackout_samples;
                         let baseline = nonlinear_rate.unwrap_or_else(|| recent.estimate());
                         nonlinear_rate.get_or_insert(baseline);
                         nonlinear_best_split.get_or_insert(from);
                         nonlinear_tried.insert(from.1);
                         nonlinear_tried.insert(target);
                         tracing::debug!(
-                            "thread-broker: probing nonlinear response producer {} -> {}",
+                            "thread-broker: probing opening bracket producer {} -> {}",
                             from.1,
                             target,
                         );
@@ -1287,18 +1410,14 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                 nonlinear_override = false;
                                 nonlinear_rate = None;
                                 nonlinear_best_split = None;
-                                nonlinear_previous_best = None;
                                 nonlinear_tried.clear();
-                                nonlinear_next_blackout_samples = None;
-                                nonlinear_interior_target = None;
-                                nonlinear_interior_extensions_used = 0;
-                                nonlinear_targets = nonlinear_probe_targets(
-                                    self.budget,
-                                    cfg.min_consumer_threads,
-                                    split.1,
-                                    cfg.nonlinear_max_producer_slots,
-                                );
-                                nonlinear_probe_complete = !nonlinear_probe_enabled;
+                                // Opening calibration is deliberately
+                                // startup-only. A later regime change reuses
+                                // the ordinary model/ratification path and
+                                // cannot re-arm the bracket or its fine
+                                // measurement cadence.
+                                nonlinear_targets.clear();
+                                nonlinear_probe_complete = true;
                                 report.time_to_converge = None;
                                 settled_model = None;
                                 // Persistent drift was itself measured from a
@@ -1348,6 +1467,10 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                             } else {
                                 model.target
                             };
+                            let opening_model_disagrees = opening_bracket_enabled
+                                && !nonlinear_probe_complete
+                                && split == initial
+                                && model.target != initial.1;
                             // The cost model is intentionally primary, but it
                             // assumes allocation-independent service cost. At a
                             // low allocation, a decoder can under-report the
@@ -1367,7 +1490,8 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                 && model.snapshot.useful_cap_reason == ProducerCapReason::None;
                             let pressure_veto = target < split.1
                                 && pressure == ProducerPressure::Starved
-                                && current_capacity_used;
+                                && current_capacity_used
+                                && !opening_model_disagrees;
                             if pressure_veto {
                                 target = split.1;
                                 report.pressure_vetoed_shrinks += 1;
@@ -1376,11 +1500,27 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                 pressure_vetoed_for = Duration::ZERO;
                             }
                             let distance = target.abs_diff(split.1);
+                            let opening_disagrees = opening_model_disagrees;
+                            if opening_bracket_enabled
+                                && !nonlinear_probe_complete
+                                && split == initial
+                                && target == initial.1
+                            {
+                                finish_opening_bracket(
+                                    &mut report,
+                                    &mut opening_bracket_started,
+                                    OpeningBracketOutcome::ModelAgreed,
+                                    sampled_at,
+                                );
+                                nonlinear_probe_complete = true;
+                            } else if opening_disagrees && opening_bracket_started.is_none() {
+                                opening_bracket_started = Some(sampled_at);
+                            }
                             // A single queued snapshot can be a short decode
                             // burst, especially for mapping-heavy modalities.
                             // Keep surveying until starvation has persisted as
                             // long as other cap evidence before accepting the
-                            // current split as the bounded nonlinear correction.
+                            // current split as the bounded bracket correction.
                             if source_growth_wait {
                                 // Direct source pressure can arrive before its
                                 // duration-based cap is mature. Do not race a
@@ -1390,7 +1530,36 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                 Phase::Survey
                             } else if pressure_veto && pressure_vetoed_for < cfg.cap_persistence {
                                 Phase::Survey
-                            } else if distance < model.snapshot.effective_deadband_threads {
+                            } else if opening_disagrees && recent.len() < opening_bracket_samples {
+                                // Compare like-sized blocks. Starting the model
+                                // candidate with only the smoothing horizon in
+                                // its baseline made short, bursty workloads
+                                // needlessly inconclusive.
+                                Phase::Survey
+                            } else if opening_disagrees
+                                && opening_bracket.is_some_and(|bracket| {
+                                    opening_bracket_started.is_some_and(|started| {
+                                        sampled_at.saturating_duration_since(started)
+                                            + bracket.horizon.saturating_mul(2)
+                                            > bracket.total_budget
+                                    })
+                                })
+                            {
+                                nonlinear_probe_complete = true;
+                                finish_opening_bracket(
+                                    &mut report,
+                                    &mut opening_bracket_started,
+                                    OpeningBracketOutcome::BudgetExhausted,
+                                    sampled_at,
+                                );
+                                report.final_model = Some(model.snapshot);
+                                settled_rate = Some(recent.estimate().mean);
+                                Phase::Steady {
+                                    drifted_for: Duration::ZERO,
+                                }
+                            } else if distance < model.snapshot.effective_deadband_threads
+                                && !opening_disagrees
+                            {
                                 report.final_model = Some(model.snapshot);
                                 settled_rate = Some(recent.estimate().mean);
                                 Phase::Steady {
@@ -1398,6 +1567,18 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                 }
                             } else {
                                 let from = split;
+                                let ratification_kind = if opening_disagrees {
+                                    opening_bracket_points_started += 1;
+                                    RatificationKind::OpeningModel
+                                } else {
+                                    RatificationKind::Model
+                                };
+                                let ratify_samples = if opening_disagrees {
+                                    opening_bracket_samples
+                                } else {
+                                    cfg.ratify_samples
+                                };
+                                let blackout_samples = cfg.blackout_samples;
                                 tracing::debug!(
                                     "thread-broker: solved producer {} -> {} \
                                      (cost share {:.2}, cap {})",
@@ -1412,14 +1593,14 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                     from,
                                     to,
                                     Phase::Blackout {
-                                        left: cfg.blackout_samples,
+                                        left: blackout_samples,
                                         next: Box::new(Phase::Ratify {
-                                            left: cfg.ratify_samples,
+                                            left: ratify_samples,
                                             from,
                                             target,
                                             baseline: recent.estimate(),
-                                            rates: Vec::with_capacity(cfg.ratify_samples),
-                                            kind: RatificationKind::Model,
+                                            rates: Vec::with_capacity(ratify_samples),
+                                            kind: ratification_kind,
                                         }),
                                     },
                                 ) {
@@ -1449,7 +1630,7 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
             };
 
             // Keep high-resolution progress publication through the bounded
-            // nonlinear experiment, including its resize/blackout stages. A
+            // opening bracket, including its resize/blackout stages. A
             // slow split is precisely where coarse item batches quantize the
             // baseline. Once probing is complete, both stages can use their
             // settled cadence.
@@ -1511,6 +1692,14 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
             }
         }
 
+        if report.opening_bracket.outcome == OpeningBracketOutcome::Incomplete {
+            finish_opening_bracket(
+                &mut report,
+                &mut opening_bracket_started,
+                OpeningBracketOutcome::Incomplete,
+                now(),
+            );
+        }
         report.final_consumer_threads = split.0;
         report.final_producer_limit = split.1;
         report.final_consumer_live = self.consumer.live_threads();
@@ -1624,50 +1813,75 @@ impl Recent {
         )
     }
 
+    fn len(&self) -> usize {
+        self.ring.len()
+    }
+
     fn clear(&mut self) {
         self.ring.clear();
     }
 }
 
-/// Candidate producer allocations that geometrically reduce consumer
-/// concurrency. These are used only by the responsive nonlinear fallback and
-/// only after the isolated cost model asks for the producer floor.
-fn nonlinear_probe_targets(
-    budget: usize,
-    min_consumer_threads: usize,
-    initial_producer_slots: usize,
-    configured_maximum: Option<usize>,
-) -> std::collections::VecDeque<usize> {
-    let mut targets = std::collections::VecDeque::new();
-    let max_producer = budget
-        .saturating_sub(min_consumer_threads)
-        .max(1)
-        .min(configured_maximum.unwrap_or(usize::MAX));
-    let mut producer = initial_producer_slots.clamp(1, max_producer);
-    while producer < max_producer {
-        // Grow locally before visiting an endpoint. Starting a 32-thread
-        // scATAC run at four producer slots must not make its first experiment
-        // 16 slots away; 4 -> 6 -> 9 ... retains geometric coverage while a
-        // first failed point can cheaply bracket the local optimum.
-        let step = producer.div_ceil(2).max(1);
-        producer = producer.saturating_add(step).min(max_producer);
-        targets.push_back(producer);
-    }
-    targets
+fn duration_samples(horizon: Duration, interval: Duration) -> usize {
+    let samples = horizon.as_nanos().div_ceil(interval.as_nanos().max(1));
+    usize::try_from(samples).unwrap_or(usize::MAX).max(1)
 }
 
-/// The unmeasured slot immediately beside `anchor` in the direction of
-/// `other`, when the two points are not already adjacent.
-///
-/// Geometric exploration is deliberately cheap, but a retained/failing pair
-/// such as producer 4 and 6 does not identify the discrete peak until producer
-/// 5 has been measured. One adjacent refinement keeps that correction bounded.
-fn interior_neighbor(anchor: usize, other: usize) -> Option<usize> {
-    match anchor.cmp(&other) {
-        std::cmp::Ordering::Less if anchor + 1 < other => Some(anchor + 1),
-        std::cmp::Ordering::Greater if other + 1 < anchor => Some(anchor - 1),
-        _ => None,
+fn finish_opening_bracket(
+    report: &mut BrokerReport,
+    started: &mut Option<Instant>,
+    outcome: OpeningBracketOutcome,
+    at: Instant,
+) {
+    if let Some(started) = started.take() {
+        report.opening_bracket.wall_nanos =
+            u64::try_from(at.saturating_duration_since(started).as_nanos()).unwrap_or(u64::MAX);
     }
+    report.opening_bracket.outcome = outcome;
+}
+
+/// Candidate allocations adjacent to the opening, first away from the rejected
+/// model and then toward it. The model point itself has already been measured.
+/// Alternating around the opening distinguishes opposite response shapes with
+/// the same model answer: at scATAC t32 the lower model point wins, whereas at
+/// t8 the first point above the opening is the real peak.
+fn opening_bracket_targets(
+    budget: usize,
+    min_consumer_threads: usize,
+    min_producer_slots: usize,
+    opening: usize,
+    model: usize,
+    maximum_points: usize,
+) -> std::collections::VecDeque<usize> {
+    let mut targets = std::collections::VecDeque::new();
+    if maximum_points == 0 {
+        return targets;
+    }
+    let floor = min_producer_slots;
+    let ceiling = budget.saturating_sub(min_consumer_threads).max(floor);
+    let toward_is_lower = model < opening;
+    for distance in 1..budget {
+        let lower = opening
+            .checked_sub(distance)
+            .filter(|target| *target >= floor);
+        let upper = opening
+            .checked_add(distance)
+            .filter(|target| *target <= ceiling);
+        let ordered = if toward_is_lower {
+            [upper, lower]
+        } else {
+            [lower, upper]
+        };
+        for target in ordered.into_iter().flatten() {
+            if target != model && !targets.contains(&target) {
+                targets.push_back(target);
+                if targets.len() == maximum_points {
+                    return targets;
+                }
+            }
+        }
+    }
+    targets
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1683,16 +1897,6 @@ enum RatificationOutcome {
     Kept,
     Inconclusive,
     Regressed,
-}
-
-fn nonlinear_floor_validation_requires_search(
-    enabled: bool,
-    floor: usize,
-    from: usize,
-    target: usize,
-    outcome: RatificationOutcome,
-) -> bool {
-    enabled && target == floor && from > target && outcome != RatificationOutcome::Kept
 }
 
 fn compare_rates(
@@ -2197,6 +2401,7 @@ impl std::fmt::Debug for PhaseName<'_> {
             Phase::Survey => "survey",
             Phase::Draining { .. } => "draining",
             Phase::Blackout { .. } => "blackout",
+            Phase::OpeningBracketRestore { .. } => "opening-bracket-restore",
             Phase::Ratify { .. } => "ratify",
             Phase::Steady { .. } => "steady",
         })
@@ -2208,8 +2413,8 @@ mod tests {
     use super::{
         BrokerPhase, BrokerReport, Caps, Costs, Phase, ProducerCapReason, RateEstimate,
         RatificationKind, RatificationOutcome, Recent, compare_rates, consecutive_drift_duration,
-        nonlinear_floor_validation_requires_search, nonlinear_probe_improved,
-        nonlinear_probe_targets, producer_capacity_used,
+        duration_samples, nonlinear_probe_improved, opening_bracket_targets,
+        producer_capacity_used,
     };
     use crate::{BrokerConfig, ProducerMeasurementMode, ProducerPressure, ResizeSide, Work};
     use std::time::{Duration, Instant};
@@ -2589,51 +2794,42 @@ mod tests {
     }
 
     #[test]
-    fn nonlinear_floor_validation_requires_a_conclusive_keep() {
-        for outcome in [
-            RatificationOutcome::Inconclusive,
-            RatificationOutcome::Regressed,
-        ] {
-            assert!(nonlinear_floor_validation_requires_search(
-                true, 1, 4, 1, outcome
-            ));
-        }
-        assert!(!nonlinear_floor_validation_requires_search(
-            true,
-            1,
-            4,
-            1,
-            RatificationOutcome::Kept,
-        ));
-        assert!(!nonlinear_floor_validation_requires_search(
-            false,
-            1,
-            4,
-            1,
-            RatificationOutcome::Inconclusive,
-        ));
-        assert!(!nonlinear_floor_validation_requires_search(
-            true,
-            1,
-            4,
-            2,
-            RatificationOutcome::Regressed,
-        ));
+    fn opening_bracket_horizon_rounds_up_to_whole_samples() {
+        assert_eq!(
+            duration_samples(Duration::from_millis(300), Duration::from_millis(100)),
+            3
+        );
+        assert_eq!(
+            duration_samples(Duration::from_millis(301), Duration::from_millis(100)),
+            4
+        );
+        assert_eq!(
+            duration_samples(Duration::from_nanos(1), Duration::from_millis(100)),
+            1
+        );
     }
 
     #[test]
-    fn nonlinear_probe_maximum_bounds_geometric_exploration() {
+    fn opening_bracket_alternates_around_the_opening_and_is_bounded() {
         assert_eq!(
-            nonlinear_probe_targets(64, 1, 6, Some(9))
+            opening_bracket_targets(32, 1, 1, 4, 1, 2)
                 .into_iter()
                 .collect::<Vec<_>>(),
-            vec![9]
+            vec![5, 3]
         );
         assert_eq!(
-            nonlinear_probe_targets(8, 1, 4, None)
+            opening_bracket_targets(8, 1, 1, 4, 7, 3)
                 .into_iter()
                 .collect::<Vec<_>>(),
-            vec![6, 7]
+            vec![3, 5, 2]
+        );
+        assert!(opening_bracket_targets(8, 1, 1, 4, 1, 0).is_empty());
+        assert_eq!(
+            opening_bracket_targets(8, 1, 3, 4, 6, 4)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![3, 5, 7],
+            "candidate generation must preserve the configured safety floor"
         );
     }
 

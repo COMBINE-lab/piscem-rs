@@ -32,8 +32,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use thread_broker::{
-    BrokerConfig, BrokerError, BrokerErrorKind, BrokerReport, Consumer, Producer, ProducerPressure,
-    ResizeSide, SteadyStatePolicy, ThreadBroker, Work,
+    BrokerConfig, BrokerError, BrokerErrorKind, BrokerReport, Consumer, OpeningBracketConfig,
+    OpeningBracketOutcome, OpeningPolicy, Producer, ProducerPressure, ResizeSide,
+    SteadyStatePolicy, ThreadBroker, Work,
 };
 
 const NANOS: f64 = 1e9;
@@ -454,6 +455,17 @@ fn quick() -> BrokerConfig {
     }
 }
 
+fn bracketed() -> BrokerConfig {
+    BrokerConfig {
+        opening_policy: OpeningPolicy::Bracket(OpeningBracketConfig {
+            max_points: 3,
+            horizon: Duration::from_millis(60),
+            total_budget: Duration::from_secs(1),
+        }),
+        ..quick()
+    }
+}
+
 fn run_for(
     pipeline: Arc<Pipeline>,
     budget: usize,
@@ -536,11 +548,8 @@ fn solves_a_mapping_heavy_split() {
 /// that measured move is the discriminator and no upward probe is needed. This
 /// is the large-budget counterpart to the negative-scaling test below.
 #[test]
-fn nonlinear_policy_keeps_a_valid_floor_move_instead_of_the_opening() {
-    let cfg = BrokerConfig {
-        nonlinear_probes: true,
-        ..quick()
-    };
+fn opening_bracket_keeps_a_valid_model_move_instead_of_the_opening() {
+    let cfg = bracketed();
     let pipeline = Pipeline::new(100.0, 10_000.0, 28, 4);
     assert_eq!(pipeline.optimum(32), 1);
 
@@ -549,26 +558,58 @@ fn nonlinear_policy_keeps_a_valid_floor_move_instead_of_the_opening() {
     assert_eq!(report.nonlinear_probes, 0, "{report:?}");
     assert!(!report.nonlinear_override, "{report:?}");
     assert!(report.producer_trajectory.contains(&1), "{report:?}");
+    assert_eq!(report.opening_bracket.points_measured, 1, "{report:?}");
+    assert_eq!(
+        report.opening_bracket.outcome,
+        OpeningBracketOutcome::ModelSelected,
+        "{report:?}"
+    );
+    assert!(report.opening_bracket.wall_nanos <= 1_000_000_000);
+}
+
+#[test]
+fn opening_bracket_costs_nothing_when_model_and_opening_agree() {
+    let cfg = bracketed();
+    let pipeline = Pipeline::new(1_000.0, 1_000.0, 4, 4);
+    assert_eq!(pipeline.optimum(8), 4);
+
+    let report = run_for(Arc::clone(&pipeline), 8, cfg, Duration::from_millis(500));
+    assert_eq!(report.final_producer_limit, 4, "{report:?}");
+    assert_eq!(report.opening_bracket.points_measured, 0, "{report:?}");
+    assert_eq!(report.opening_bracket.samples, 0, "{report:?}");
+    assert_eq!(report.opening_bracket.wall_nanos, 0, "{report:?}");
+    assert_eq!(
+        report.opening_bracket.outcome,
+        OpeningBracketOutcome::ModelAgreed,
+        "{report:?}"
+    );
 }
 
 /// A one-point cost model cannot see that adding consumers makes this stage
 /// slower. Responsive mode must measure the response curve, while freeze is the
 /// explicitly cheaper cost-model-only policy.
 #[test]
-fn responsive_probes_negative_consumer_scaling_but_freeze_skips_it() {
-    let cfg = BrokerConfig {
-        nonlinear_probes: true,
-        ..quick()
-    };
-    let responsive = Pipeline::new(100.0, 10_000.0, 6, 2);
-    responsive.state.lock().unwrap().consumer_scaling = -1.0;
-    assert_eq!(responsive.optimum(8), 7);
+fn opening_bracket_distinguishes_opposite_scaling_with_the_same_model_answer() {
+    let cfg = bracketed();
+    let responsive = Pipeline::new(2_887.0, 1_000.0, 4, 4);
+    {
+        let mut state = responsive.state.lock().unwrap();
+        state.consumer_scaling = 0.5;
+        state.producer_bias = 0.01;
+    }
+    assert_eq!(responsive.optimum(8), 5);
 
-    let report = run_for(Arc::clone(&responsive), 8, cfg, Duration::from_millis(1800));
-    assert_eq!(report.final_producer_limit, 7, "{report:?}");
+    let report = run_for(Arc::clone(&responsive), 8, cfg, Duration::from_millis(2200));
+    assert_eq!(report.final_producer_limit, 5, "{report:?}");
     assert!(report.nonlinear_override);
-    assert_eq!(report.nonlinear_probes, 3);
-    assert_eq!(report.nonlinear_probe_improvements, 3);
+    assert_eq!(report.nonlinear_probes, 1, "{report:?}");
+    assert_eq!(report.opening_bracket.points_measured, 2, "{report:?}");
+    assert!(report.opening_bracket.samples <= 6, "{report:?}");
+    assert_eq!(
+        report.opening_bracket.outcome,
+        OpeningBracketOutcome::AlternativeSelected,
+        "{report:?}"
+    );
     assert!(
         report.producer_trajectory.contains(&1),
         "floor-directed validation was skipped: {report:?}"
@@ -578,15 +619,19 @@ fn responsive_probes_negative_consumer_scaling_but_freeze_skips_it() {
         "regressed floor was not restored: {report:?}"
     );
 
-    let frozen = Pipeline::new(100.0, 10_000.0, 6, 2);
-    frozen.state.lock().unwrap().consumer_scaling = -1.0;
+    let frozen = Pipeline::new(2_887.0, 1_000.0, 4, 4);
+    {
+        let mut state = frozen.state.lock().unwrap();
+        state.consumer_scaling = 0.5;
+        state.producer_bias = 0.01;
+    }
     let broker = ThreadBroker::builder_with(
         FakeConsumer(Arc::clone(&frozen)),
         FakeProducer(Arc::clone(&frozen)),
         cfg,
     )
     .budget(8)
-    .initial_producer_slots(2)
+    .initial_producer_slots(4)
     .steady_state_policy(SteadyStatePolicy::FreezeAfterConvergence)
     .build()
     .unwrap()
@@ -595,25 +640,24 @@ fn responsive_probes_negative_consumer_scaling_but_freeze_skips_it() {
     let report = broker.finish().unwrap();
     assert_eq!(report.nonlinear_probes, 0);
     assert!(!report.nonlinear_override);
-    assert_ne!(report.final_producer_limit, 7);
+    assert_eq!(
+        report.opening_bracket.outcome,
+        OpeningBracketOutcome::SkippedBySteadyPolicy
+    );
 }
 
-/// A geometric endpoint can bracket the discrete optimum without landing on
-/// it. Producer 6 is no better than the safe opening at 4, producer 7 is worse,
-/// and producer 5 is the true peak; completing the curve at 6 would therefore
-/// miss the only allocation that matters.
+/// When the model loses to the opening, the first adjacent point away from the
+/// rejected model can recover a discrete optimum on the other side of the
+/// opening. Producer 5 is the true peak here even though the model says 1.
 #[test]
-fn nonlinear_search_refines_the_unmeasured_interior_peak() {
-    let cfg = BrokerConfig {
-        nonlinear_probes: true,
-        ..quick()
-    };
+fn opening_bracket_tests_the_useful_adjacent_side_first() {
+    let cfg = bracketed();
     let pipeline = Pipeline::new(2_887.0, 1_000.0, 4, 4);
     {
         let mut state = pipeline.state.lock().unwrap();
         state.consumer_scaling = 0.5;
         // Force the isolated busy-cost model to its floor so the response
-        // fallback, rather than that deliberately biased model, owns the test.
+        // bracket, rather than that deliberately biased model, owns the test.
         state.producer_bias = 0.01;
     }
     assert_eq!(pipeline.optimum(8), 5);
@@ -625,7 +669,7 @@ fn nonlinear_search_refines_the_unmeasured_interior_peak() {
     assert!(report.moves <= 5, "{report:?}");
     assert!(
         report.producer_trajectory.contains(&5),
-        "interior producer split was never measured: {report:?}"
+        "adjacent producer split was never measured: {report:?}"
     );
     let transitions: Vec<_> = report
         .producer_trajectory
@@ -634,18 +678,15 @@ fn nonlinear_search_refines_the_unmeasured_interior_peak() {
         .collect();
     assert!(
         transitions.contains(&(4, 5)),
-        "interior probe did not restore its retained adjacent baseline: {report:?}"
+        "opening bracket did not test the useful adjacent split: {report:?}"
     );
 }
 
-/// Full-calibration freeze must retain the response-search result and release
-/// its recurring adapter only after the discrete interior optimum was tested.
+/// Full-calibration freeze must retain the opening-bracket result and release
+/// its recurring adapter only after the adjacent optimum was tested.
 #[test]
-fn full_calibration_freeze_refines_then_releases_the_producer() {
-    let cfg = BrokerConfig {
-        nonlinear_probes: true,
-        ..quick()
-    };
+fn full_calibration_freeze_brackets_then_releases_the_producer() {
+    let cfg = bracketed();
     let pipeline = Pipeline::new(2_887.0, 1_000.0, 4, 4);
     {
         let mut state = pipeline.state.lock().unwrap();
@@ -849,7 +890,7 @@ fn settles_and_stops_moving() {
 /// starting changes the costs, and the split has to follow.
 #[test]
 fn re_solves_after_a_regime_change() {
-    let cfg = quick();
+    let cfg = bracketed();
     // Starts mapping-heavy, so decode gets little.
     let p = Pipeline::new(1_000.0, 7_000.0, 28, 4);
     let report = run_with(Arc::clone(&p), 32, cfg, Duration::from_millis(3000), |p| {
@@ -863,6 +904,12 @@ fn re_solves_after_a_regime_change() {
         "ignored the regime change: settled at {} with {} resurveys",
         report.final_producer_limit,
         report.resurveys,
+    );
+    assert_eq!(report.opening_bracket.points_measured, 0, "{report:?}");
+    assert_eq!(
+        report.opening_bracket.outcome,
+        OpeningBracketOutcome::ModelAgreed,
+        "startup bracket was rearmed after the regime change: {report:?}"
     );
 }
 
@@ -1015,6 +1062,40 @@ fn the_default_configuration_builds() {
         .budget(32)
         .build()
         .expect("the default configuration must be valid");
+}
+
+#[test]
+fn rejects_unbounded_or_empty_opening_brackets() {
+    for opening_policy in [
+        OpeningPolicy::Bracket(OpeningBracketConfig {
+            max_points: 0,
+            ..OpeningBracketConfig::default()
+        }),
+        OpeningPolicy::Bracket(OpeningBracketConfig {
+            horizon: Duration::ZERO,
+            ..OpeningBracketConfig::default()
+        }),
+        OpeningPolicy::Bracket(OpeningBracketConfig {
+            horizon: Duration::from_secs(2),
+            total_budget: Duration::from_secs(1),
+            ..OpeningBracketConfig::default()
+        }),
+    ] {
+        let pipeline = Pipeline::new(1_000.0, 1_000.0, 4, 4);
+        let error = ThreadBroker::builder_with(
+            FakeConsumer(Arc::clone(&pipeline)),
+            FakeProducer(pipeline),
+            BrokerConfig {
+                opening_policy,
+                ..quick()
+            },
+        )
+        .budget(8)
+        .build()
+        .err()
+        .expect("invalid opening bracket built successfully");
+        assert!(error.to_string().contains("opening bracket"));
+    }
 }
 
 #[test]

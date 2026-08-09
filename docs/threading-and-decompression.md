@@ -128,10 +128,11 @@ jobs can adapt after the observed startup transient. They open with two decode
 slots where the budget permits. A producer that still has runnable work queued
 may veto a model-requested shrink, but pressure never grows or sizes the split;
 this is the bounded fallback for allocation-dependent decoder scaling.
-scATAC instead opens its opt-in nonlinear search at the midpoint. This avoids
-spending calibration in its measured high-contention mapping region without
-hard-coding the pinned oracle; serial and fixed allocations retain their exact
-requested split.
+scATAC instead uses one four-slot opening hint at every budget and opts into a
+bounded startup bracket. Its safety floor remains one: if the first stable model
+answer differs from four, the broker measures that answer and at most two local
+alternatives rather than encoding a measured optimum as an unreachable floor.
+Serial and fixed allocations retain their exact requested split.
 
 The decoder busy-time signal is integrated from lock-free per-decoder executing
 worker counts. While a scheduling decision is open, a dedicated sampler uses a
@@ -143,11 +144,12 @@ guard this design.
 
 Applications can select steady-state behavior with the thread-broker builder.
 `SteadyStatePolicy::Responsive` is the default and preserves regime-change
-adaptation. Applications may opt into a bounded geometric response probe when
-the cost model reaches the producer floor; piscem does so for scATAC, whose
-measured response curve has negative consumer scaling that a one-point
-service-cost ratio cannot see. Other modalities do not pay this exploration
-cost. Its `steady_probe_interval` is
+adaptation. Applications may opt into `OpeningPolicy::Bracket` when
+allocation-dependent stage scaling can invalidate the one-point service-cost
+model; piscem does so for scATAC. The startup-only experiment is triggered by
+model/opening disagreement, is bounded by point count and wall time, and reports
+its cost and outcome. Other modalities keep `OpeningPolicy::Fixed` and pay no
+bracket cost. Its `steady_probe_interval` is
 independently configurable: it does
 not weaken startup calibration or ratification, and the sampled decoder adapter
 scales toward roughly four observations per probe without exceeding its measured
@@ -155,10 +157,10 @@ scales toward roughly four observations per probe without exceeding its measured
 `PISCEM_THREAD_BROKER_PROBE_INTERVAL_MS=25` restores normal-resolution
 monitoring without changing startup calibration. Other modalities retain their
 ordinary cadence. `SteadyStatePolicy::FreezeAfterConvergence` is the cheaper
-model-only path: it skips nonlinear response exploration, then terminates the
+model-only path: it skips opening calibration, then terminates the
 controller and producer sampler after guarded model convergence. The separate
 `SteadyStatePolicy::FreezeAfterFullCalibration` runs responsive mode's bounded
-nonlinear/local startup calibration before the same teardown. Both freeze modes
+opening calibration before the same teardown. Both freeze modes
 have no recurring broker work and cannot react to a later workload change; only
 the full-calibration variant is suitable when the one-point model is known to
 miss the useful response curve.

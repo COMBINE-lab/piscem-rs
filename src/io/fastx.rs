@@ -1023,6 +1023,7 @@ mod tests {
             small.warmup + small.sample_interval * (small.smoothing_windows as u32)
                 < std::time::Duration::from_millis(250)
         );
+        assert_eq!(small.opening_policy, thread_broker::OpeningPolicy::Fixed);
 
         let normal = super::broker_config_for_budget(32);
         assert_eq!(
@@ -1030,5 +1031,6 @@ mod tests {
             thread_broker::BrokerConfig::default().sample_interval
         );
         assert_eq!(normal.warmup, thread_broker::BrokerConfig::default().warmup);
+        assert_eq!(normal.opening_policy, thread_broker::OpeningPolicy::Fixed);
     }
 }

@@ -76,18 +76,14 @@ fn parse_reader_batch_size(value: Option<&str>) -> Result<Option<usize>> {
 
 fn scatac_pipeline_geometry(
     allocation: crate::io::fastx::DecodeAllocation,
-    budget: usize,
+    _budget: usize,
     progress_override: Option<u64>,
     batch_override: Option<usize>,
 ) -> crate::io::fastx::PipelineTuning {
     let (default_batch, default_progress) = match allocation {
-        crate::io::fastx::DecodeAllocation::Adaptive if budget <= 8 => (
-            crate::io::fastx::SCATAC_READER_BATCH_SIZE,
-            SCATAC_PROGRESS_FLUSH_EVERY,
-        ),
         crate::io::fastx::DecodeAllocation::Adaptive => (
             crate::io::fastx::SCATAC_READER_BATCH_SIZE,
-            thread_broker::DEFAULT_FLUSH_EVERY,
+            SCATAC_PROGRESS_FLUSH_EVERY,
         ),
         crate::io::fastx::DecodeAllocation::Serial => (
             crate::io::fastx::SCATAC_READER_BATCH_SIZE,
@@ -113,30 +109,19 @@ fn scatac_broker_config(budget: usize) -> thread_broker::BrokerConfig {
     // the environment override can restore 25 ms monitoring for applications
     // that need rapid post-convergence reaction.
     config.steady_probe_interval = Some(Duration::from_secs(5));
-    // The measured t8 surface has negative consumer scaling: validate its
-    // floor-directed move and, if that is not conclusively safe, restore the
-    // four-slot opening and run the bounded upward/local response search.
-    if budget <= 8 {
-        config.nonlinear_probes = true;
-        config.nonlinear_probe_samples = 12;
-        config.nonlinear_blackout_samples = 12;
-    } else {
-        // The expanded low-end surface puts t32's optimum at producer 2. At
-        // t64, producer 2 is within 4.3% of producer 1 and improves on the old
-        // four-slot floor. Open directly at two as well: the reviewer-observed
-        // same-split penalty came from starting the pools at 28/4 and resizing
-        // them after startup. The normal responsive model can still grow above
-        // two if decode work changes; only the unnecessary response search is
-        // disabled on these measured monotone surfaces.
-        config.min_producer_slots = 2;
-        config.nonlinear_probes = false;
-    }
+    // scATAC has measured allocation-dependent consumer scaling. Confirm a
+    // disagreement between the opening and cost model under the crate's
+    // bounded startup defaults; do not encode a performance belief in either
+    // safety floor. The true shared-pool decoder floor remains one.
+    config.opening_policy = thread_broker::OpeningPolicy::Bracket(Default::default());
     config
 }
 
 fn scatac_initial_decode_slots(budget: usize) -> usize {
-    let measured_opening = if budget <= 8 { 4 } else { 2 };
-    measured_opening.min(budget.saturating_sub(1)).max(1)
+    // Provenance: 2M-read 10x scATAC grid, 2026-08-07, whose t8 peak is
+    // producer five and whose t32 low end is 1--3. Four is intentionally only
+    // an opening hint: the startup bracket can leave it in either direction.
+    4.min(budget.saturating_sub(1)).max(1)
 }
 
 #[derive(Args, Debug)]
@@ -515,11 +500,10 @@ where
         decoder_pref,
     )?;
     if plan.adaptive() {
-        // scATAC is the measured negative-scaling modality. Start its opt-in
-        // response search at the midpoint rather than at the mapping-biased
-        // generic opening: the latter spends the calibration interval in the
-        // known high-contention region before the response curve can correct
-        // it. Fixed and serial requests retain their exact semantics.
+        // scATAC is the measured allocation-dependent modality. Four is one
+        // provenance-backed opening hint at every budget; the bounded startup
+        // bracket, rather than a budget-specific safety floor, decides whether
+        // to leave it. Fixed and serial requests retain exact semantics.
         plan.decode_slots = scatac_initial_decode_slots(plan.effective_budget);
         plan.map_threads = plan.effective_budget - plan.decode_slots;
     }
@@ -778,7 +762,7 @@ mod tests {
             scatac_pipeline_geometry(crate::io::fastx::DecodeAllocation::Adaptive, 32, None, None),
             crate::io::fastx::PipelineTuning {
                 reader_batch_size: crate::io::fastx::SCATAC_READER_BATCH_SIZE,
-                progress_flush_every: thread_broker::DEFAULT_FLUSH_EVERY,
+                progress_flush_every: SCATAC_PROGRESS_FLUSH_EVERY,
             }
         );
         assert_eq!(
@@ -825,15 +809,14 @@ mod tests {
     fn scatac_defaults_to_sparse_responsive_monitoring() {
         let config = scatac_broker_config(8);
         assert_eq!(config.steady_probe_interval, Some(Duration::from_secs(5)));
-        assert!(config.nonlinear_probes);
-        assert_eq!(config.nonlinear_probe_samples, 12);
-        assert_eq!(config.nonlinear_blackout_samples, 12);
-        assert_eq!(config.nonlinear_max_producer_slots, None);
-        assert!(!scatac_broker_config(32).nonlinear_probes);
-        assert_eq!(scatac_broker_config(32).min_producer_slots, 2);
-        assert_eq!(scatac_broker_config(64).min_producer_slots, 2);
+        assert_eq!(
+            config.opening_policy,
+            thread_broker::OpeningPolicy::Bracket(Default::default())
+        );
+        assert_eq!(scatac_broker_config(32).min_producer_slots, 1);
+        assert_eq!(scatac_broker_config(64).min_producer_slots, 1);
         assert_eq!(scatac_initial_decode_slots(8), 4);
-        assert_eq!(scatac_initial_decode_slots(32), 2);
-        assert_eq!(scatac_initial_decode_slots(64), 2);
+        assert_eq!(scatac_initial_decode_slots(32), 4);
+        assert_eq!(scatac_initial_decode_slots(64), 4);
     }
 }

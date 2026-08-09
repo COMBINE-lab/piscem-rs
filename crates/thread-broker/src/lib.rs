@@ -121,8 +121,8 @@
 //!    successfully produced output disappear.
 //!
 //! Leave warm-up, sampling, smoothing, blackout, ratification, cap history,
-//! deadband, resurvey, and regression tolerance at their defaults initially.
-//! Likewise leave nonlinear probing off. Choose a [`SteadyStatePolicy`] only
+//! deadband, resurvey, regression tolerance, and [`OpeningPolicy`] at their
+//! defaults initially. Choose a [`SteadyStatePolicy`] only
 //! from the application's workload contract: responsive for possible regime
 //! changes, or a freeze policy for stable long runs where recurring work should
 //! become zero.
@@ -142,7 +142,8 @@ use std::time::{Duration, Instant};
 
 mod controller;
 pub use controller::{
-    BrokerPhase, BrokerReport, Model, ProducerCapReason, Rejection, RunningBroker,
+    BrokerPhase, BrokerReport, Model, OpeningBracketOutcome, OpeningBracketReport,
+    ProducerCapReason, Rejection, RunningBroker,
 };
 
 /// Cumulative work done by one stage.
@@ -323,14 +324,14 @@ pub enum ProducerMeasurementMode {
 ///
 /// All variants share warm-up, cost measurement, guarded model resizing,
 /// blackout, ratification, and the first clean steady-state check. Responsive
-/// may additionally run opt-in nonlinear probes. The two freeze variants make
+/// may additionally run an opt-in opening bracket. The two freeze variants make
 /// the calibration/overhead tradeoff explicit rather than overloading one
 /// ambiguous "freeze" setting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SteadyStatePolicy {
     /// Continue low-frequency observation and re-open the controller after a
-    /// persistent workload change. Also permits opt-in nonlinear probing.
+    /// persistent workload change. Also permits an opt-in opening bracket.
     #[default]
     Responsive,
     /// Use the model-only path, then stop the controller and release recurring
@@ -340,13 +341,54 @@ pub enum SteadyStatePolicy {
     /// but intentionally gives up adaptation to later workload regimes. Use it
     /// only when that tradeoff is known to fit the application.
     FreezeAfterConvergence,
-    /// Complete the same opt-in nonlinear response-curve calibration as
+    /// Complete the same opt-in opening calibration as
     /// [`Responsive`](Self::Responsive), then stop the controller and release
     /// recurring measurement adapters after the first stable split.
     ///
     /// This pays a bounded startup calibration cost in exchange for zero
     /// recurring broker work. It cannot react to a later workload regime.
     FreezeAfterFullCalibration,
+}
+
+/// How the broker treats the caller's initial split.
+///
+/// The default trusts the allocation-independent cost model. Applications
+/// with measured allocation-dependent scaling can instead ask the broker to
+/// confirm a disagreement between that model and the opening. The experiment
+/// is startup-only, bounded in points and wall time, and does no work when the
+/// first stable model answer agrees with the opening.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OpeningPolicy {
+    /// Treat the opening as an initial hint and follow ordinary model moves.
+    #[default]
+    Fixed,
+    /// Confirm a model/opening disagreement with a bounded local bracket.
+    Bracket(OpeningBracketConfig),
+}
+
+/// Bounds for [`OpeningPolicy::Bracket`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpeningBracketConfig {
+    /// Maximum allocations measured by the bracket, including the model's
+    /// answer but excluding the already-measured opening.
+    pub max_points: usize,
+    /// Throughput evidence gathered at each candidate allocation.
+    pub horizon: Duration,
+    /// Hard wall-time budget for the startup experiment.
+    pub total_budget: Duration,
+}
+
+impl Default for OpeningBracketConfig {
+    fn default() -> Self {
+        Self {
+            max_points: 3,
+            horizon: Duration::from_millis(200),
+            // Three 200 ms evidence horizons plus their ordinary resize
+            // blackouts fit comfortably below four seconds on the measured
+            // scATAC path, leaving margin for scheduling and acknowledgements.
+            total_budget: Duration::from_secs(4),
+        }
+    }
 }
 
 /// Bounded diagnostics for producer-side busy-time measurement.
@@ -688,34 +730,9 @@ pub struct BrokerConfig {
     /// windows from their real workload; a deliberately changing or pausing
     /// workload is not a statistically identifiable ratification population.
     pub ratify_samples: usize,
-    /// Windows used by an optional nonlinear response probe.
-    ///
-    /// A caller whose records have genuine short-range cost variation may
-    /// lengthen this bounded, startup-only experiment without slowing ordinary
-    /// model moves or settled monitoring. Publication granularity should be
-    /// fixed first: this is not a substitute for progress counters that update
-    /// less often than a sample.
-    pub nonlinear_probe_samples: usize,
-    /// Enable bounded response-curve exploration at the producer floor.
-    ///
-    /// Disabled by default: it is an application policy for workloads with
-    /// measured allocation-dependent scaling, not a tax every model-floor job
-    /// should pay. Freeze-after-convergence skips it even when configured.
-    pub nonlinear_probes: bool,
-    /// Optional upper bound for producer slots visited by nonlinear probes.
-    ///
-    /// This bounds startup exploration independently of the ordinary cost
-    /// model. It is useful when an application has measured a local nonlinear
-    /// region but short jobs cannot amortize a geometric walk to the budget
-    /// boundary. `None` preserves full geometric coverage.
-    pub nonlinear_max_producer_slots: Option<usize>,
-    /// Post-resize blackout used only before a nonlinear response probe.
-    ///
-    /// Some allocation changes take longer to reach representative throughput
-    /// than they take to acknowledge worker retirement. This separates that
-    /// transition-settling horizon from both the ordinary model blackout and
-    /// the number of evidence windows gathered afterward.
-    pub nonlinear_blackout_samples: usize,
+    /// Whether a disagreement between the opening and the first stable model
+    /// answer should be confirmed by a bounded startup bracket.
+    pub opening_policy: OpeningPolicy,
     /// Relative throughput loss that counts as a regression rather than noise.
     ///
     /// Only a *regression* reverts a move. Absence of improvement does not,
@@ -810,10 +827,7 @@ impl Default for BrokerConfig {
             deadband_threads: 1,
             blackout_samples: 4,
             ratify_samples: 10,
-            nonlinear_probe_samples: 4,
-            nonlinear_probes: false,
-            nonlinear_max_producer_slots: None,
-            nonlinear_blackout_samples: 4,
+            opening_policy: OpeningPolicy::Fixed,
             regression_tolerance: 0.05,
             resurvey_distance: 1,
             resurvey_persistence: Duration::from_millis(800),
@@ -952,27 +966,9 @@ impl<C: Consumer, P: Producer> ThreadBrokerBuilder<C, P> {
         self
     }
 
-    /// See [`BrokerConfig::nonlinear_probe_samples`].
-    pub fn nonlinear_probe_samples(mut self, samples: usize) -> Self {
-        self.config.nonlinear_probe_samples = samples;
-        self
-    }
-
-    /// See [`BrokerConfig::nonlinear_probes`].
-    pub fn nonlinear_probes(mut self, enabled: bool) -> Self {
-        self.config.nonlinear_probes = enabled;
-        self
-    }
-
-    /// See [`BrokerConfig::nonlinear_max_producer_slots`].
-    pub fn nonlinear_max_producer_slots(mut self, slots: Option<usize>) -> Self {
-        self.config.nonlinear_max_producer_slots = slots;
-        self
-    }
-
-    /// See [`BrokerConfig::nonlinear_blackout_samples`].
-    pub fn nonlinear_blackout_samples(mut self, samples: usize) -> Self {
-        self.config.nonlinear_blackout_samples = samples;
+    /// See [`BrokerConfig::opening_policy`].
+    pub fn opening_policy(mut self, policy: OpeningPolicy) -> Self {
+        self.config.opening_policy = policy;
         self
     }
 
@@ -1065,22 +1061,22 @@ impl<C: Consumer, P: Producer> ThreadBrokerBuilder<C, P> {
         if c.ratify_samples == 0 {
             return Err(BrokerConfigError("ratify_samples must be non-zero"));
         }
-        if c.nonlinear_probe_samples == 0 {
-            return Err(BrokerConfigError(
-                "nonlinear_probe_samples must be non-zero",
-            ));
-        }
-        if c.nonlinear_max_producer_slots
-            .is_some_and(|maximum| maximum < c.min_producer_slots)
-        {
-            return Err(BrokerConfigError(
-                "nonlinear_max_producer_slots must be at least min_producer_slots",
-            ));
-        }
-        if c.nonlinear_blackout_samples < c.smoothing_windows {
-            return Err(BrokerConfigError(
-                "nonlinear_blackout_samples must be at least smoothing_windows",
-            ));
+        if let OpeningPolicy::Bracket(bracket) = c.opening_policy {
+            if bracket.max_points == 0 {
+                return Err(BrokerConfigError(
+                    "opening bracket max_points must be non-zero",
+                ));
+            }
+            if bracket.horizon.is_zero() {
+                return Err(BrokerConfigError(
+                    "opening bracket horizon must be non-zero",
+                ));
+            }
+            if bracket.total_budget.is_zero() || bracket.total_budget < bracket.horizon {
+                return Err(BrokerConfigError(
+                    "opening bracket total_budget must be at least its horizon",
+                ));
+            }
         }
         // Re-opening is made harder by persistence. Its distance may equal the
         // movement deadband so a one-slot regime change remains observable on
