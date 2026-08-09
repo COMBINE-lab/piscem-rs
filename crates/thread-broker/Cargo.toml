@@ -3,9 +3,12 @@ name = "thread-broker"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
-license-file = "../../LICENSE"
+license = "BSD-3-Clause"
 description = "Closed-loop scheduling of a fixed thread budget between a decompressor and the work that consumes it"
-publish = false
+repository = "https://github.com/COMBINE-lab/piscem-rs"
+readme = "README.md"
+keywords = ["scheduling", "threads", "throughput", "autoscaling", "pipeline"]
+categories = ["concurrency", "algorithms"]
 
 [dependencies]
 tracing = "0.1"
