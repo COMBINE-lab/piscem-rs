@@ -33,9 +33,9 @@ the mapping result.
 Responsive mode offers an opt-in bounded nonlinear response fallback for
 workloads such as scATAC where adding mapping workers can reduce throughput.
 Piscem enables that search for small-budget scATAC and exposes an application
-cap on the explored producer allocation. scATAC uses a
-64-record completed-progress publisher only during this decision phase and
-returns to the generic 256-record cadence after convergence. Busy-time clock
+cap on the explored producer allocation. Small-budget adaptive scATAC uses a
+64-record completed-progress publisher during this decision phase; larger,
+serial, and pinned runs keep the generic 256-record cadence. Busy-time clock
 reads remain at 256 records even during calibration. Progress is written to
 cache-padded, single-writer processor shards with relaxed cumulative stores, so
 the finer cadence passed the formal <=1% wall- and CPU-overhead gates.
@@ -58,11 +58,14 @@ freeze was cheapest but chose a poor split on this non-monotone surface;
 full-calibration freeze instead stayed within 1.016 median/1.037 upper-95 of
 the oracle and used at most 2.582 ms of administrative CPU. Sparse-responsive
 is therefore the closest policy to the original low-overhead responsive design.
-Adaptive scATAC opens with four aggregate decoder slots, the stable region in
-the measured fixed-split surface. At larger budgets the ordinary cost model can
-still grow above four, but the optional nonlinear startup search is disabled
-because its noisy probes did not amortize. Serial and pinned controls are
-unchanged. scRNA and Flex use a measured quarter-budget opening.
+Adaptive scATAC opens with four aggregate decoder slots at budgets up to eight,
+where the bounded response search finds the measured nonlinear optimum. At
+larger budgets it opens directly at producer two: that is the measured t32
+oracle, is within 4.3% of producer one at t64, and avoids a startup resize from
+the former four-slot opening. The ordinary cost model can still grow above two,
+but the optional nonlinear startup search is disabled on these measured
+monotone surfaces. Serial and pinned controls are unchanged. scRNA and Flex use
+a measured quarter-budget opening.
 
 The exact cumulative rapidgzip signal is feature-gated upstream; its disabled
 build compiles the hot-path accounting out, and its enabled build passed the

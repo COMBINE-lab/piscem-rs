@@ -113,30 +113,30 @@ fn scatac_broker_config(budget: usize) -> thread_broker::BrokerConfig {
     // the environment override can restore 25 ms monitoring for applications
     // that need rapid post-convergence reaction.
     config.steady_probe_interval = Some(Duration::from_secs(5));
-    // With the 25 ms small-budget calibration cadence, scATAC records retain
-    // real short-range cost variation after their progress publisher is fine
-    // grained. Bound only the optional nonlinear startup probe to 300 ms;
-    // ordinary moves and settled monitoring keep their own horizons.
+    // The measured t8 surface has negative consumer scaling: validate its
+    // floor-directed move and, if that is not conclusively safe, restore the
+    // four-slot opening and run the bounded upward/local response search.
     if budget <= 8 {
+        config.nonlinear_probes = true;
         config.nonlinear_probe_samples = 12;
         config.nonlinear_blackout_samples = 12;
-        config.nonlinear_probes = true;
     } else {
-        // Normal t32/t64 fixed surfaces repeatedly put producer 4 in the safe
-        // oracle region, while optional 6 -> 9 response probes were too noisy
-        // to amortize even with a one-second resolved horizon. Preserve four as
-        // the application-measured floor/opening and let the ordinary responsive
-        // cost model grow above it when producer work actually changes.
-        config.min_producer_slots = 4;
+        // The expanded low-end surface puts t32's optimum at producer 2. At
+        // t64, producer 2 is within 4.3% of producer 1 and improves on the old
+        // four-slot floor. Open directly at two as well: the reviewer-observed
+        // same-split penalty came from starting the pools at 28/4 and resizing
+        // them after startup. The normal responsive model can still grow above
+        // two if decode work changes; only the unnecessary response search is
+        // disabled on these measured monotone surfaces.
+        config.min_producer_slots = 2;
         config.nonlinear_probes = false;
     }
     config
 }
 
 fn scatac_initial_decode_slots(budget: usize) -> usize {
-    // Four is the measured safe opening at every validated budget. Small jobs
-    // may explore above it; larger jobs retain it as their model floor.
-    4.min(budget.saturating_sub(1)).max(1)
+    let measured_opening = if budget <= 8 { 4 } else { 2 };
+    measured_opening.min(budget.saturating_sub(1)).max(1)
 }
 
 #[derive(Args, Debug)]
@@ -830,9 +830,10 @@ mod tests {
         assert_eq!(config.nonlinear_blackout_samples, 12);
         assert_eq!(config.nonlinear_max_producer_slots, None);
         assert!(!scatac_broker_config(32).nonlinear_probes);
-        assert_eq!(scatac_broker_config(32).min_producer_slots, 4);
+        assert_eq!(scatac_broker_config(32).min_producer_slots, 2);
+        assert_eq!(scatac_broker_config(64).min_producer_slots, 2);
         assert_eq!(scatac_initial_decode_slots(8), 4);
-        assert_eq!(scatac_initial_decode_slots(32), 4);
-        assert_eq!(scatac_initial_decode_slots(64), 4);
+        assert_eq!(scatac_initial_decode_slots(32), 2);
+        assert_eq!(scatac_initial_decode_slots(64), 2);
     }
 }

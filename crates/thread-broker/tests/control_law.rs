@@ -531,6 +531,26 @@ fn solves_a_mapping_heavy_split() {
     assert_near(report.final_producer_limit, want, &cfg, "mapping-heavy");
 }
 
+/// The response-curve policy must not turn its opening split into a hard floor.
+/// When ordinary consumer scaling makes the model's floor-directed move safe,
+/// that measured move is the discriminator and no upward probe is needed. This
+/// is the large-budget counterpart to the negative-scaling test below.
+#[test]
+fn nonlinear_policy_keeps_a_valid_floor_move_instead_of_the_opening() {
+    let cfg = BrokerConfig {
+        nonlinear_probes: true,
+        ..quick()
+    };
+    let pipeline = Pipeline::new(100.0, 10_000.0, 28, 4);
+    assert_eq!(pipeline.optimum(32), 1);
+
+    let report = run_for(Arc::clone(&pipeline), 32, cfg, Duration::from_millis(1800));
+    assert_eq!(report.final_producer_limit, 1, "{report:?}");
+    assert_eq!(report.nonlinear_probes, 0, "{report:?}");
+    assert!(!report.nonlinear_override, "{report:?}");
+    assert!(report.producer_trajectory.contains(&1), "{report:?}");
+}
+
 /// A one-point cost model cannot see that adding consumers makes this stage
 /// slower. Responsive mode must measure the response curve, while freeze is the
 /// explicitly cheaper cost-model-only policy.
@@ -550,8 +570,12 @@ fn responsive_probes_negative_consumer_scaling_but_freeze_skips_it() {
     assert_eq!(report.nonlinear_probes, 3);
     assert_eq!(report.nonlinear_probe_improvements, 3);
     assert!(
-        !report.producer_trajectory.contains(&1),
-        "opt-in response search collapsed through its safe opening: {report:?}"
+        report.producer_trajectory.contains(&1),
+        "floor-directed validation was skipped: {report:?}"
+    );
+    assert!(
+        report.reverts >= 1,
+        "regressed floor was not restored: {report:?}"
     );
 
     let frozen = Pipeline::new(100.0, 10_000.0, 6, 2);

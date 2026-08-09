@@ -977,12 +977,32 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                 // and still ships disabled by default.
                                 let comparison =
                                     compare_rates(baseline, achieved, cfg.regression_tolerance);
-                                if comparison == RatificationOutcome::Regressed {
+                                let nonlinear_floor_validation = nonlinear_probe_enabled
+                                    && target == cfg.min_producer_slots
+                                    && from.1 > target;
+                                let floor_validation_requires_search =
+                                    nonlinear_floor_validation_requires_search(
+                                        nonlinear_probe_enabled,
+                                        cfg.min_producer_slots,
+                                        from.1,
+                                        target,
+                                        comparison,
+                                    );
+                                let unresolved_floor_validation = floor_validation_requires_search
+                                    && comparison == RatificationOutcome::Inconclusive;
+                                if comparison == RatificationOutcome::Regressed
+                                    || unresolved_floor_validation
+                                {
                                     tracing::debug!(
-                                        "thread-broker: reverting producer {} -> {} \
-                                 ({:.0} vs {:.0} items/s)",
+                                        "thread-broker: reverting producer {} -> {} after {} \
+                                         ({:.0} vs {:.0} items/s)",
                                         target,
                                         from.1,
+                                        if unresolved_floor_validation {
+                                            "inconclusive nonlinear floor validation"
+                                        } else {
+                                            "measured regression"
+                                        },
                                         achieved.mean,
                                         baseline.mean,
                                     );
@@ -990,16 +1010,36 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                         .final_model
                                         .map(|model| model.producer_cost_share)
                                         .unwrap_or_default();
-                                    rejected.insert(target, rejected_share);
-                                    report.rejections.push(Rejection {
-                                        epoch,
-                                        producer_target: target,
-                                        baseline_rate: baseline.mean,
-                                        achieved_rate: achieved.mean,
-                                        baseline_uncertainty: baseline.half_width,
-                                        achieved_uncertainty: achieved.half_width,
-                                        producer_cost_share: rejected_share,
-                                    });
+                                    if comparison == RatificationOutcome::Regressed {
+                                        rejected.insert(target, rejected_share);
+                                        report.rejections.push(Rejection {
+                                            epoch,
+                                            producer_target: target,
+                                            baseline_rate: baseline.mean,
+                                            achieved_rate: achieved.mean,
+                                            baseline_uncertainty: baseline.half_width,
+                                            achieved_uncertainty: achieved.half_width,
+                                            producer_cost_share: rejected_share,
+                                        });
+                                    } else {
+                                        report.inconclusive_ratifications += 1;
+                                    }
+                                    // An opt-in nonlinear policy validates the
+                                    // model's floor answer in the direction the
+                                    // model actually wants to move. If that
+                                    // measured shrink regresses, the opening is
+                                    // now a proven baseline and the existing
+                                    // upward/local response search has a reason
+                                    // to run. This distinguishes negative
+                                    // consumer scaling from an ordinary
+                                    // mapping-heavy split without treating an
+                                    // arbitrary opening as permanent evidence.
+                                    if nonlinear_floor_validation {
+                                        nonlinear_rate = Some(baseline);
+                                        nonlinear_best_split = Some(from);
+                                        nonlinear_tried.insert(from.1);
+                                        nonlinear_tried.insert(target);
+                                    }
                                     settled_rate = Some(baseline.mean);
                                     report.reverts += 1;
                                     costs.clear();
@@ -1035,6 +1075,19 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                 } else {
                                     if comparison == RatificationOutcome::Inconclusive {
                                         report.inconclusive_ratifications += 1;
+                                    }
+                                    // The floor-directed move itself is the
+                                    // cheapest discriminator. Once it has been
+                                    // retained, an upward response probe would
+                                    // only pay to revisit the opening it just
+                                    // improved on. A clear regression takes the
+                                    // branch above and enables that search.
+                                    if nonlinear_probe_enabled && target == cfg.min_producer_slots {
+                                        nonlinear_probe_complete = true;
+                                        nonlinear_targets.clear();
+                                        nonlinear_rate = None;
+                                        nonlinear_best_split = None;
+                                        nonlinear_previous_best = None;
                                     }
                                     // Kept. Re-survey once: the rates may have been
                                     // measured under a split that distorted them, and
@@ -1337,22 +1390,6 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                 Phase::Survey
                             } else if pressure_veto && pressure_vetoed_for < cfg.cap_persistence {
                                 Phase::Survey
-                            } else if nonlinear_probe_enabled
-                                && !nonlinear_probe_complete
-                                && target == cfg.min_producer_slots
-                                && split.1 > cfg.min_producer_slots
-                            {
-                                // An opt-in response-curve policy says the
-                                // one-point floor answer is known to be
-                                // insufficient evidence. Preserve the caller's
-                                // measured safe opening as the first proven
-                                // point instead of paying to collapse to the
-                                // floor and then climbing back through it.
-                                report.final_model = Some(model.snapshot);
-                                settled_rate = Some(recent.estimate().mean);
-                                Phase::Steady {
-                                    drifted_for: Duration::ZERO,
-                                }
                             } else if distance < model.snapshot.effective_deadband_threads {
                                 report.final_model = Some(model.snapshot);
                                 settled_rate = Some(recent.estimate().mean);
@@ -1646,6 +1683,16 @@ enum RatificationOutcome {
     Kept,
     Inconclusive,
     Regressed,
+}
+
+fn nonlinear_floor_validation_requires_search(
+    enabled: bool,
+    floor: usize,
+    from: usize,
+    target: usize,
+    outcome: RatificationOutcome,
+) -> bool {
+    enabled && target == floor && from > target && outcome != RatificationOutcome::Kept
 }
 
 fn compare_rates(
@@ -2161,7 +2208,8 @@ mod tests {
     use super::{
         BrokerPhase, BrokerReport, Caps, Costs, Phase, ProducerCapReason, RateEstimate,
         RatificationKind, RatificationOutcome, Recent, compare_rates, consecutive_drift_duration,
-        nonlinear_probe_improved, nonlinear_probe_targets, producer_capacity_used,
+        nonlinear_floor_validation_requires_search, nonlinear_probe_improved,
+        nonlinear_probe_targets, producer_capacity_used,
     };
     use crate::{BrokerConfig, ProducerMeasurementMode, ProducerPressure, ResizeSide, Work};
     use std::time::{Duration, Instant};
@@ -2537,6 +2585,39 @@ mod tests {
                 ..RateEstimate::default()
             },
             0.05,
+        ));
+    }
+
+    #[test]
+    fn nonlinear_floor_validation_requires_a_conclusive_keep() {
+        for outcome in [
+            RatificationOutcome::Inconclusive,
+            RatificationOutcome::Regressed,
+        ] {
+            assert!(nonlinear_floor_validation_requires_search(
+                true, 1, 4, 1, outcome
+            ));
+        }
+        assert!(!nonlinear_floor_validation_requires_search(
+            true,
+            1,
+            4,
+            1,
+            RatificationOutcome::Kept,
+        ));
+        assert!(!nonlinear_floor_validation_requires_search(
+            false,
+            1,
+            4,
+            1,
+            RatificationOutcome::Inconclusive,
+        ));
+        assert!(!nonlinear_floor_validation_requires_search(
+            true,
+            1,
+            4,
+            2,
+            RatificationOutcome::Regressed,
         ));
     }
 
