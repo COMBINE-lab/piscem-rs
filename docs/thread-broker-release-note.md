@@ -12,7 +12,13 @@ uses the serial path.
 
 Fixed controls have precise, changed semantics:
 
-- `--decoder parallel=N` fixes `N` decode slots per decoder-capable input;
+- `--decoder parallel=N` fixes `N` decode slots per decoder-capable input.
+  **This changed in 0.9.0**: the request previously overwrote the decode
+  allocation without reducing the mapping pool, so a pinned run spent both sides
+  of the budget in full and quietly ignored `-t`. Measured at `-t 32`,
+  `--decoder parallel=16` ran an average of 41.3 concurrent threads against a
+  budget of 32, which also invalidated any timing compared against it. Pinned
+  runs now use the threads they were given, and may take longer than before;
 - `PISCEM_DECODE_SLOTS=N` fixes `N` aggregate decode slots and is the preferred
   control for reproducible oracle sweeps;
 - legacy `PISCEM_RAPIDGZIP_THREADS=N` remains per decoder-capable input.
