@@ -5,5 +5,6 @@ pub mod broker;
 pub mod calibrate;
 pub mod fastx;
 pub mod map_info;
+pub mod policy;
 pub mod rad;
 pub mod threads;

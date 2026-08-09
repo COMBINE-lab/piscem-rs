@@ -146,6 +146,88 @@ pub use controller::{
     ProducerCapReason, Rejection, RunningBroker,
 };
 
+/// Whether engaging a *parallel* producer can pay for the threads it takes.
+///
+/// # The economics this encodes
+///
+/// A consumer that decodes its own input inline — each worker inflating under
+/// its own stream's lock, then processing what it produced — is
+/// **work-conserving**: it is never idle, because a thread with less decode work
+/// simply does more consuming, rebalancing at batch granularity with no
+/// coordination. It gives `streams` concurrent decoders for free, where `streams`
+/// is the number of independent input streams.
+///
+/// A parallel producer gives `d` decoders but *takes* `d` threads away from
+/// consuming, and those threads can only decode. So it pays exactly when
+/// `d > streams` — when it can supply more concurrency than the consumer already
+/// gets for nothing.
+///
+/// # Why a threshold rather than that rule
+///
+/// `d` is what the broker *converges to*, so it is unknown when the decision has
+/// to be made. This is the budget-side proxy: with `budget` threads and
+/// `streams` inputs, the producer can only plausibly exceed `streams` decoders
+/// if the budget is several times the stream count.
+///
+/// # Provenance of the default
+///
+/// Measured on a single-cell Flex library (150 bp pairs, human index) and a bulk
+/// SE library (gencode), sweeping `budget` over `{8, 32, 64}` and `streams` over
+/// `{1..16}` — 16 cells. Inline decoding won every cell where `d <= streams` by
+/// 8–28%, and the parallel producer won every cell where `d > streams` by up to
+/// 4.2x. `budget >= 8 * streams` reproduces all 16 verdicts except one boundary
+/// cell that costs ~8%.
+///
+/// The default is calibrated on the *most* decode-bound workload available, so it
+/// errs toward inline decoding for anything less decode-heavy — the direction
+/// that protects a consumer-bound baseline. The asymmetry is deliberate: missing
+/// a parallel win costs up to 4.2x, taking one wrongly costs ~25%, but the
+/// wrongly-taken case is the one a user notices as a regression against not
+/// having the feature at all.
+///
+/// Override it when your workload's decode-to-consume ratio is known to differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EngagementPolicy {
+    /// Budget threads required per independent input stream before a parallel
+    /// producer is engaged at all.
+    ///
+    /// `0` always engages; a very large value never does.
+    pub min_threads_per_stream: usize,
+}
+
+impl Default for EngagementPolicy {
+    fn default() -> Self {
+        Self {
+            min_threads_per_stream: 8,
+        }
+    }
+}
+
+impl EngagementPolicy {
+    /// Engage a parallel producer for `streams` inputs under `budget` threads?
+    ///
+    /// `streams == 0` never engages: there is nothing for a parallel producer to
+    /// do, so it could only cost threads.
+    pub const fn engages(&self, budget: usize, streams: usize) -> bool {
+        streams != 0 && budget >= self.min_threads_per_stream.saturating_mul(streams)
+    }
+
+    /// Always engage, leaving the decision entirely to the broker.
+    ///
+    /// There is deliberately no `never()` counterpart. This type expresses a
+    /// *threshold*, and no threshold declines every budget — `usize::MAX` still
+    /// engages at a `usize::MAX` budget, so such a constructor would be a lie in
+    /// exactly the case someone would reach for it to be safe. A caller that
+    /// wants the producer off should not construct it at all; piscem exposes
+    /// that as `--decoder serial`.
+    pub const fn always() -> Self {
+        Self {
+            min_threads_per_stream: 0,
+        }
+    }
+}
+
 /// Cumulative work done by one stage.
 ///
 /// # Busy time, never wall time

@@ -175,6 +175,19 @@ pub struct MapScatacArgs {
     /// serial because the parallel decoder requires positional reads.
     #[arg(long, default_value = "auto", value_name = "MODE")]
     pub decoder: String,
+    /// Path to a JSON file overriding thread and decoder policy.
+    ///
+    /// Every field is optional and defaults to a measured value, so a file need
+    /// only name what it changes; an unknown field is an error rather than a
+    /// silent no-op. Currently:
+    ///
+    /// `{"parallel_decode": {"min_threads_per_stream": 8}}`
+    ///
+    /// That value is how many threads must be available per gzip input before
+    /// the parallel decoder is used at all. Below it the serial decoder already
+    /// supplies one inflate stream per input for free, on threads that also map.
+    #[arg(long, value_name = "FILE")]
+    pub thread_policy: Option<PathBuf>,
     /// Barcode length in bases
     #[arg(long, default_value = "16")]
     pub bc_len: usize,
@@ -351,6 +364,7 @@ where
     let num_threads = args.threads.max(1);
     let decoder_pref = crate::io::calibrate::DecoderPreference::parse(&args.decoder)
         .map_err(|e| anyhow::anyhow!("invalid --decoder value: {e}"))?;
+    let thread_policy = crate::io::policy::ThreadPolicy::load(args.thread_policy.as_deref())?;
     let progress_flush_override = parse_progress_flush_every(
         std::env::var(SCATAC_PROGRESS_FLUSH_EVERY_ENV)
             .ok()
@@ -382,7 +396,7 @@ where
             &output_info, &stats,
             index, &binning, bc_len, tn5_shift, min_overlap, Some(&end_cache),
             is_paired, progress_flush_override, reader_batch_override, opts,
-            num_threads, decoder_pref, &progress,
+            num_threads, decoder_pref, thread_policy, &progress,
         )?
     });
 
@@ -458,6 +472,7 @@ fn run_atac_pipeline<const K: usize, D: KmerDictionary + Sync, C: ContigTableLik
     opts: MappingOpts,
     num_threads: usize,
     decoder_pref: crate::io::calibrate::DecoderPreference,
+    thread_policy: crate::io::policy::ThreadPolicy,
     progress: &indicatif::ProgressBar,
 ) -> Result<crate::io::fastx::PipelineOutcome>
 where
@@ -491,7 +506,12 @@ where
             g
         })
         .collect();
-    let decision = crate::io::calibrate::choose_decoder(&groups, num_threads, decoder_pref);
+    let decision = crate::io::calibrate::choose_decoder(
+        &groups,
+        num_threads,
+        decoder_pref,
+        thread_policy.parallel_decode,
+    );
     #[cfg_attr(not(feature = "rapidgzip"), allow(unused_mut))]
     let mut plan = crate::io::fastx::plan_thread_budget(
         num_threads,

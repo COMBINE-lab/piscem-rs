@@ -73,6 +73,19 @@ pub struct MapBulkArgs {
     /// serial because the parallel decoder requires positional reads.
     #[arg(long, default_value = "auto", value_name = "MODE")]
     pub decoder: String,
+    /// Path to a JSON file overriding thread and decoder policy.
+    ///
+    /// Every field is optional and defaults to a measured value, so a file need
+    /// only name what it changes; an unknown field is an error rather than a
+    /// silent no-op. Currently:
+    ///
+    /// `{"parallel_decode": {"min_threads_per_stream": 8}}`
+    ///
+    /// That value is how many threads must be available per gzip input before
+    /// the parallel decoder is used at all. Below it the serial decoder already
+    /// supplies one inflate stream per input for free, on threads that also map.
+    #[arg(long, value_name = "FILE")]
+    pub thread_policy: Option<PathBuf>,
     /// K-mer skipping strategy (permissive or strict)
     #[arg(long, default_value = "permissive")]
     pub skipping_strategy: String,
@@ -243,6 +256,7 @@ where
     let num_threads = args.threads.max(1);
     let decoder_pref = crate::io::calibrate::DecoderPreference::parse(&args.decoder)
         .map_err(|e| anyhow::anyhow!("invalid --decoder value: {e}"))?;
+    let thread_policy = crate::io::policy::ThreadPolicy::load(args.thread_policy.as_deref())?;
     let opts = MappingOpts {
         max_hit_occ: args.max_hit_occ,
         max_hit_occ_recover: args.max_hit_occ_recover,
@@ -271,14 +285,14 @@ where
                 r1_paths, r2_paths,
                 &output_info, &stats,
                 index, strat, opts, is_paired,
-                num_threads, decoder_pref, &progress,
+                num_threads, decoder_pref, thread_policy, &progress,
             )?
         } else {
             run_bulk_pipeline::<K, SketchHitInfoSimple, _, _>(
                 r1_paths, r2_paths,
                 &output_info, &stats,
                 index, strat, opts, is_paired,
-                num_threads, decoder_pref, &progress,
+                num_threads, decoder_pref, thread_policy, &progress,
             )?
         }
     });
@@ -358,6 +372,7 @@ fn run_bulk_pipeline<
     is_paired: bool,
     num_threads: usize,
     decoder_pref: crate::io::calibrate::DecoderPreference,
+    thread_policy: crate::io::policy::ThreadPolicy,
     progress: &ProgressBar,
 ) -> Result<crate::io::fastx::PipelineOutcome>
 where
@@ -386,7 +401,12 @@ where
         read1_paths.iter().map(|a| vec![a.clone()]).collect()
     };
 
-    let decision = crate::io::calibrate::choose_decoder(&groups, num_threads, decoder_pref);
+    let decision = crate::io::calibrate::choose_decoder(
+        &groups,
+        num_threads,
+        decoder_pref,
+        thread_policy.parallel_decode,
+    );
     #[cfg_attr(not(feature = "rapidgzip"), allow(unused_mut))]
     let mut plan = crate::io::fastx::plan_thread_budget(
         num_threads,

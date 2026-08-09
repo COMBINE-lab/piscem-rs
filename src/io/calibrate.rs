@@ -80,6 +80,10 @@ pub enum Reason {
     SingleThreaded,
     /// The user asked for this decoder explicitly.
     UserRequested,
+    /// The budget is too small relative to the number of gzip inputs for the
+    /// parallel decoder to supply more concurrency than the serial path already
+    /// gets for free. See [`thread_broker::EngagementPolicy`].
+    PolicyDeclined,
     /// Nothing forces the answer, so the parallel path is opened and the thread
     /// broker sizes it from live evidence.
     Adaptive,
@@ -327,8 +331,9 @@ pub fn preference_choice(pref: DecoderPreference, kind: InputKind) -> Option<Dec
 /// whether anything *can* be decoded in parallel, and what the user asked for.
 pub fn choose_decoder(
     groups: &[ReadGroup],
-    map_threads: usize,
+    budget: usize,
     pref: DecoderPreference,
+    policy: thread_broker::EngagementPolicy,
 ) -> Decision {
     let all: Vec<PathBuf> = groups.iter().flatten().cloned().collect();
     if all.is_empty() {
@@ -385,9 +390,31 @@ pub fn choose_decoder(
         );
         return chosen;
     }
-    if let Some(forced) = forced_choice(kind, map_threads) {
+    if let Some(forced) = forced_choice(kind, budget) {
         tracing::debug!("decoder choice forced: {:?}", forced.reason);
         return forced;
+    }
+
+    // The serial path decodes inline on the mapping threads, so it already
+    // supplies one concurrent inflate stream per gzip input at no cost, and
+    // those threads map whenever decode is light. The parallel decoder only
+    // wins when it can beat that stream count, which needs a budget several
+    // times the input count. Below that it is a measured 8-28% regression.
+    let streams = regular
+        .iter()
+        .filter(|p| detect_compression(p, InputKind::Regular) == InputCompression::Gzip)
+        .count();
+    if !policy.engages(budget, streams) {
+        tracing::info!(
+            "using the serial decoder: {budget} threads for {streams} gzip \
+             input(s) is below the {} threads per input needed before parallel \
+             decoding adds concurrency the serial path does not already have",
+            policy.min_threads_per_stream,
+        );
+        return Decision {
+            parallel: false,
+            reason: Reason::PolicyDeclined,
+        };
     }
 
     // Nothing forces the answer, so open the parallel path and let the broker
@@ -401,9 +428,98 @@ pub fn choose_decoder(
     }
 }
 
+/// Shared by both test modules below.
+#[cfg(test)]
+mod test_support {
+    /// Most tests here predate the engagement policy and are about the forcing
+    /// rules, so they opt out of it rather than restating its threshold.
+    pub(super) fn always() -> thread_broker::EngagementPolicy {
+        thread_broker::EngagementPolicy::always()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The measured rule: the serial decoder already supplies one inflate
+    /// stream per gzip input, on threads that also map, so the parallel decoder
+    /// is only worth its reserved threads when the budget is several times the
+    /// input count. Below that it was measured 8-28% slower.
+    #[test]
+    fn the_budget_must_clear_the_engagement_threshold() {
+        let d = std::env::temp_dir().join(format!("piscem-engage-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        // Two gzip inputs, so the default policy wants 16 threads.
+        let mut groups = Vec::new();
+        let mut paths = Vec::new();
+        for n in ["a.gz", "b.gz"] {
+            let p = d.join(n);
+            std::fs::write(&p, [0x1f, 0x8b, 0x08, 0x00]).unwrap();
+            paths.push(p);
+        }
+        groups.push(paths);
+
+        let policy = thread_broker::EngagementPolicy::default();
+        let under = choose_decoder(&groups, 8, DecoderPreference::Auto, policy);
+        assert!(!under.parallel, "8 threads for 2 inputs must stay serial");
+        assert_eq!(under.reason, Reason::PolicyDeclined);
+
+        let over = choose_decoder(&groups, 16, DecoderPreference::Auto, policy);
+        assert!(
+            over.parallel,
+            "16 threads for 2 inputs clears the threshold"
+        );
+        assert_eq!(over.reason, Reason::Adaptive);
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// An explicit request outranks the policy: it is a measured default, not a
+    /// safety rule, and a user who names the decoder has said what they want.
+    #[test]
+    fn an_explicit_request_overrides_the_policy() {
+        let d = std::env::temp_dir().join(format!("piscem-engage-req-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        let p = d.join("a.gz");
+        std::fs::write(&p, [0x1f, 0x8b, 0x08, 0x00]).unwrap();
+        let groups = vec![vec![p]];
+
+        let cal = choose_decoder(
+            &groups,
+            2,
+            DecoderPreference::Parallel {
+                workers_per_file: None,
+            },
+            thread_broker::EngagementPolicy::default(),
+        );
+        assert!(cal.parallel, "an explicit request must not be declined");
+        assert_eq!(cal.reason, Reason::UserRequested);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Non-gzip inputs are not streams the parallel decoder could ever serve, so
+    /// they must not count toward the threshold and make it harder to clear.
+    #[test]
+    fn only_gzip_inputs_count_toward_the_threshold() {
+        let d = std::env::temp_dir().join(format!("piscem-engage-mix-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        let gz = d.join("a.gz");
+        std::fs::write(&gz, [0x1f, 0x8b, 0x08, 0x00]).unwrap();
+        let plain = d.join("b.fq");
+        std::fs::write(&plain, b"@r\nACGT\n+\nIIII\n").unwrap();
+        let groups = vec![vec![gz, plain]];
+
+        // One gzip input among two files: 8 threads is enough for that one.
+        let cal = choose_decoder(
+            &groups,
+            8,
+            DecoderPreference::Auto,
+            thread_broker::EngagementPolicy::default(),
+        );
+        assert!(cal.parallel, "the plain file must not raise the bar");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn streams_never_take_the_parallel_path() {
@@ -585,6 +701,7 @@ mod tests {
 /// times out. A test that completes is proof the path was never opened.
 #[cfg(all(test, unix))]
 mod non_rewindable_input_tests {
+    use super::test_support::always;
     use super::*;
     /// A FIFO with no writer. Reading it blocks forever, which is the point.
     fn fifo(dir: &std::path::Path, name: &str) -> PathBuf {
@@ -642,7 +759,7 @@ mod non_rewindable_input_tests {
     fn an_all_fifo_run_is_forced_before_anything_is_read() {
         let d = tmpdir("allfifo");
         let groups = vec![vec![fifo(&d, "a.fifo"), fifo(&d, "b.fifo")]];
-        let cal = choose_decoder(&groups, 32, DecoderPreference::Auto);
+        let cal = choose_decoder(&groups, 32, DecoderPreference::Auto, always());
         assert!(!cal.parallel);
         assert_eq!(cal.reason, Reason::NonSeekableInput);
         let _ = std::fs::remove_dir_all(&d);
@@ -659,6 +776,7 @@ mod non_rewindable_input_tests {
             DecoderPreference::Parallel {
                 workers_per_file: Some(8),
             },
+            always(),
         );
         assert!(!cal.parallel);
         assert_eq!(cal.reason, Reason::NonSeekableInput);
@@ -671,7 +789,7 @@ mod non_rewindable_input_tests {
     fn a_split_group_is_skipped_rather_than_half_read() {
         let d = tmpdir("split");
         let groups = vec![vec![gzip_fixture(&d, "r1.fq.gz"), fifo(&d, "r2.fifo")]];
-        let cal = choose_decoder(&groups, 32, DecoderPreference::Auto);
+        let cal = choose_decoder(&groups, 32, DecoderPreference::Auto, always());
         // Adaptive -- seekable gzip exists and no data was read to decide.
         assert_eq!(cal.reason, Reason::Adaptive);
         // But not forced serial either: the regular file is still a candidate.
@@ -689,7 +807,7 @@ mod non_rewindable_input_tests {
         ];
         // Reaching the next line at all is the real assertion: opening either
         // FIFO would block forever and this would never return.
-        let cal = choose_decoder(&groups, 8, DecoderPreference::Auto);
+        let cal = choose_decoder(&groups, 8, DecoderPreference::Auto, always());
         // The FIFO group must not have forced the run serial -- half the input
         // is perfectly seekable.
         assert_ne!(cal.reason, Reason::NonSeekableInput);
