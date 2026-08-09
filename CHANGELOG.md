@@ -3,7 +3,24 @@
 Notable changes to `piscem-rs`. Versions follow [Semantic Versioning](https://semver.org);
 pre-1.0, a minor bump may carry breaking changes.
 
-## [0.9.0] — unreleased
+## [0.9.1] — unreleased
+
+### Fixed
+
+- **`rapidgzip-core` 0.3.1, closing a lost-wakeup deadlock in the shared decoder
+  pool.** The pool's `release` notified waiting decoders without holding the
+  scheduler lock, so the final release could slip between a waiter's admission
+  check and its park — leaving free decode slots, parked decoders, and no
+  future wakeup, with every later admission joining the dead queue. piscem
+  itself never reproduced this: its decode cost share keeps enough slots
+  granted that admission rarely waits at all. It was found through salmon,
+  whose far heavier per-fragment mapping drives the broker to shrink the pool
+  to a handful of slots, putting both paired inputs' decoders on the contended
+  path where the race window sits. The exposure is nevertheless piscem's too —
+  any run whose split leaves the decode side small shares it — so this ships as
+  a patch release rather than waiting on the next feature cycle.
+
+## [0.9.0] — 2026-08-09
 
 Supersedes 0.7.0, 0.7.1 and 0.8.0, all of which were **yanked**. Those releases
 selected the parallel gzip decoder but never actually decoded in parallel: the
