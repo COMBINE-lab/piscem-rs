@@ -84,7 +84,26 @@ directly.
 ### Dependencies
 
 - `rapidgzip-core` 0.3.0, now a released crate rather than a git revision.
+- **No git dependencies remain.** `paraseq` was a git revision, which crates.io
+  rejects outright, and `thread-broker` was a bare path dependency, which cannot
+  be published either. Both are now released crates, which is what makes this
+  release publishable at all.
+- **`paraseq-temp` 0.5.0-pre.1** replaces the `paraseq` git pin. It is a
+  republication of paraseq's unreleased `dev-0.5.0` branch plus the resizable
+  worker pool from noamteyssier/paraseq#75, which is what allows the mapping
+  thread count to change mid-run. Its library target is still named `paraseq`,
+  so nothing about the API changes. **`paraseq` remains the official crate** —
+  prefer it once 0.5.0 is released upstream.
+- **`thread-broker` 0.1.0**, the control law described above, split out as a
+  standalone crate.
 - `libradicl` 0.16 → 0.17.
+- `sshash-lib` and `tiny-dict` 0.6.3 → 0.6.4, which pins `rapidhash` exactly.
+  `sshash-lib` had accepted any 4.x while deriving its minimizer hasher's magic
+  constant through `rapidhash::fast::RapidHasher` — documented as unstable
+  across versions — and recomputing that constant when an index is *loaded*. A
+  future rapidhash release could therefore have made a rebuilt piscem compute
+  different minimizers and silently fail to find k-mers in indices built
+  earlier. Nothing was broken in practice; the pin closes the window.
 - `hashbrown` 0.17 is now a direct dependency, for `HashTable` in
   `index::eq_classes`. It adds no copy to the build tree — it unifies with the
   one `tiny-dict` already resolves.

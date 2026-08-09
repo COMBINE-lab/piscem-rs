@@ -89,7 +89,12 @@ case "$CRATE" in
     piscem-rs)
         CARGO_TOML="Cargo.toml"
         TAG="${CRATE}-v${VERSION}"
-        PUBLISH_ARGS=""
+        # Explicit, though the workspace root package is also the default. The
+        # workspace has four publishable members (piscem-rs, piscem-py,
+        # seq_geom_parser, thread-broker) and only this one is being released
+        # here; naming it means a bare `cargo publish` can never be resolved
+        # against a different member.
+        PUBLISH_ARGS="-p piscem-rs"
         ;;
     seq_geom_parser)
         CARGO_TOML="crates/seq_geom_parser/Cargo.toml"
