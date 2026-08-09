@@ -2184,8 +2184,9 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rapidgzip-core"
-version = "0.2.1"
-source = "git+https://github.com/COMBINE-lab/rapidgzip-rust.git?rev=276a41f77fb927e24cb0898a638a08b21eb048c6#276a41f77fb927e24cb0898a638a08b21eb048c6"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73479522ef5ac15e4015ff42faab6c3f6372f88b95ffd5fa4577f93dd76e907e"
 dependencies = [
  "bon",
  "cpu-time",
@@ -2650,7 +2651,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys",
