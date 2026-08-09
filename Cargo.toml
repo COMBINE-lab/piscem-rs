@@ -99,13 +99,14 @@ hashbrown = "0.17"
 dashmap = "6"
 smallvec = "1.13"
 crossbeam = "0.8"
-# TEMPORARY: our fork, while the dynamic worker pool is in review.
+# TEMPORARY: a republication of paraseq's unreleased dev-0.5.0 branch plus the
+# resizable worker pool from noamteyssier/paraseq#75.
 #
-# Adds `ThreadPool` so the mapping thread count can change mid-run, which is
-# what lets a bad decode/map split be corrected instead of merely avoided.
-# See noamteyssier/paraseq#75. Pinned to the reviewed implementation used by
-# the broker audit; revert to a released crates.io version once that lands.
-paraseq = { git = "https://github.com/rob-p/paraseq.git", rev = "40ae74fe4e8c6d8009ae65eb4c955083c238fa06" }
+# `ThreadPool` is what lets the mapping thread count change mid-run, so a bad
+# decode/map split can be corrected rather than merely avoided. `paraseq` is the
+# official crate -- move back to it once 0.5.0 is released upstream. The lib
+# target is still named `paraseq`, so every `use paraseq::...` is unaffected.
+paraseq-temp = "0.5.0-pre.1"
 niffler = { version = "3", default-features = false, features = [
   "gz",
   "bz2",
@@ -131,7 +132,7 @@ mimalloc = { version = "0.1.48", optional = true }
 # 17-313% off. Released in 0.3.0, so this is no longer a git dependency.
 rapidgzip-core = { version = "0.3", optional = true }
 
-thread-broker = { path = "crates/thread-broker" }
+thread-broker = { version = "0.1.0", path = "crates/thread-broker" }
 
 [dev-dependencies]
 tempfile = "3"
