@@ -52,7 +52,7 @@
 //! it, so the target set is a half-line and the controller has no restoring force
 //! on it. Measured, it walked to 47 producer slots of 64 and ran **44% slower
 //! than the best split**, reporting near-zero error the whole way. See
-//! [`ProducerPressure`] and `DESIGN-thread-broker.md`.
+//! [`ProducerPressure`] and `notes/thread-broker/design.md`.
 //!
 //! A model can still be wrong — a producer reading from a saturated disk cannot
 //! use the slots it is given — so the jump is guarded: capped against observed

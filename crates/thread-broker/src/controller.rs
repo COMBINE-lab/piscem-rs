@@ -9,7 +9,7 @@
 //! demote hill-climbing to a check on a model-based decision rather than the
 //! decision itself.
 //!
-//! See `DESIGN-thread-broker.md` for the derivation and the citations.
+//! See `notes/thread-broker/design.md` for the derivation and the citations.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -91,7 +91,19 @@ pub struct BrokerReport {
     /// Model-requested producer shrinks vetoed because runnable producer work
     /// was still queued behind the current limit.
     pub pressure_vetoed_shrinks: usize,
-    /// Time from the end of warm-up until the broker settled, if it did.
+    /// Time from the end of warm-up until the split stopped changing.
+    ///
+    /// Measured to the last actual **change of allocation**, not to the moment
+    /// the controller last stopped deliberating. Those differ: a settled split
+    /// can be re-opened by drift, re-solved, and left exactly where it was. That
+    /// is a decision being reconsidered, not an allocation moving, and reporting
+    /// it as a fresh convergence is misleading in the direction that matters —
+    /// it makes a stable run look unstable.
+    ///
+    /// Measured on a 2.3 billion read Flex run at `-t 64`: the split reached
+    /// 25 decode slots about two seconds in and never moved again for the
+    /// remaining 111 seconds, while a single harmless resurvey made this field
+    /// read 87 seconds.
     pub time_to_converge: Option<Duration>,
     /// Final split.
     pub final_consumer_threads: usize,
@@ -490,6 +502,11 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
         // "what has taken effect yet". The budget must be enforced against the
         // former or two consecutive decisions can double-spend the same threads.
         let mut split = initial;
+        // When the split last *changed*, which is what convergence means. A
+        // decision that is re-opened and reaches the same answer has not
+        // un-converged: nothing moved, no work was redone, and the allocation
+        // the run has been using is still the one it started with.
+        let mut last_split_change = started;
 
         let mut costs = Costs::new(cfg.smoothing_windows);
         // Throughput over the same span the ratify stage will measure, so the
@@ -716,6 +733,7 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                         ) {
                             Ok((interim, phase)) => {
                                 split = interim;
+                                last_split_change = now();
                                 phase
                             }
                             Err(kind) => {
@@ -781,6 +799,7 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                             ));
                         }
                         split = to;
+                        last_split_change = now();
                         report.moves += 1;
                         costs.clear();
                         *next
@@ -1010,6 +1029,7 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                                 ) {
                                                     Ok((interim, phase)) => {
                                                         split = interim;
+                                                        last_split_change = now();
                                                         phase
                                                     }
                                                     Err(error_kind) => {
@@ -1049,6 +1069,7 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                                 ) {
                                                     Ok((interim, phase)) => {
                                                         split = interim;
+                                                        last_split_change = now();
                                                         phase
                                                     }
                                                     Err(error_kind) => {
@@ -1197,6 +1218,7 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                         ) {
                                             Ok((interim, phase)) => {
                                                 split = interim;
+                                                last_split_change = now();
                                                 phase
                                             }
                                             Err(kind) => {
@@ -1399,6 +1421,7 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                         ) {
                             Ok((interim, phase)) => {
                                 split = interim;
+                                last_split_change = now();
                                 phase
                             }
                             Err(kind) => {
@@ -1507,7 +1530,6 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                 // measurement cadence.
                                 nonlinear_targets.clear();
                                 nonlinear_probe_complete = true;
-                                report.time_to_converge = None;
                                 settled_model = None;
                                 // Persistent drift was itself measured from a
                                 // full clean cost window. Reuse that evidence
@@ -1526,10 +1548,12 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                 if settled_model.is_none() {
                                     settled_model = solved.map(|model| model.snapshot);
                                 }
-                                if report.time_to_converge.is_none() {
-                                    report.time_to_converge =
-                                        Some(sampled_at.saturating_duration_since(warm_ended));
-                                }
+                                // Measured to the last split change, not to
+                                // this sample: a run that opened at the right
+                                // allocation and never moved converged
+                                // immediately, however long it then ran.
+                                report.time_to_converge =
+                                    Some(last_split_change.saturating_duration_since(warm_ended));
                                 settled_rate.get_or_insert(current_rate.mean);
                                 Phase::Steady {
                                     drifted_for: Duration::ZERO,
@@ -1708,6 +1732,7 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                 ) {
                                     Ok((interim, phase)) => {
                                         split = interim;
+                                        last_split_change = now();
                                         phase
                                     }
                                     Err(kind) => {

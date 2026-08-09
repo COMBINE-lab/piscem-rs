@@ -1635,3 +1635,31 @@ fn max_cadences_publish_only_when_the_batch_ends() {
     assert_eq!(done.items, 1);
     assert!(done.busy_nanos > 0);
 }
+
+/// Convergence means the allocation stopped changing, not that the controller
+/// stopped thinking about it.
+///
+/// A stable workload can still drift enough to re-open a settled decision, solve
+/// it again, and land on the same split. Nothing moved and no work was redone,
+/// so the run converged when it first settled. Reporting the reopen instead made
+/// a 2.3 billion read Flex run that settled in ~2 s and never moved again claim
+/// 87 s.
+#[test]
+fn a_reopened_decision_that_does_not_move_stays_converged() {
+    let cfg = quick();
+    // Opens exactly where the model wants, so no move is ever justified.
+    let want = 16;
+    let p = Pipeline::new(1_000.0, 1_000.0, 32 - want, want);
+    assert_eq!(p.optimum(32), want);
+
+    let report = run_for(Arc::clone(&p), 32, cfg, Duration::from_millis(1500));
+    assert_eq!(report.moves, 0, "nothing should have moved: {report:?}");
+    let settled = report
+        .time_to_converge
+        .expect("a run that never moves must report convergence");
+    assert!(
+        settled < Duration::from_millis(300),
+        "converged at {settled:?}; a split that never changed must not report \
+         the elapsed run, however many times the decision was re-opened",
+    );
+}

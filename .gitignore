@@ -38,27 +38,16 @@ piscem_build_stats_cpp.time
 profile.json.gz
 test_data/
 
-# Untracked working documents (design/plan notes, not part of the repo)
-PLAN-adaptive-scheduling.md
-DESIGN-thread-broker.md
-COMPLETION-thread-broker.md
-thread-broker-review-2.md
 
 # Raw thread-broker oracle runs are large, machine-local evidence.
 benchmark_results/
 
-# Local thread-broker validation harnesses and generated-data stress tests.
+# Local thread-broker validation manifests and generated-data stress fixtures.
 # Their purpose, invocation, and retained evidence are recorded in
-# COMPLETION-thread-broker.md; they are deliberately not release artifacts.
+# notes/thread-broker/completion-ledger.md.
 scripts/__pycache__/
 # The runners define what "passing" means for every performance claim on
 # this branch, so they are tracked. Only the concrete manifests are
 # machine-local: they carry absolute fixture paths for one host.
 scripts/*.json
 !scripts/*.example.json
-thread-broker-scatac-t32-failure.md
-thread-broker-policy-knobs.md
-thread-broker-bracket-review.md
-thread-broker-policy-knobs-response.md
-thread-broker-bracket-review-response.md
-thread-broker-decoder-policy.md

@@ -553,7 +553,7 @@ cadence it cannot use.
 Only run this after gates A-G pass; otherwise an apparently fast run may simply
 be using a different budget.
 
-Use the five ready modalities from `PLAN-adaptive-scheduling.md`: bulk SE, bulk
+Use the five ready modalities from `plan-adaptive-scheduling.md`: bulk SE, bulk
 PE, scRNA, Flex, and scATAC, at `-t {8,32,64}` plus a small `-t {1,2,4}`
 correctness set. Include dense-member, marker-window, sequential/inelastic,
 plain, mixed regular/FIFO, warm-cache, and cold/source-bound cases.

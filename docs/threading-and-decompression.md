@@ -220,7 +220,7 @@ and exits and updates a cumulative counter only at exit; it adds nothing to a
 decode-task or inflate hot loop. The feature is disabled by default and is not
 the controller signal. It passed separate direct-decoder and application-level
 feature-on/off gates whose one-sided 95% wall- and CPU-overhead bounds were at
-most 1%. See `THREAD-BROKER-AUDIT.md` for the remaining real-workload gates.
+most 1%. See `notes/thread-broker/audit.md` for the remaining real-workload gates.
 
 <details>
 <summary>Archived pre-run probe and supervisor experiments (superseded)</summary>
