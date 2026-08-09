@@ -1,0 +1,71 @@
+{
+  "binary": "target/release/piscem-rs",
+  "results_dir": "/path/to/results_dir",
+  "repetitions": 3,
+  "jobs": [
+    {
+      "name": "dense-members",
+      "output_kind": "stem",
+      "budget": 8,
+      "pin": 2,
+      "signal": "accounted",
+      "reference": "accounted",
+      "expected_decoder_paths": ["DenseMembers"],
+      "cleanup_output": true,
+      "args": ["map-bulk", "-i", "/path/to/bulk_index", "-r", "/path/to/dense.fq.gz", "--quiet", "--dict", "tiny"]
+    },
+    {
+      "name": "marker-window",
+      "output_kind": "stem",
+      "budget": 8,
+      "pin": 4,
+      "signal": "accounted",
+      "reference": "accounted",
+      "expected_decoder_paths": ["MarkerWindow"],
+      "cleanup_output": true,
+      "args": ["map-bulk", "-i", "/path/to/bulk_index", "-r", "/path/to/single_member.fq.gz", "--quiet", "--dict", "tiny"]
+    },
+    {
+      "name": "sequential",
+      "output_kind": "stem",
+      "budget": 8,
+      "decoder": "serial",
+      "sequential": true,
+      "cleanup_output": true,
+      "args": ["map-bulk", "-i", "/path/to/bulk_index", "-r", "/path/to/bulk.fq.gz", "--quiet", "--dict", "tiny"]
+    },
+    {
+      "name": "bursty-multimember",
+      "output_kind": "stem",
+      "budget": 8,
+      "pin": 2,
+      "signal": "accounted",
+      "reference": "accounted",
+      "expected_decoder_paths": ["DenseMembers"],
+      "cleanup_output": true,
+      "args": ["map-bulk", "-i", "/path/to/bulk_index", "-r", "/path/to/bursty.fq.gz", "--quiet", "--dict", "tiny"]
+    },
+    {
+      "name": "mixed-plain-compressed",
+      "output_kind": "stem",
+      "budget": 8,
+      "pin": 2,
+      "signal": "accounted",
+      "reference": "accounted",
+      "expected_decoder_paths": ["Sequential", "MarkerWindow", "DenseMembers"],
+      "cleanup_output": true,
+      "args": ["map-bulk", "-i", "/path/to/bulk_index", "-r", "/path/to/bulk.fq.gz,/path/to/plain.fq", "--quiet", "--dict", "tiny"]
+    },
+    {
+      "name": "source-dominated-stored",
+      "output_kind": "stem",
+      "budget": 8,
+      "pin": 2,
+      "signal": "accounted",
+      "reference": "accounted",
+      "expected_decoder_paths": ["Stored"],
+      "cleanup_output": true,
+      "args": ["map-bulk", "-i", "/path/to/bulk_index", "-r", "/path/to/source_bound.fq.gz", "--quiet", "--dict", "tiny"]
+    }
+  ]
+}

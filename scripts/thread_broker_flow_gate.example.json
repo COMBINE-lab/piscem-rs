@@ -1,0 +1,24 @@
+{
+  "binary": "target/release/piscem-rs",
+  "results_dir": "/tmp/thread-broker-gate-g-flex-pilot-v1",
+  "repetitions": 1,
+  "cadences_ms": [25, 100],
+  "budget": 8,
+  "source_ceiling": 1,
+  "cap_persistence_seconds": 0.3,
+  "require_lull_cap": false,
+  "lull_schedule": "3072:250,500,1000",
+  "lull_path_match": "R1",
+  "output_kind": "directory",
+  "args": [
+    "map-scrna",
+    "-i", "/path/to/sc_index",
+    "-1", "/path/to/reads_R1.fq.gz",
+    "-2", "/path/to/reads_R2.fq.gz",
+    "-g", "1{b[16]u[12]x[0-3]f[TTGCTAGGACCG]s[10]x:}2{r:}",
+    "--quiet", "--dict", "auto"
+  ],
+  "canonical_digest_command": [
+    "target/release/examples/canonical_rad-e2563b7d48aecf24", "flex", "{output}/map.rad"
+  ]
+}

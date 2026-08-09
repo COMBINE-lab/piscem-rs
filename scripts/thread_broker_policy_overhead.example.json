@@ -1,0 +1,33 @@
+{
+  "binary": "target/release/piscem-rs",
+  "results_dir": "/tmp/thread-broker-policy-overhead",
+  "repetitions": 30,
+  "minimum_repetitions": 30,
+  "formal_gate": true,
+  "seed": 20260807,
+  "overhead_margin": 0.01,
+  "responsive_administrative_cpu_per_wall_second": 0.001,
+  "freeze_administrative_cpu_nanos": 5000000,
+  "freeze_sample_scaling_margin": 1.25,
+  "jobs": [
+    {
+      "name": "bulk-pe-long",
+      "scale_group": "bulk-pe",
+      "args": [
+        "map-bulk",
+        "-i", "/path/to/index",
+        "-1", "/path/to/read1.fastq.gz",
+        "-2", "/path/to/read2.fastq.gz"
+      ],
+      "budget": 8,
+      "pin": 2,
+      "sparse_probe_interval_ms": 5000,
+      "final_split_tolerance": 0,
+      "output_kind": "stem",
+      "canonical_digest_command": [
+        "target/release/examples/canonical_rad", "bulk", "{output}.rad"
+      ],
+      "cleanup_paths": ["{output}.rad"]
+    }
+  ]
+}

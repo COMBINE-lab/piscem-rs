@@ -1,0 +1,45 @@
+{
+  "binary": "target/release/piscem-rs",
+  "results_dir": "benchmark_results/thread-broker-oracle",
+  "repetitions": 3,
+  "seed": 20260806,
+  "pin_fractions": [0.125, 0.25, 0.3333333333, 0.5, 0.75],
+  "jobs": [
+    {
+      "name": "bulk-se",
+      "output_kind": "stem",
+      "output_argument": "-o",
+      "threads": [8, 32, 64],
+      "require_convergence": true,
+      "stable_workload": true,
+      "measure_fixed_components": true,
+      "args": [
+        "map-bulk",
+        "-i", "/path/to/gencode_v49",
+        "-r", "/path/to/SRR21186103_1.fastq.gz",
+        "--quiet"
+      ],
+      "canonical_digest_command": ["/path/to/canonical-rad-digest", "bulk", "{output}.rad"],
+      "cleanup_paths": ["{output}.rad"]
+    },
+    {
+      "name": "scrna",
+      "output_kind": "directory",
+      "output_argument": "-o",
+      "threads": [8, 32, 64],
+      "require_convergence": true,
+      "stable_workload": true,
+      "measure_fixed_components": true,
+      "args": [
+        "map-scrna",
+        "-i", "/path/to/flex/index",
+        "-1", "/path/to/R1.fastq.gz",
+        "-2", "/path/to/R2.fastq.gz",
+        "-g", "chromium_v3",
+        "--quiet"
+      ],
+      "canonical_digest_command": ["/path/to/canonical-rad-digest", "scrna", "{output}/map.rad"],
+      "cleanup_paths": ["{output}/map.rad"]
+    }
+  ]
+}

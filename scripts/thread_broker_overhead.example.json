@@ -1,0 +1,27 @@
+{
+  "binary": "target/release/piscem-rs",
+  "results_dir": "benchmark_results/thread-broker-overhead",
+  "repetitions": 30,
+  "seed": 20260807,
+  "equivalence_margin": 0.01,
+  "jobs": [
+    {
+      "name": "bulk-one-input",
+      "output_kind": "stem",
+      "output_argument": "-o",
+      "budget": 8,
+      "pin": 2,
+      "args": [
+        "map-bulk",
+        "-i", "/path/to/index-prefix",
+        "-r", "/path/to/reads.fastq.gz",
+        "--quiet",
+        "--dict", "tiny"
+      ],
+      "canonical_digest_command": [
+        "target/release/examples/canonical_rad", "bulk", "{output}.rad"
+      ],
+      "cleanup_paths": ["{output}.rad"]
+    }
+  ]
+}
