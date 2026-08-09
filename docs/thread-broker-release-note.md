@@ -50,6 +50,18 @@ bounded opening bracket, then performs the same teardown; it is the
 appropriate freeze policy where the one-point model can miss the response
 curve.
 
+The model answer remains primary during the opening bracket. An apparent loss
+at the short opening horizon is extended to the ordinary ratification sample
+count before exploration; the common accept path still stops at the short
+horizon. A regressed or inconclusive comparison may trigger an adjacent response
+point, but that point must beat the higher measured opening/model rate. Only a
+greater-than-5% gain with non-overlapping intervals can replace the model. The
+opening is a pivot and high-water evidence bar, never the fallback, and
+deadline-limited confirmation likewise retains the model.
+Independent persistent cap evidence can confirm the model target without local
+exploration: if the producer demonstrably cannot use slots above that target,
+short-term throughput disagreement is not evidence for buying them back.
+
 Measured on a crossover-balanced 14--20 second scATAC workload, direct
 controller-plus-sampler CPU was 4.965 ms for 25 ms responsive monitoring,
 1.408 ms for 5 s sparse-responsive monitoring, and 0.401 ms for model-only
@@ -83,6 +95,19 @@ one in one point; their 4.380 s median was below the 4.925 s same-binary pin-one
 median, although both very short arms were noisy. Every output had the same
 canonical digest. These are startup-bracket measurements; the settled-policy
 overhead measurements above remain the evidence for recurring cost.
+
+A follow-up review found that the single t32 run hid a bimodal 5/8 model versus
+3/8 opening result. The corrected final binary (`78cebc9c...`) makes the opening
+a candidate-placement pivot rather than a fallback, requires alternatives to
+beat the higher opening/model evidence bar, and accepts an independently
+confirmed empirical cap. Eight t32 repetitions then selected producer one in
+8/8 runs: 4.526--11.859 s, median 7.808 s (0.907 times the 8.61 s pin-one
+reference), with seven `model_selected` outcomes and one deadline-limited model
+fallback. Bracket wall was 0.700--1.001 s normally and 4.000111 s at the single
+deadline (111 microseconds of wakeup overshoot); controller CPU was
+0.129--0.363 ms. Two t8 guards selected producer five in 2/2 runs, with
+1.052--1.153 s bracket wall. All ten adaptive outputs and two fixed controls
+retained the canonical digest above.
 
 The exact cumulative rapidgzip signal is feature-gated upstream; its disabled
 build compiles the hot-path accounting out, and its enabled build passed the

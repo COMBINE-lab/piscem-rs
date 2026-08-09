@@ -528,8 +528,10 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
         // curve; `recent` still contains pre-probe windows and is only the
         // baseline for the first point.
         let mut nonlinear_rate: Option<RateEstimate> = None;
-        // Best *proven* point in the current bounded exploration. An
-        // inconclusive candidate is never made the rollback destination.
+        // Fallback point in the current bounded exploration. The model answer
+        // is primary while its first apparent regression is being confirmed;
+        // a proven regression replaces it with the opening. Optional local
+        // candidates must prove improvement before replacing that fallback.
         let mut nonlinear_best_split: Option<Split> = None;
         let mut nonlinear_tried = std::collections::HashSet::new();
         // Model drift is meaningful only relative to the model that established
@@ -871,247 +873,275 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                             }
                         } else {
                             let achieved = RateEstimate::from_rates(rates.iter().copied());
-                            if matches!(
-                                kind,
-                                RatificationKind::OpeningModel | RatificationKind::NonlinearProbe
-                            ) {
-                                report.opening_bracket.points_measured += 1;
-                            }
-                            if kind == RatificationKind::NonlinearProbe {
-                                let improved = nonlinear_probe_improved(
+                            let opening_model_max_samples =
+                                cfg.ratify_samples.max(opening_bracket_samples);
+                            let confirm_opening_model_regression = kind
+                                == RatificationKind::OpeningModel
+                                && rates.len() < opening_model_max_samples
+                                && compare_opening_model_rates(
                                     baseline,
                                     achieved,
                                     cfg.regression_tolerance,
+                                ) == RatificationOutcome::Regressed;
+                            if confirm_opening_model_regression {
+                                tracing::debug!(
+                                    "thread-broker: extending apparent opening-model regression \
+                                     from {} to {} samples",
+                                    rates.len(),
+                                    opening_model_max_samples,
                                 );
-                                if improved {
-                                    tracing::debug!(
-                                        "thread-broker: nonlinear probe kept producer {} -> {} \
+                                Phase::Ratify {
+                                    left: opening_model_max_samples - rates.len(),
+                                    from,
+                                    target,
+                                    baseline,
+                                    rates,
+                                    kind,
+                                }
+                            } else {
+                                if matches!(
+                                    kind,
+                                    RatificationKind::OpeningModel
+                                        | RatificationKind::NonlinearProbe
+                                ) {
+                                    report.opening_bracket.points_measured += 1;
+                                }
+                                if kind == RatificationKind::NonlinearProbe {
+                                    let improved = nonlinear_probe_improved(
+                                        baseline,
+                                        achieved,
+                                        cfg.regression_tolerance,
+                                    );
+                                    if improved {
+                                        tracing::debug!(
+                                            "thread-broker: nonlinear probe kept producer {} -> {} \
                                          ({:.0} [{:.0}, {:.0}] vs {:.0} [{:.0}, {:.0}] items/s)",
-                                        from.1,
-                                        target,
-                                        achieved.mean,
-                                        achieved.lower(),
-                                        achieved.upper(),
-                                        baseline.mean,
-                                        baseline.lower(),
-                                        baseline.upper(),
-                                    );
-                                    report.nonlinear_probe_improvements += 1;
-                                    nonlinear_override = true;
-                                    nonlinear_rate = Some(achieved);
-                                    nonlinear_best_split = Some(split);
-                                    settled_rate = Some(achieved.mean);
-                                    costs.clear();
-                                    // The model has already lost to the
-                                    // opening. The first local point is on the
-                                    // opposite side of that rejected answer;
-                                    // once it proves an improvement, continuing
-                                    // back toward the rejected model cannot
-                                    // justify another startup move.
-                                    nonlinear_probe_complete = true;
-                                    nonlinear_targets.clear();
-                                    finish_opening_bracket(
-                                        &mut report,
-                                        &mut opening_bracket_started,
-                                        OpeningBracketOutcome::AlternativeSelected,
-                                        sampled_at,
-                                    );
-                                    Phase::Steady {
-                                        drifted_for: Duration::ZERO,
-                                    }
-                                } else {
-                                    let comparison =
-                                        compare_rates(baseline, achieved, cfg.regression_tolerance);
-                                    tracing::debug!(
-                                        "thread-broker: nonlinear probe did not retain producer {} \
-                                         ({:.0} [{:.0}, {:.0}] vs {:.0} [{:.0}, {:.0}] items/s)",
-                                        target,
-                                        achieved.mean,
-                                        achieved.lower(),
-                                        achieved.upper(),
-                                        baseline.mean,
-                                        baseline.lower(),
-                                        baseline.upper(),
-                                    );
-                                    if comparison == RatificationOutcome::Inconclusive {
-                                        report.inconclusive_ratifications += 1;
-                                    }
-                                    // Every optional point has the higher
-                                    // burden of proving improvement. A failure
-                                    // does not discard a queued candidate on
-                                    // the other side of the opening: that point
-                                    // is what turns a one-sided guess into a
-                                    // bracket.
-                                    costs.clear();
-                                    if nonlinear_targets.is_empty() {
+                                            from.1,
+                                            target,
+                                            achieved.mean,
+                                            achieved.lower(),
+                                            achieved.upper(),
+                                            baseline.mean,
+                                            baseline.lower(),
+                                            baseline.upper(),
+                                        );
+                                        report.nonlinear_probe_improvements += 1;
+                                        nonlinear_override = true;
+                                        nonlinear_rate = Some(achieved);
+                                        nonlinear_best_split = Some(split);
+                                        settled_rate = Some(achieved.mean);
+                                        costs.clear();
+                                        // The model has already lost to the
+                                        // opening. The first local point is on the
+                                        // opposite side of that rejected answer;
+                                        // once it proves an improvement, continuing
+                                        // back toward the rejected model cannot
+                                        // justify another startup move.
                                         nonlinear_probe_complete = true;
-                                        let restore = nonlinear_best_split.unwrap_or(from);
-                                        let outcome = if nonlinear_override {
-                                            OpeningBracketOutcome::AlternativeSelected
-                                        } else {
-                                            OpeningBracketOutcome::OpeningRetained
-                                        };
+                                        nonlinear_targets.clear();
                                         finish_opening_bracket(
                                             &mut report,
                                             &mut opening_bracket_started,
-                                            outcome,
+                                            OpeningBracketOutcome::AlternativeSelected,
                                             sampled_at,
                                         );
-                                        settled_rate = nonlinear_rate.map(|rate| rate.mean);
-                                        nonlinear_best_split = None;
-                                        recent.clear();
-                                        if split == restore {
-                                            Phase::Steady {
-                                                drifted_for: Duration::ZERO,
-                                            }
-                                        } else {
-                                            report.reverts += 1;
-                                            match self.begin_move(
-                                                split,
-                                                restore,
-                                                Phase::Blackout {
-                                                    left: cfg.blackout_samples,
-                                                    next: Box::new(Phase::Steady {
-                                                        drifted_for: Duration::ZERO,
-                                                    }),
-                                                },
-                                            ) {
-                                                Ok((interim, phase)) => {
-                                                    split = interim;
-                                                    phase
-                                                }
-                                                Err(error_kind) => {
-                                                    report.final_consumer_threads = split.0;
-                                                    report.final_producer_limit = split.1;
-                                                    report.final_consumer_live = live;
-                                                    report.final_producer_active = active;
-                                                    return Err(runtime_failure(
-                                                        error_kind,
-                                                        report,
-                                                        split,
-                                                        (live, active),
-                                                        BrokerPhase::Ratifying,
-                                                        epoch,
-                                                    ));
-                                                }
-                                            }
+                                        Phase::Steady {
+                                            drifted_for: Duration::ZERO,
                                         }
                                     } else {
-                                        // Restore the last proven point before
-                                        // measuring the queued candidate on the
-                                        // other side of the opening. Otherwise
-                                        // it inherits cold-start cost from a
-                                        // failed endpoint while being compared
-                                        // with a warm baseline.
-                                        let restore = nonlinear_best_split.unwrap_or(from);
-                                        if split != restore {
-                                            match self.begin_move(
-                                                split,
-                                                restore,
-                                                Phase::Blackout {
-                                                    left: cfg.blackout_samples,
-                                                    next: Box::new(Phase::Steady {
-                                                        drifted_for: Duration::ZERO,
-                                                    }),
-                                                },
-                                            ) {
-                                                Ok((interim, phase)) => {
-                                                    split = interim;
-                                                    phase
+                                        let comparison = compare_rates(
+                                            baseline,
+                                            achieved,
+                                            cfg.regression_tolerance,
+                                        );
+                                        tracing::debug!(
+                                            "thread-broker: nonlinear probe did not retain producer {} \
+                                         ({:.0} [{:.0}, {:.0}] vs {:.0} [{:.0}, {:.0}] items/s)",
+                                            target,
+                                            achieved.mean,
+                                            achieved.lower(),
+                                            achieved.upper(),
+                                            baseline.mean,
+                                            baseline.lower(),
+                                            baseline.upper(),
+                                        );
+                                        if comparison == RatificationOutcome::Inconclusive {
+                                            report.inconclusive_ratifications += 1;
+                                        }
+                                        // Every optional point has the higher
+                                        // burden of proving improvement. A failure
+                                        // does not discard a queued candidate on
+                                        // the other side of the opening: that point
+                                        // is what turns a one-sided guess into a
+                                        // bracket.
+                                        costs.clear();
+                                        if nonlinear_targets.is_empty() {
+                                            nonlinear_probe_complete = true;
+                                            let restore = nonlinear_best_split.unwrap_or(from);
+                                            let outcome = retained_bracket_outcome(
+                                                nonlinear_override,
+                                                nonlinear_best_split,
+                                                initial,
+                                            );
+                                            finish_opening_bracket(
+                                                &mut report,
+                                                &mut opening_bracket_started,
+                                                outcome,
+                                                sampled_at,
+                                            );
+                                            settled_rate = nonlinear_rate.map(|rate| rate.mean);
+                                            nonlinear_best_split = None;
+                                            recent.clear();
+                                            if split == restore {
+                                                Phase::Steady {
+                                                    drifted_for: Duration::ZERO,
                                                 }
-                                                Err(error_kind) => {
-                                                    report.final_consumer_threads = split.0;
-                                                    report.final_producer_limit = split.1;
-                                                    report.final_consumer_live = live;
-                                                    report.final_producer_active = active;
-                                                    return Err(runtime_failure(
-                                                        error_kind,
-                                                        report,
-                                                        split,
-                                                        (live, active),
-                                                        BrokerPhase::Ratifying,
-                                                        epoch,
-                                                    ));
+                                            } else {
+                                                report.reverts += 1;
+                                                match self.begin_move(
+                                                    split,
+                                                    restore,
+                                                    Phase::Blackout {
+                                                        left: cfg.blackout_samples,
+                                                        next: Box::new(Phase::Steady {
+                                                            drifted_for: Duration::ZERO,
+                                                        }),
+                                                    },
+                                                ) {
+                                                    Ok((interim, phase)) => {
+                                                        split = interim;
+                                                        phase
+                                                    }
+                                                    Err(error_kind) => {
+                                                        report.final_consumer_threads = split.0;
+                                                        report.final_producer_limit = split.1;
+                                                        report.final_consumer_live = live;
+                                                        report.final_producer_active = active;
+                                                        return Err(runtime_failure(
+                                                            error_kind,
+                                                            report,
+                                                            split,
+                                                            (live, active),
+                                                            BrokerPhase::Ratifying,
+                                                            epoch,
+                                                        ));
+                                                    }
                                                 }
                                             }
                                         } else {
-                                            Phase::Steady {
-                                                drifted_for: Duration::ZERO,
+                                            // Restore the last proven point before
+                                            // measuring the queued candidate on the
+                                            // other side of the opening. Otherwise
+                                            // it inherits cold-start cost from a
+                                            // failed endpoint while being compared
+                                            // with a warm baseline.
+                                            let restore = nonlinear_best_split.unwrap_or(from);
+                                            if split != restore {
+                                                match self.begin_move(
+                                                    split,
+                                                    restore,
+                                                    Phase::Blackout {
+                                                        left: cfg.blackout_samples,
+                                                        next: Box::new(Phase::Steady {
+                                                            drifted_for: Duration::ZERO,
+                                                        }),
+                                                    },
+                                                ) {
+                                                    Ok((interim, phase)) => {
+                                                        split = interim;
+                                                        phase
+                                                    }
+                                                    Err(error_kind) => {
+                                                        report.final_consumer_threads = split.0;
+                                                        report.final_producer_limit = split.1;
+                                                        report.final_consumer_live = live;
+                                                        report.final_producer_active = active;
+                                                        return Err(runtime_failure(
+                                                            error_kind,
+                                                            report,
+                                                            split,
+                                                            (live, active),
+                                                            BrokerPhase::Ratifying,
+                                                            epoch,
+                                                        ));
+                                                    }
+                                                }
+                                            } else {
+                                                Phase::Steady {
+                                                    drifted_for: Duration::ZERO,
+                                                }
                                             }
                                         }
                                     }
-                                }
-                            } else {
-                                // Only a regression reverts; absence of improvement does
-                                // not. Near the optimum the surface is locally flat --
-                                // measured, 22 and 23 producer slots of 64 differ by 3%,
-                                // which is inside this comparison's own noise -- so "no
-                                // better" is a perfectly ordinary reading for a *correct*
-                                // move. Treating it as failure would revert the broker to
-                                // wherever it happened to start, which is the one place
-                                // with no evidence for it at all.
-                                //
-                                // Flink reaches the same conclusion from the other end:
-                                // its `detectIneffectiveScaleUp` compares against a
-                                // model-*predicted* increase rather than any increase,
-                                // and still ships disabled by default.
-                                let comparison =
-                                    compare_rates(baseline, achieved, cfg.regression_tolerance);
-                                let opening_model_validation =
-                                    kind == RatificationKind::OpeningModel;
-                                let unresolved_opening_model = opening_model_validation
-                                    && comparison == RatificationOutcome::Inconclusive;
-                                if comparison == RatificationOutcome::Regressed
-                                    || unresolved_opening_model
-                                {
-                                    tracing::debug!(
-                                        "thread-broker: reverting producer {} -> {} after {} \
-                                         ({:.0} vs {:.0} items/s)",
-                                        target,
-                                        from.1,
-                                        if unresolved_opening_model {
-                                            "inconclusive opening-model validation"
+                                } else {
+                                    // Only a regression reverts; absence of improvement does
+                                    // not. Near the optimum the surface is locally flat --
+                                    // measured, 22 and 23 producer slots of 64 differ by 3%,
+                                    // which is inside this comparison's own noise -- so "no
+                                    // better" is a perfectly ordinary reading for a *correct*
+                                    // move. Treating it as failure would revert the broker to
+                                    // wherever it happened to start, which is the one place
+                                    // with no evidence for it at all.
+                                    //
+                                    // Flink reaches the same conclusion from the other end:
+                                    // its `detectIneffectiveScaleUp` compares against a
+                                    // model-*predicted* increase rather than any increase,
+                                    // and still ships disabled by default.
+                                    let opening_model_validation =
+                                        kind == RatificationKind::OpeningModel;
+                                    let comparison = if opening_model_validation {
+                                        compare_opening_model_rates(
+                                            baseline,
+                                            achieved,
+                                            cfg.regression_tolerance,
+                                        )
+                                    } else {
+                                        compare_rates(baseline, achieved, cfg.regression_tolerance)
+                                    };
+                                    let cap_confirms_opening_model = opening_model_validation
+                                        && empirical_cap_confirms_target(
+                                            report.final_model,
+                                            target,
+                                        );
+                                    if opening_model_validation
+                                        && comparison != RatificationOutcome::Kept
+                                        && !cap_confirms_opening_model
+                                    {
+                                        if comparison == RatificationOutcome::Inconclusive {
+                                            report.inconclusive_ratifications += 1;
+                                        }
+                                        tracing::debug!(
+                                            "thread-broker: exploring around opening {} after {} \
+                                             model point {} ({:.0} vs {:.0} items/s)",
+                                            from.1,
+                                            if comparison == RatificationOutcome::Regressed {
+                                                "regressed"
+                                            } else {
+                                                "inconclusive"
+                                            },
+                                            target,
+                                            achieved.mean,
+                                            baseline.mean,
+                                        );
+                                        // The opening is a pivot and a measured
+                                        // high-water mark, not a fallback. An
+                                        // optional point must beat the higher of
+                                        // the opening/model rates, while failure
+                                        // still returns to the primary model.
+                                        // This lets an ambiguous t8 comparison
+                                        // discover five without letting a
+                                        // temporarily depressed t32 model make
+                                        // another mediocre point look better.
+                                        nonlinear_rate = Some(if achieved.mean >= baseline.mean {
+                                            achieved
                                         } else {
-                                            "measured regression"
-                                        },
-                                        achieved.mean,
-                                        baseline.mean,
-                                    );
-                                    let rejected_share = report
-                                        .final_model
-                                        .map(|model| model.producer_cost_share)
-                                        .unwrap_or_default();
-                                    if comparison == RatificationOutcome::Regressed {
-                                        rejected.insert(target, rejected_share);
-                                        report.rejections.push(Rejection {
-                                            epoch,
-                                            producer_target: target,
-                                            baseline_rate: baseline.mean,
-                                            achieved_rate: achieved.mean,
-                                            baseline_uncertainty: baseline.half_width,
-                                            achieved_uncertainty: achieved.half_width,
-                                            producer_cost_share: rejected_share,
+                                            baseline
                                         });
-                                    } else {
-                                        report.inconclusive_ratifications += 1;
-                                    }
-                                    // A failed model candidate makes the
-                                    // opening the retained baseline. Spend the
-                                    // remaining point budget on the adjacent
-                                    // candidate away from the rejected model,
-                                    // then the adjacent candidate toward it if
-                                    // the first local test fails.
-                                    // This brackets both t32 (model wins below
-                                    // the opening) and t8 (the peak is just
-                                    // above it) without a geometric sweep.
-                                    if opening_model_validation {
-                                        nonlinear_rate = Some(baseline);
-                                        nonlinear_best_split = Some(from);
+                                        nonlinear_best_split = Some(split);
                                         nonlinear_tried.insert(from.1);
                                         nonlinear_tried.insert(target);
-                                        let bracket = opening_bracket.expect(
-                                            "opening model validation requires bracket config",
-                                        );
+                                        let bracket = opening_bracket
+                                            .expect("opening model validation requires config");
                                         nonlinear_targets = opening_bracket_targets(
                                             self.budget,
                                             cfg.min_consumer_threads,
@@ -1122,67 +1152,124 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                                 .max_points
                                                 .saturating_sub(opening_bracket_points_started),
                                         );
-                                    }
-                                    settled_rate = Some(baseline.mean);
-                                    report.reverts += 1;
-                                    costs.clear();
-                                    match self.begin_move(
-                                        split,
-                                        from,
-                                        Phase::Blackout {
-                                            left: cfg.blackout_samples,
-                                            next: Box::new(Phase::Steady {
-                                                drifted_for: Duration::ZERO,
-                                            }),
-                                        },
-                                    ) {
-                                        Ok((interim, phase)) => {
-                                            split = interim;
-                                            phase
+                                        settled_rate = Some(achieved.mean);
+                                        costs.clear();
+                                        Phase::Steady {
+                                            drifted_for: Duration::ZERO,
                                         }
-                                        Err(kind) => {
-                                            report.final_consumer_threads = split.0;
-                                            report.final_producer_limit = split.1;
-                                            report.final_consumer_live = live;
-                                            report.final_producer_active = active;
-                                            return Err(runtime_failure(
-                                                kind,
-                                                report,
-                                                split,
-                                                (live, active),
-                                                BrokerPhase::Ratifying,
-                                                epoch,
-                                            ));
-                                        }
-                                    }
-                                } else {
-                                    if comparison == RatificationOutcome::Inconclusive {
-                                        report.inconclusive_ratifications += 1;
-                                    }
-                                    // The differing model answer was measured
-                                    // and retained. The bracket has answered
-                                    // its only question, so it must not add an
-                                    // exploratory tax after agreement.
-                                    if opening_model_validation {
-                                        nonlinear_probe_complete = true;
-                                        nonlinear_targets.clear();
-                                        nonlinear_rate = None;
-                                        nonlinear_best_split = None;
-                                        finish_opening_bracket(
-                                            &mut report,
-                                            &mut opening_bracket_started,
-                                            OpeningBracketOutcome::ModelSelected,
-                                            sampled_at,
+                                    } else if comparison == RatificationOutcome::Regressed
+                                        && !opening_model_validation
+                                    {
+                                        tracing::debug!(
+                                            "thread-broker: reverting producer {} -> {} after \
+                                             measured regression ({:.0} vs {:.0} items/s)",
+                                            target,
+                                            from.1,
+                                            achieved.mean,
+                                            baseline.mean,
                                         );
+                                        let rejected_share = report
+                                            .final_model
+                                            .map(|model| model.producer_cost_share)
+                                            .unwrap_or_default();
+                                        rejected.insert(target, rejected_share);
+                                        report.rejections.push(Rejection {
+                                            epoch,
+                                            producer_target: target,
+                                            baseline_rate: baseline.mean,
+                                            achieved_rate: achieved.mean,
+                                            baseline_uncertainty: baseline.half_width,
+                                            achieved_uncertainty: achieved.half_width,
+                                            producer_cost_share: rejected_share,
+                                        });
+                                        settled_rate = Some(baseline.mean);
+                                        report.reverts += 1;
+                                        costs.clear();
+                                        match self.begin_move(
+                                            split,
+                                            from,
+                                            Phase::Blackout {
+                                                left: cfg.blackout_samples,
+                                                next: Box::new(Phase::Steady {
+                                                    drifted_for: Duration::ZERO,
+                                                }),
+                                            },
+                                        ) {
+                                            Ok((interim, phase)) => {
+                                                split = interim;
+                                                phase
+                                            }
+                                            Err(kind) => {
+                                                report.final_consumer_threads = split.0;
+                                                report.final_producer_limit = split.1;
+                                                report.final_consumer_live = live;
+                                                report.final_producer_active = active;
+                                                return Err(runtime_failure(
+                                                    kind,
+                                                    report,
+                                                    split,
+                                                    (live, active),
+                                                    BrokerPhase::Ratifying,
+                                                    epoch,
+                                                ));
+                                            }
+                                        }
+                                    } else {
+                                        if comparison == RatificationOutcome::Inconclusive {
+                                            report.inconclusive_ratifications += 1;
+                                        }
+                                        if cap_confirms_opening_model
+                                            && comparison != RatificationOutcome::Kept
+                                        {
+                                            tracing::debug!(
+                                                "thread-broker: retaining opening-model producer \
+                                                 {} despite {} throughput evidence; empirical {} \
+                                                 cap independently confirms the target",
+                                                target,
+                                                if comparison == RatificationOutcome::Regressed {
+                                                    "regressed"
+                                                } else {
+                                                    "inconclusive"
+                                                },
+                                                match report
+                                                    .final_model
+                                                    .expect("confirmed model has a snapshot")
+                                                    .useful_cap_reason
+                                                {
+                                                    ProducerCapReason::Slack => "slack",
+                                                    ProducerCapReason::Source => "source",
+                                                    ProducerCapReason::SlackAndSource => {
+                                                        "slack-and-source"
+                                                    }
+                                                    ProducerCapReason::None => "missing",
+                                                },
+                                            );
+                                        }
+                                        // The differing model answer was measured
+                                        // and retained. The bracket has answered
+                                        // its only question, so it must not add an
+                                        // exploratory tax after agreement.
+                                        if opening_model_validation {
+                                            nonlinear_probe_complete = true;
+                                            nonlinear_targets.clear();
+                                            nonlinear_rate = None;
+                                            nonlinear_best_split = None;
+                                            finish_opening_bracket(
+                                                &mut report,
+                                                &mut opening_bracket_started,
+                                                OpeningBracketOutcome::ModelSelected,
+                                                sampled_at,
+                                            );
+                                        }
+                                        // Kept. Re-survey once: the rates may have been
+                                        // measured under a split that distorted them, and
+                                        // DS2 reports convergence in at most a few such
+                                        // rounds. The deadband and the tabu set are what
+                                        // stop this from cycling.
+                                        surveyed = 0;
+                                        settled_rate = None;
+                                        Phase::Survey
                                     }
-                                    // Kept. Re-survey once: the rates may have been
-                                    // measured under a split that distorted them, and
-                                    // DS2 reports convergence in at most a few such
-                                    // rounds. The deadband and the tabu set are what
-                                    // stop this from cycling.
-                                    surveyed = 0;
-                                    settled_rate = None;
-                                    Phase::Survey
                                 }
                             }
                         }
@@ -1235,11 +1322,11 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                         };
                         if target.is_none() {
                             nonlinear_probe_complete = true;
-                            let outcome = if nonlinear_override {
-                                OpeningBracketOutcome::AlternativeSelected
-                            } else {
-                                OpeningBracketOutcome::OpeningRetained
-                            };
+                            let outcome = retained_bracket_outcome(
+                                nonlinear_override,
+                                nonlinear_best_split,
+                                initial,
+                            );
                             finish_opening_bracket(
                                 &mut report,
                                 &mut opening_bracket_started,
@@ -1254,10 +1341,12 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                             nonlinear_targets.clear();
                             let outcome = if bracket_budget_expired {
                                 OpeningBracketOutcome::BudgetExhausted
-                            } else if nonlinear_override {
-                                OpeningBracketOutcome::AlternativeSelected
                             } else {
-                                OpeningBracketOutcome::OpeningRetained
+                                retained_bracket_outcome(
+                                    nonlinear_override,
+                                    nonlinear_best_split,
+                                    initial,
+                                )
                             };
                             finish_opening_bracket(
                                 &mut report,
@@ -1578,6 +1667,11 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                 } else {
                                     cfg.ratify_samples
                                 };
+                                let ratify_capacity = if opening_disagrees {
+                                    ratify_samples.max(cfg.ratify_samples)
+                                } else {
+                                    ratify_samples
+                                };
                                 let blackout_samples = cfg.blackout_samples;
                                 tracing::debug!(
                                     "thread-broker: solved producer {} -> {} \
@@ -1589,6 +1683,14 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                 );
                                 report.final_model = Some(model.snapshot);
                                 let to = (self.budget - target, target);
+                                if opening_disagrees {
+                                    // Until a material, separated regression is
+                                    // confirmed, absence of evidence favors the
+                                    // primary model over the opening hint. This
+                                    // also makes a bracket deadline during the
+                                    // confirmation extension retain the model.
+                                    nonlinear_best_split = Some(to);
+                                }
                                 match self.begin_move(
                                     from,
                                     to,
@@ -1599,7 +1701,7 @@ impl<C: Consumer + 'static, P: Producer + 'static> ThreadBroker<C, P> {
                                             from,
                                             target,
                                             baseline: recent.estimate(),
-                                            rates: Vec::with_capacity(ratify_samples),
+                                            rates: Vec::with_capacity(ratify_capacity),
                                             kind: ratification_kind,
                                         }),
                                     },
@@ -1840,6 +1942,20 @@ fn finish_opening_bracket(
     report.opening_bracket.outcome = outcome;
 }
 
+fn retained_bracket_outcome(
+    alternative_selected: bool,
+    retained: Option<Split>,
+    opening: Split,
+) -> OpeningBracketOutcome {
+    if alternative_selected {
+        OpeningBracketOutcome::AlternativeSelected
+    } else if retained.is_some_and(|split| split != opening) {
+        OpeningBracketOutcome::ModelSelected
+    } else {
+        OpeningBracketOutcome::OpeningRetained
+    }
+}
+
 /// Candidate allocations adjacent to the opening, first away from the rejected
 /// model and then toward it. The model point itself has already been measured.
 /// Alternating around the opening distinguishes opposite response shapes with
@@ -1928,6 +2044,37 @@ fn compare_rates(
     } else {
         RatificationOutcome::Kept
     }
+}
+
+/// A differing model answer has higher evidential status than the opening.
+///
+/// Ordinary ratification's directional test is intentionally sensitive to a
+/// tolerated loss. Rejecting the model point is more consequential: it restores
+/// an unevidenced opening and starts the optional response search. Require the
+/// same two independent facts used to retain an optional point, in reverse:
+/// non-overlapping intervals and a material loss. A directional rejection that
+/// does not clear both gates is inconclusive and therefore keeps the model.
+fn compare_opening_model_rates(
+    baseline: RateEstimate,
+    achieved: RateEstimate,
+    tolerance: f64,
+) -> RatificationOutcome {
+    match compare_rates(baseline, achieved, tolerance) {
+        RatificationOutcome::Regressed
+            if baseline.lower() > achieved.upper()
+                && achieved.mean < baseline.mean * (1.0 - tolerance) =>
+        {
+            RatificationOutcome::Regressed
+        }
+        RatificationOutcome::Regressed => RatificationOutcome::Inconclusive,
+        outcome => outcome,
+    }
+}
+
+fn empirical_cap_confirms_target(model: Option<Model>, target: usize) -> bool {
+    model.is_some_and(|model| {
+        model.useful_cap <= target && model.useful_cap_reason != ProducerCapReason::None
+    })
 }
 
 /// A nonlinear probe has to be both statistically and materially better.
@@ -2411,12 +2558,16 @@ impl std::fmt::Debug for PhaseName<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrokerPhase, BrokerReport, Caps, Costs, Phase, ProducerCapReason, RateEstimate,
-        RatificationKind, RatificationOutcome, Recent, compare_rates, consecutive_drift_duration,
-        duration_samples, nonlinear_probe_improved, opening_bracket_targets,
-        producer_capacity_used,
+        BrokerPhase, BrokerReport, Caps, Costs, Model, Phase, ProducerCapReason, RateEstimate,
+        RatificationKind, RatificationOutcome, Recent, compare_opening_model_rates, compare_rates,
+        consecutive_drift_duration, duration_samples, empirical_cap_confirms_target,
+        nonlinear_probe_improved, opening_bracket_targets, producer_capacity_used,
+        retained_bracket_outcome,
     };
-    use crate::{BrokerConfig, ProducerMeasurementMode, ProducerPressure, ResizeSide, Work};
+    use crate::{
+        BrokerConfig, OpeningBracketOutcome, ProducerMeasurementMode, ProducerPressure, ResizeSide,
+        Work,
+    };
     use std::time::{Duration, Instant};
 
     struct Noise(u64);
@@ -2791,6 +2942,118 @@ mod tests {
             },
             0.05,
         ));
+    }
+
+    #[test]
+    fn opening_model_requires_separation_and_materiality_to_revert() {
+        let baseline = RateEstimate {
+            mean: 100.0,
+            half_width: 2.0,
+            samples: 2,
+            ..RateEstimate::default()
+        };
+        assert_eq!(
+            compare_opening_model_rates(
+                baseline,
+                RateEstimate {
+                    mean: 90.0,
+                    half_width: 2.0,
+                    samples: 2,
+                    ..RateEstimate::default()
+                },
+                0.05,
+            ),
+            RatificationOutcome::Regressed,
+            "a separated, material loss must reject the model point"
+        );
+
+        assert_eq!(
+            compare_opening_model_rates(
+                RateEstimate {
+                    mean: 100.0,
+                    half_width: 10.0,
+                    samples: 2,
+                    ..RateEstimate::default()
+                },
+                RateEstimate {
+                    mean: 80.0,
+                    half_width: 10.0,
+                    samples: 2,
+                    ..RateEstimate::default()
+                },
+                0.05,
+            ),
+            RatificationOutcome::Inconclusive,
+            "touching intervals must not restore an unevidenced opening"
+        );
+
+        assert_ne!(
+            compare_opening_model_rates(
+                RateEstimate {
+                    mean: 100.0,
+                    half_width: 0.1,
+                    samples: 2,
+                    ..RateEstimate::default()
+                },
+                RateEstimate {
+                    mean: 96.0,
+                    half_width: 0.1,
+                    samples: 2,
+                    ..RateEstimate::default()
+                },
+                0.05,
+            ),
+            RatificationOutcome::Regressed,
+            "a statistically separated but immaterial loss must keep the model point"
+        );
+    }
+
+    #[test]
+    fn bracket_without_a_proven_alternative_retains_the_model_not_the_opening() {
+        let opening = (28, 4);
+        let model = (31, 1);
+        assert_eq!(
+            retained_bracket_outcome(false, Some(model), opening),
+            OpeningBracketOutcome::ModelSelected
+        );
+        assert_eq!(
+            retained_bracket_outcome(false, Some(opening), opening),
+            OpeningBracketOutcome::OpeningRetained
+        );
+        assert_eq!(
+            retained_bracket_outcome(true, Some(model), opening),
+            OpeningBracketOutcome::AlternativeSelected
+        );
+    }
+
+    #[test]
+    fn empirical_cap_can_independently_confirm_the_model_target() {
+        let model = |useful_cap, useful_cap_reason| Model {
+            producer_cost_share: 0.0,
+            producer_cost_share_uncertainty: 0.0,
+            ideal_producer_slots: 1,
+            useful_cap,
+            useful_cap_reason,
+            effective_deadband_threads: 1,
+            effective_resurvey_distance: 1,
+        };
+        assert!(empirical_cap_confirms_target(
+            Some(model(1, ProducerCapReason::Slack)),
+            1
+        ));
+        assert!(empirical_cap_confirms_target(
+            Some(model(1, ProducerCapReason::Source)),
+            2
+        ));
+        assert!(!empirical_cap_confirms_target(
+            Some(model(2, ProducerCapReason::Slack)),
+            1
+        ));
+        assert!(!empirical_cap_confirms_target(
+            Some(model(1, ProducerCapReason::None)),
+            1
+        ));
+        assert!(!empirical_cap_confirms_target(None, 1));
     }
 
     #[test]

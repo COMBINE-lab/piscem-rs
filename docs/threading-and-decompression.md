@@ -148,9 +148,14 @@ adaptation. Applications may opt into `OpeningPolicy::Bracket` when
 allocation-dependent stage scaling can invalidate the one-point service-cost
 model; piscem does so for scATAC. The startup-only experiment is triggered by
 model/opening disagreement, is bounded by point count and wall time, and reports
-its cost and outcome. Other modalities keep `OpeningPolicy::Fixed` and pay no
-bracket cost. Its `steady_probe_interval` is
-independently configurable: it does
+its cost and outcome. An apparent regression at the short horizon is extended
+to the ordinary ratification sample count. A regressed or inconclusive result
+may trigger an adjacent point, but only a statistically separated, material gain
+over the higher measured opening/model rate can replace the model. The opening
+is never the fallback, and deadline-limited evidence keeps the model. Persistent
+slack or source evidence at the model target independently suppresses redundant
+exploration. Other modalities retain `OpeningPolicy::Fixed` and pay no bracket
+cost. Its `steady_probe_interval` is independently configurable: it does
 not weaken startup calibration or ratification, and the sampled decoder adapter
 scales toward roughly four observations per probe without exceeding its measured
 25 ms accuracy floor. Stable scATAC uses a 5 s responsive interval by default;

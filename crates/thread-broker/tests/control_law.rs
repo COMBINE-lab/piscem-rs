@@ -585,12 +585,46 @@ fn opening_bracket_costs_nothing_when_model_and_opening_agree() {
     );
 }
 
+#[test]
+fn opening_bracket_deadline_retains_the_model_not_the_opening() {
+    let mut cfg = quick();
+    cfg.opening_policy = OpeningPolicy::Bracket(OpeningBracketConfig {
+        max_points: 3,
+        horizon: Duration::from_millis(40),
+        total_budget: Duration::from_millis(80),
+    });
+    let pipeline = Pipeline::new(2_887.0, 1_000.0, 4, 4);
+    {
+        let mut state = pipeline.state.lock().unwrap();
+        state.consumer_scaling = 0.5;
+        state.producer_bias = 0.01;
+    }
+
+    let report = run_for(Arc::clone(&pipeline), 8, cfg, Duration::from_millis(800));
+    assert_eq!(
+        report.opening_bracket.outcome,
+        OpeningBracketOutcome::BudgetExhausted,
+        "{report:?}"
+    );
+    assert_eq!(
+        report.final_producer_limit, 1,
+        "deadline restored the unevidenced producer-4 opening: {report:?}"
+    );
+}
+
 /// A one-point cost model cannot see that adding consumers makes this stage
 /// slower. Responsive mode must measure the response curve, while freeze is the
 /// explicitly cheaper cost-model-only policy.
 #[test]
 fn opening_bracket_distinguishes_opposite_scaling_with_the_same_model_answer() {
-    let cfg = bracketed();
+    let mut cfg = bracketed();
+    cfg.opening_policy = OpeningPolicy::Bracket(OpeningBracketConfig {
+        // Two initial windows make an apparent model regression; the ordinary
+        // three-window ratification horizon must confirm it before rollback.
+        max_points: 3,
+        horizon: Duration::from_millis(40),
+        total_budget: Duration::from_secs(1),
+    });
     let responsive = Pipeline::new(2_887.0, 1_000.0, 4, 4);
     {
         let mut state = responsive.state.lock().unwrap();
@@ -604,7 +638,7 @@ fn opening_bracket_distinguishes_opposite_scaling_with_the_same_model_answer() {
     assert!(report.nonlinear_override);
     assert_eq!(report.nonlinear_probes, 1, "{report:?}");
     assert_eq!(report.opening_bracket.points_measured, 2, "{report:?}");
-    assert!(report.opening_bracket.samples <= 6, "{report:?}");
+    assert_eq!(report.opening_bracket.samples, 5, "{report:?}");
     assert_eq!(
         report.opening_bracket.outcome,
         OpeningBracketOutcome::AlternativeSelected,
@@ -615,8 +649,11 @@ fn opening_bracket_distinguishes_opposite_scaling_with_the_same_model_answer() {
         "floor-directed validation was skipped: {report:?}"
     );
     assert!(
-        report.reverts >= 1,
-        "regressed floor was not restored: {report:?}"
+        report
+            .producer_trajectory
+            .windows(2)
+            .any(|pair| pair == [1, 5]),
+        "adjacent point was not compared directly with the retained model: {report:?}"
     );
 
     let frozen = Pipeline::new(2_887.0, 1_000.0, 4, 4);
@@ -646,8 +683,8 @@ fn opening_bracket_distinguishes_opposite_scaling_with_the_same_model_answer() {
     );
 }
 
-/// When the model loses to the opening, the first adjacent point away from the
-/// rejected model can recover a discrete optimum on the other side of the
+/// When the opening/model comparison is ambiguous, the first adjacent point
+/// away from the model can recover a discrete optimum on the other side of the
 /// opening. Producer 5 is the true peak here even though the model says 1.
 #[test]
 fn opening_bracket_tests_the_useful_adjacent_side_first() {
@@ -677,7 +714,7 @@ fn opening_bracket_tests_the_useful_adjacent_side_first() {
         .filter_map(|pair| (pair[0] != pair[1]).then_some((pair[0], pair[1])))
         .collect();
     assert!(
-        transitions.contains(&(4, 5)),
+        transitions.contains(&(1, 5)),
         "opening bracket did not test the useful adjacent split: {report:?}"
     );
 }

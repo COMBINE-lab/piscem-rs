@@ -362,7 +362,13 @@ pub enum OpeningPolicy {
     /// Treat the opening as an initial hint and follow ordinary model moves.
     #[default]
     Fixed,
-    /// Confirm a model/opening disagreement with a bounded local bracket.
+    /// Confirm a model/opening disagreement with a bounded local bracket. The
+    /// model answer is rejected only when a statistically separated, material
+    /// throughput gain over the best measured opening/model rate is proven at
+    /// an adjacent point. An inconclusive or regressed comparison may trigger
+    /// that search unless independent empirical-cap evidence confirms the
+    /// model target. The opening is never a fallback; deadline-limited evidence
+    /// also retains the model.
     Bracket(OpeningBracketConfig),
 }
 
