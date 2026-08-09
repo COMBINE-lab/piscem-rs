@@ -1,0 +1,19 @@
+[package]
+name = "hb-vs-phast"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+# Exactly what tiny-dict uses for its index table.
+hashbrown = "0.17"
+rapidhash = "=4.5.1"
+# Exactly what sshash-lib uses for its MPHF.
+ph = { package = "ph-temp", version = "0.12.0", default-features = false, features = [
+  "rapidhash",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

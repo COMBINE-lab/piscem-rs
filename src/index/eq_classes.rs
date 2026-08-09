@@ -20,8 +20,8 @@
 use anyhow::{Context, Result, bail};
 use epserde::deser::Deserialize;
 use epserde::ser::Serialize;
+use hashbrown::HashTable;
 use mem_dbg::{MemSize, SizeFlags};
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use sux::bits::bit_field_vec::BitFieldVec;
 use sux::dict::elias_fano::{EfSeq, EliasFanoBuilder};
@@ -340,8 +340,40 @@ pub struct EqClassMapBuilder {
     tile_to_ec: Vec<u32>,
     /// Unique labels in order of first occurrence.
     labels: Vec<Vec<(u32, Orientation)>>,
-    /// Deduplication map: sorted label → EC ID.
-    label_to_ec: HashMap<Vec<(u32, Orientation)>, u32>,
+    /// Deduplication index over `labels`: sorted label → EC ID.
+    ///
+    /// Stores only the EC id, not the label. A plain `HashMap` keyed by the
+    /// label would have to own a second copy of every distinct label — the
+    /// builder already owns them all in `labels` — which on a large reference
+    /// doubles the peak cost of the densest structure in the build. A
+    /// `HashTable` is probed by hash with equality supplied by the caller, so
+    /// the label lives in exactly one place and the table costs 4 bytes an
+    /// entry. `std` has no equivalent: `raw_entry` is unstable and `HashTable`
+    /// is not in `std` at all.
+    ///
+    /// # Invariant
+    ///
+    /// Every id in this table indexes its own label in `labels`. Both reads of
+    /// an id — equality in `find` and rehashing in `insert_unique` — go through
+    /// `labels[id]`, so a stale id is either a panic or, worse, a silent merge
+    /// of two distinct ECs. It is upheld by three things, only the last of
+    /// which the compiler checks:
+    ///
+    /// 1. ids are minted as `labels.len()` and immediately pushed (`add_tile`);
+    /// 2. `labels` is append-only — nothing removes, truncates or reorders it,
+    ///    and `build` consumes the builder whole;
+    /// 3. `labels` cannot be mutated while a closure is reading it, since those
+    ///    closures borrow it shared while the table is borrowed mutably.
+    ///
+    /// Adding any path that removes or reorders `labels` breaks (2) and must
+    /// rebuild this table rather than patch it.
+    label_to_ec: HashTable<u32>,
+    /// Hasher for `label_to_ec`. Fixed-seed so a build is reproducible.
+    ///
+    /// EC *ids* are assigned by order of first occurrence and so do not depend
+    /// on the hash, but pinning the seed keeps the builder free of per-process
+    /// randomness like everything else in `crate::hash`.
+    hasher: ahash::RandomState,
     /// Largest transcript ID seen.
     max_transcript_id: u32,
 }
@@ -353,7 +385,8 @@ impl EqClassMapBuilder {
             num_tiles,
             tile_to_ec: vec![0; num_tiles],
             labels: Vec::new(),
-            label_to_ec: HashMap::new(),
+            label_to_ec: HashTable::new(),
+            hasher: crate::hash::fixed_state(),
             max_transcript_id: 0,
         }
     }
@@ -365,22 +398,54 @@ impl EqClassMapBuilder {
         // Sort for consistent hashing/comparison
         label.sort();
 
+        let Self {
+            tile_to_ec,
+            labels,
+            label_to_ec,
+            hasher,
+            max_transcript_id,
+            ..
+        } = self;
+
         // Track max transcript ID
         for &(tid, _) in &label {
-            self.max_transcript_id = self.max_transcript_id.max(tid);
+            *max_transcript_id = (*max_transcript_id).max(tid);
         }
 
-        // Look up existing EC without cloning the label
-        if let Some(&ec_id) = self.label_to_ec.get(&label) {
-            self.tile_to_ec[tile_id] = ec_id;
+        let hash = hasher.hash_one(label.as_slice());
+
+        // Existing EC. The table stores ids, so equality compares against the
+        // single copy already in `labels` — no second copy is ever made.
+        if let Some(&ec_id) = label_to_ec.find(hash, |&id| labels[id as usize] == label) {
+            tile_to_ec[tile_id] = ec_id;
             return;
         }
 
-        // New EC — clone only for the map key, move original into labels
-        let ec_id = self.labels.len() as u32;
-        self.label_to_ec.insert(label.clone(), ec_id);
-        self.labels.push(label);
-        self.tile_to_ec[tile_id] = ec_id;
+        // New EC.
+        //
+        // The table holds bare ids, so it is only meaningful against `labels`:
+        // *every id in `label_to_ec` must index that id's own label*. Ids are
+        // minted as `labels.len()` and `labels` is append-only, so the only way
+        // to break that is for this cast to wrap — which would produce an
+        // in-bounds but *wrong* index, silently merging two distinct ECs rather
+        // than panicking. Unreachable in practice (it needs ~137 GB of labels),
+        // and checked anyway because the failure is undetectable downstream.
+        assert!(
+            labels.len() < u32::MAX as usize,
+            "equivalence class count exceeded u32::MAX; EC ids would wrap"
+        );
+        let ec_id = labels.len() as u32;
+        // Push before inserting, so the invariant holds at every instant rather
+        // than only at the points hashbrown happens to look. `insert_unique` is
+        // handed this element's hash and does not recompute it, so today the
+        // order is not load-bearing — but that is an implementation detail of
+        // hashbrown, not a documented guarantee, and a reordering here would
+        // compile and pass every test.
+        labels.push(label);
+        label_to_ec.insert_unique(hash, ec_id, |&id| {
+            hasher.hash_one(labels[id as usize].as_slice())
+        });
+        tile_to_ec[tile_id] = ec_id;
     }
 
     /// Build the final `EqClassMap`.
@@ -579,6 +644,47 @@ mod tests {
             let span = ec_map.entries_for_tile(i as u64);
             assert_eq!(span.len(), 1);
             assert_eq!(ec_entry_transcript_id(span.get(0)), i as u32);
+        }
+    }
+
+    /// Dedup has to keep working across a table resize.
+    ///
+    /// `label_to_ec` stores EC ids, not labels, so both equality and rehashing
+    /// read through to `labels`. `add_tile` therefore pushes a new label
+    /// *before* inserting its id, so `labels[id]` is already valid when a
+    /// growing table rehashes the ids it holds. Only a test large enough to
+    /// force several growths exercises that ordering.
+    #[test]
+    fn test_dedup_survives_table_growth() {
+        const DISTINCT: usize = 4096;
+        const COPIES: usize = 3;
+        let num_tiles = DISTINCT * COPIES;
+
+        let mut builder = EqClassMapBuilder::new(num_tiles);
+        // Interleaved, so new and repeated labels are mixed across resizes.
+        for tile in 0..num_tiles {
+            let id = (tile % DISTINCT) as u32;
+            builder.add_tile(
+                tile,
+                vec![(id, Orientation::Forward), (id + 1, Orientation::Both)],
+            );
+        }
+        let ec_map = builder.build();
+
+        assert_eq!(ec_map.num_tiles(), num_tiles);
+        assert_eq!(ec_map.num_ecs(), DISTINCT, "labels failed to dedup");
+
+        for tile in 0..num_tiles {
+            let id = (tile % DISTINCT) as u32;
+            // Every repeat of a label must land on its first occurrence's EC.
+            assert_eq!(
+                ec_map.ec_for_tile(tile as u64),
+                ec_map.ec_for_tile((tile % DISTINCT) as u64),
+            );
+            let span = ec_map.entries_for_tile(tile as u64);
+            assert_eq!(span.len(), 2);
+            assert_eq!(ec_entry_transcript_id(span.get(0)), id);
+            assert_eq!(ec_entry_transcript_id(span.get(1)), id + 1);
         }
     }
 

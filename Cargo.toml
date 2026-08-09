@@ -1,6 +1,6 @@
 [workspace]
 members = [".", "crates/py-piscem", "crates/seq_geom_parser", "crates/thread-broker"]
-exclude = ["sshash-rs"]
+exclude = ["sshash-rs", "scripts/hb-vs-phast"]
 
 [workspace.package]
 edition = "2024"
@@ -84,6 +84,13 @@ libc = "0.2"
 
 # Fast hashing with deterministic seeding (same version as sshash-rs)
 ahash = "0.8"
+
+# `HashTable`: a raw table keyed by hash with caller-supplied equality, which
+# `std` cannot express (`raw_entry` is still unstable). Used by
+# `index::eq_classes` to intern EC labels by id rather than storing a second
+# owned copy of every label as the map key. Same version tiny-dict resolves,
+# so the two share one copy.
+hashbrown = "0.17"
 
 # Phase 4 dependencies
 dashmap = "6"
