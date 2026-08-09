@@ -75,6 +75,39 @@ hold at every instant instead of only at the points hashbrown happens to look.
 `test_dedup_survives_table_growth` forces several resizes; the pre-existing
 dedup tests are far too small to ever trigger one.
 
+### End-to-end validation of the change
+
+Run 2026-08-09 against a binary built at `7ea5b84`, the commit immediately
+before the rewrite. Script: `VALIDATE-hashbrown/validate.sh` (scratch, not
+tracked); index rebuilt from regenerated cuttlefish output with the exact flags
+the `piscem` wrapper passes to `piscem_rs::cli::build` — **including
+`--build-ec-table`, which is not the default and without which none of this
+exercises the changed code**.
+
+| stage | result |
+|---|---|
+| **0. control** — same binary, index built twice | all 7 artifacts byte-identical. Establishes that byte-comparison is meaningful at all |
+| **1. index NEW vs OLD** | all 7 byte-identical, including `index.ectab` (242 784 B, the direct product of the rewrite) and `index.tdct` (37 058 573 B) |
+| **2. 10 k fixture, `-t 1`** | `map.rad` byte-identical (1 860 453 B), `unmapped_bc_count.bin` byte-identical, 8 995/10 000 mapped — matching the historical 0.6.4 figure |
+| **3. full Flex v2, `-t 64`** | 2 302 290 422 read pairs, **1 994 961 121 mapped (86.65 %) on both**, identical to the last digit |
+
+The full-run count also matches `dyn_full/raw.tsv` from July — a different
+binary, index build and `-t` semantics — so this is corroborated across eras,
+not merely self-consistent.
+
+Discipline checks: CPU/wall was 54.8 (OLD) and 55.1 (NEW) average threads
+against a budget of 64, so neither run overspent `-t`. Wall differed by +1.43 %
+and CPU by +2.07 %, both under the ~3 % floor below which this project claims
+nothing. The broker was genuinely engaged in both (64 controlled slots, final
+split 43/21 vs 41/23, steady phase, no errors, no reverts) — this was not a
+serial fallback. The move counts differ (1 vs 5) because the controller widens
+its deadband with measured uncertainty, which differed run to run; nothing in
+this change touches the broker.
+
+Stage 3 cannot be byte-compared: multi-threaded runs interleave records by
+thread arrival, which is inherent to the pipeline. Exact content is covered by
+stage 2 at `-t 1`.
+
 ## 3. hashbrown vs PHast for `TinyDictionary`
 
 `TinyDictionary` indexes k-mers with
@@ -138,17 +171,46 @@ PHast builds **18–53× slower** (7.3 M keys: 112 ms vs 3.6 s).
 
 ## 4. Conclusion
 
-**No change.** hashbrown is not uniformly faster — it wins above ~3.6 M keys and
-loses below ~1 M — but nothing here justifies a switch:
+**No change — but on one ground only, and not the one it first appeared.**
 
-1. The prefilter already owns the miss path. `lookup_core_bits` records that
+### The production reference sits where PHast looked best
+
+The Flex v2 probe panel — the actual reason `TinyDictionary` exists — holds
+**1 498 349 distinct canonical k-mers** at k=23 (cuttlefish vertex count,
+confirmed by `sum_unitig_len − unitigs×(k−1)` = 2 677 043 − 53 577×22). At that
+size, on a 32 MB L3:
+
+| | table | vs L3 |
+|---|---:|---|
+| hashbrown | 2 097 152 buckets × 17 B = **35.7 MB** | just over |
+| PHast | 1.5 M × 16 B + 2.1 bits/key = **24.4 MB** | fits |
+
+The on-disk `.tdct` is 35.3 MB, corroborating the hashbrown figure. This is
+almost exactly the `n = 1 000 000` sparse row above — 34 MB vs 16 MB, PHast at
+**0.47×** on hits. So the real reference is *not* in the ≳3.6 M regime where
+hashbrown wins; it is a few megabytes the wrong side of the cache cliff, which
+is the single most favourable configuration PHast had.
+
+An earlier draft of this note implied the size range was unfavourable to PHast.
+It is not, and that reasoning should not be reused.
+
+### Why it still does not change
+
+1. **The prefilter owns the miss path.** `lookup_core_bits` records that
    **~79 % of queried k-mers are absent** on probe-panel references and are
-   rejected by the blocked Bloom filter in ~12 instructions, before any table is
-   consulted. The table choice governs the remaining ~21 %.
-2. Where PHast wins (≲ 1 M keys) lookups are L3-resident and already ~4 ns, so
-   the win is small in absolute terms.
-3. Where PHast loses (≳ 3.6 M keys) it loses by 1.3–1.5×.
-4. The memory case is ~16 %, against a 30× build-time cost.
+   rejected by the blocked Bloom filter in ~12 instructions, before the table is
+   consulted. A 2× table win applies to the remaining ~21 % of lookups.
+2. **The load factor is luck, not design.** 1.5 M rounds to 2 097 152 buckets —
+   71.4 % load. A panel 10 % larger stays at 35.7 MB; one 25 % larger doubles to
+   71 MB and loses badly. Building a decision on where the current panel happens
+   to fall relative to a power of two is exactly the mistake §"Recurring
+   lessons" in `thread-broker/README.md` warns about.
+3. **Cost.** ~16 % memory at a dense load, against a 30× build-time cost and a
+   new failure mode (a stale MPHF silently returning another k-mer's slot).
+
+The item to revisit is therefore not "PHast vs hashbrown" in the abstract but
+**PHast verifying against `TinySpss`**, which is the only variant whose memory
+win (~8.3 B/key) is large enough to survive point 2.
 
 If this is ever revisited, the variant worth measuring is **PHast verifying
 against `TinySpss`** rather than a key array: that drops to ~8.3 B/key (a real
