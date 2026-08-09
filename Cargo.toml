@@ -78,7 +78,10 @@ sshash-lib = "0.6.3"
 tiny-dict = "0.6.3"
 # Total physical memory, portably. Paired with getrlimit and cgroup reads in
 # `index::mem_budget`, which cover the limits `sysinfo` cannot see.
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+# Held at 0.36: `sux` -> `dsi-progress-logger` pins `sysinfo = "0.36.1"`, which
+# can never unify with 0.39, so bumping puts two copies of the crate in the
+# build tree. Nothing we call needs anything newer.
+sysinfo = { version = "0.36", default-features = false, features = ["system"] }
 # getrlimit(RLIMIT_AS): the one memory ceiling visible on both Linux and macOS.
 libc = "0.2"
 

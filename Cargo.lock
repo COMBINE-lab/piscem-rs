@@ -822,7 +822,7 @@ dependencies = [
  "log",
  "num-format",
  "pluralizer",
- "sysinfo 0.36.1",
+ "sysinfo",
 ]
 
 [[package]]
@@ -1994,7 +1994,7 @@ dependencies = [
  "smallvec",
  "sshash-lib",
  "sux",
- "sysinfo 0.39.6",
+ "sysinfo",
  "tempfile",
  "thread-broker",
  "tiny-dict",
@@ -2671,20 +2671,6 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-io-kit",
  "windows 0.61.3",
-]
-
-[[package]]
-name = "sysinfo"
-version = "0.39.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2071df9448915b71c4fe6d25deaf1c22f12bd234f01540b77312bb8e41361e6"
-dependencies = [
- "libc",
- "memchr",
- "ntapi",
- "objc2-core-foundation",
- "objc2-io-kit",
- "windows 0.62.2",
 ]
 
 [[package]]

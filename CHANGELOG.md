@@ -84,7 +84,12 @@ directly.
 ### Dependencies
 
 - `rapidgzip-core` 0.3.0, now a released crate rather than a git revision.
-- `libradicl` 0.16 → 0.17, `sysinfo` 0.36 → 0.39.
+- `libradicl` 0.16 → 0.17.
+- `hashbrown` 0.17 is now a direct dependency, for `HashTable` in
+  `index::eq_classes`. It adds no copy to the build tree — it unifies with the
+  one `tiny-dict` already resolves.
+- `sysinfo` is deliberately held at 0.36: `sux` → `dsi-progress-logger` pins
+  `0.36.1`, so bumping only adds a second copy of the crate.
 - The `epserde`/`sux`/`value-traits` serialization stack is deliberately held at
   the versions `sshash-lib` requires; they must move together or two copies end up
   either side of the sshash boundary.
