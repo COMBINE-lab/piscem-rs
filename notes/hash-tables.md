@@ -78,8 +78,8 @@ dedup tests are far too small to ever trigger one.
 ### End-to-end validation of the change
 
 Run 2026-08-09 against a binary built at `7ea5b84`, the commit immediately
-before the rewrite. Script: `VALIDATE-hashbrown/validate.sh` (scratch, not
-tracked); index rebuilt from regenerated cuttlefish output with the exact flags
+before the rewrite. Script: [`scripts/validate_index_change.sh`](../scripts/validate_index_change.sh)
+(set `VALIDATE_DIR` to choose a workspace); index rebuilt from regenerated cuttlefish output with the exact flags
 the `piscem` wrapper passes to `piscem_rs::cli::build` — **including
 `--build-ec-table`, which is not the default and without which none of this
 exercises the changed code**.
