@@ -2220,9 +2220,9 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rapidgzip-core"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73479522ef5ac15e4015ff42faab6c3f6372f88b95ffd5fa4577f93dd76e907e"
+checksum = "da5be74bd353811db3efff881e87200a18150d72fb0b1d39ea04e7972a5b4ca1"
 dependencies = [
  "bon",
  "cpu-time",

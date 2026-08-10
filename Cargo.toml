@@ -130,7 +130,10 @@ mimalloc = { version = "0.1.48", optional = true }
 # supplies the exact cumulative executing-region integral the thread broker
 # solves the decode/map split from; reconstructing it by sampling was measured
 # 17-313% off. Released in 0.3.0, so this is no longer a git dependency.
-rapidgzip-core = { version = "0.3", optional = true }
+# 0.3.1 minimum: 0.3.0's shared pool had a lost-wakeup in its release path
+# that could deadlock every attached decoder once a broker shrank the pool
+# enough to keep admission on the contended slow path. See CHANGELOG 0.9.1.
+rapidgzip-core = { version = "0.3.1", optional = true }
 
 thread-broker = { version = "0.1.0", path = "crates/thread-broker" }
 
