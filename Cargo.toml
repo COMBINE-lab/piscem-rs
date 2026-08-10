@@ -106,7 +106,7 @@ crossbeam = "0.8"
 # decode/map split can be corrected rather than merely avoided. `paraseq` is the
 # official crate -- move back to it once 0.5.0 is released upstream. The lib
 # target is still named `paraseq`, so every `use paraseq::...` is unaffected.
-paraseq-temp = "0.5.0-pre.1"
+paraseq-temp = "0.5.0-pre.2"
 niffler = { version = "3", default-features = false, features = [
   "gz",
   "bz2",
