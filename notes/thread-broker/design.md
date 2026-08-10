@@ -56,7 +56,12 @@ upstream during it. That is why the design can assume them.
 - **The consumer resizes mid-run.** `paraseq::parallel::ThreadPool` gained
   `set_threads`, `share(ways)` and `total_live()`
   ([fork](https://github.com/rob-p/paraseq), branch `feat/dynamic-thread-pool`,
-  PR open). Workers can be added *and* retired while the pipeline runs.
+  PR open). Workers can be added *and* removed from service while the
+  pipeline runs. (Since this was written, the pool was redesigned after
+  upstream review -- noamteyssier/paraseq#78, shipped in paraseq-temp
+  0.5.0-pre.2: a fixed spawn set with parking, so "removed" now means parked
+  with its thread alive and its record buffers dropped, and the worker count
+  is bounded by construction rather than by claim/release accounting.)
 - **The producer resizes mid-run, admission is decoupled from the runtime
   limit, and executing time is cumulative.** `rapidgzip_core::DecoderPool`
   (current reviewed revision `7b943ba`) gives several decoders one shared

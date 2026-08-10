@@ -37,7 +37,7 @@ pub const READER_BATCH_SIZE: usize = 16384;
 /// scATAC batch size, chosen for its much more expensive per-record mapping
 /// callback.
 ///
-/// A worker can retire only after completing the batch it owns; 16K scATAC
+/// A worker can park only after completing the batch it owns; 16K scATAC
 /// records exceeded the broker's two-second drain timeout on a real
 /// negative-scaling workload. The size is not only a broker concession: on the
 /// two-million-record gate, 1K also beat 16K for serial scATAC by 7.7% wall,
