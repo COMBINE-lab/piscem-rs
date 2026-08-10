@@ -3,7 +3,22 @@
 Notable changes to `piscem-rs`. Versions follow [Semantic Versioning](https://semver.org);
 pre-1.0, a minor bump may carry breaking changes.
 
-## [0.9.1] — unreleased
+## [0.9.2] — unreleased
+
+### Changed
+
+- **`paraseq-temp` 0.5.0-pre.2**: upstream paraseq's released 0.5.0 plus the
+  worker pool in its redesigned form (noamteyssier/paraseq#78, superseding
+  #75 after upstream review). The pool is now a fixed spawn set with parking:
+  the worker count is bounded by construction rather than enforced by
+  claim/release accounting — the previous design could stochastically exceed
+  its ceiling on small inputs — and a parked worker drops its record buffers,
+  so batch memory is proportional to *active* workers. The pool API the
+  thread broker drives is unchanged; verified against the full 2.3 B-read
+  Flex v2 run (identical mapped count, same converged 42/22 split, wall time
+  within the historical band).
+
+## [0.9.1] — 2026-08-09
 
 ### Fixed
 
