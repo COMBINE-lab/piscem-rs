@@ -99,14 +99,15 @@ hashbrown = "0.17"
 dashmap = "6"
 smallvec = "1.13"
 crossbeam = "0.8"
-# TEMPORARY: a republication of paraseq's unreleased dev-0.5.0 branch plus the
-# resizable worker pool from noamteyssier/paraseq#75.
+# TEMPORARY: a republication of paraseq's released 0.5.0 plus the resizable
+# worker pool offered upstream as noamteyssier/paraseq#78 (a fixed spawn set
+# with parking; worker count bounded by construction).
 #
 # `ThreadPool` is what lets the mapping thread count change mid-run, so a bad
-# decode/map split can be corrected rather than merely avoided. `paraseq` is the
-# official crate -- move back to it once 0.5.0 is released upstream. The lib
+# decode/map split can be corrected rather than merely avoided. `paraseq` is
+# the official crate -- move back to it once the pool lands there. The lib
 # target is still named `paraseq`, so every `use paraseq::...` is unaffected.
-paraseq-temp = "0.5.0-pre.1"
+paraseq-temp = "0.5.0-pre.2"
 niffler = { version = "3", default-features = false, features = [
   "gz",
   "bz2",
