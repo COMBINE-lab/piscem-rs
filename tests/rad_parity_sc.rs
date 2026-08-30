@@ -92,7 +92,6 @@ fn ensure_rust_index() -> Result<()> {
         m: 19,
         build_ec_table: true,
         num_threads: 0,
-        canonical: true,
         seed: 1,
         single_mphf: false,
         emit_tiny: None,
