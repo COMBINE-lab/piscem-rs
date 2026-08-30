@@ -855,15 +855,16 @@ impl PyReferenceIndex {
     /// :param m: Minimizer length (default 19).
     /// :param threads: Number of threads (default 4, 0 = all cores).
     /// :param build_ec: Whether to build the equivalence class table.
-    /// :param canonical: Deprecated and ignored — the index is always
-    ///     canonical since sshash-lib 0.7 (one indexing modality).
+    /// :param canonical: Deprecated, no effect — the index is always
+    ///     canonical since sshash-lib 0.7 (one indexing modality). Accepted
+    ///     for one release; passing it emits a ``DeprecationWarning``.
     /// :param decoys: Optional list of decoy FASTA file paths for building a
     ///     poison k-mer table. Compressed files (gzip, bzip2, zstd) are
     ///     supported. If omitted, no poison table is built.
     /// :returns: A ready-to-use :class:`ReferenceIndex`.
     /// :raises RuntimeError: If the build fails.
     #[staticmethod]
-    #[pyo3(signature = (input_prefix, output_prefix, *, k=31, m=19, threads=4, build_ec=true, canonical=true, decoys=None))]
+    #[pyo3(signature = (input_prefix, output_prefix, *, k=31, m=19, threads=4, build_ec=true, canonical=None, decoys=None))]
     fn build(
         py: Python<'_>,
         input_prefix: &str,
@@ -872,12 +873,19 @@ impl PyReferenceIndex {
         m: usize,
         threads: usize,
         build_ec: bool,
-        canonical: bool,
+        canonical: Option<bool>,
         decoys: Option<Vec<String>>,
     ) -> PyResult<Self> {
         use piscem_rs::index::build::BuildConfig;
 
-        let _ = canonical; // ignored: the index is always canonical
+        if canonical.is_some() {
+            PyErr::warn(
+                py,
+                &py.get_type::<pyo3::exceptions::PyDeprecationWarning>(),
+                c"canonical is deprecated and has no effect: the index is always canonical",
+                1,
+            )?;
+        }
 
         let config = BuildConfig {
             input_prefix: input_prefix.into(),
