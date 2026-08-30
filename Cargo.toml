@@ -42,8 +42,6 @@ exclude = [
   "test_data/",
   "piscem-cpp/",
   "piscem/",
-  "examples/",
-  "tests/",
   "crates/",
   "sshash-rs/",
   "sshash_tmp/",
@@ -143,7 +141,9 @@ tempfile = "3"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 libradicl = "0.18"
 
-# Examples that need optional features (excluded from publish but needed locally).
+# Examples that need optional features. These files ship in the package:
+# excluding declared targets breaks maturin's sdist vendoring of this crate
+# (the raw manifest is copied while the files are dropped).
 [[example]]
 name = "atac_mismatch_diag"
 required-features = ["parity-test"]
