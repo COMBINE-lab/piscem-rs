@@ -3,6 +3,34 @@
 Notable changes to `piscem-rs`. Versions follow [Semantic Versioning](https://semver.org);
 pre-1.0, a minor bump may carry breaking changes.
 
+## [0.10.0] — unreleased
+
+### Breaking
+
+- **sshash-lib 0.7 / index format break**: sshash-rs 0.7 ports C++ SSHash
+  v6.0.0 — one canonical indexing modality (the minimizer is the locus
+  minimizing the hash of the *canonical* m-mer, mirror-equivariant at plain
+  forward density, with the centre-closest tie-break). Existing `.ssi`
+  dictionaries cannot be loaded: `piscem build` indexes must be rebuilt, and
+  `Dictionary::load` fails on old files with an explicit rebuild message.
+- **`BuildConfig.canonical` / `piscem build --canonical` removed**: the flag
+  chose between modalities that no longer exist. Indexes are always canonical
+  and report match orientation; previously-non-canonical indexes answered
+  both strands via reverse-complement fallback probing, so mapping results
+  are unchanged — lookups now cost a single probe. The py-piscem `canonical=`
+  kwarg is kept but ignored.
+
+### Changed
+
+- Streaming lookups gain sshash's same-minimizer memos (negative-in-positive
+  streams answer from the previous seed's cached locate set): ~33% faster
+  streaming on 1%-error reads in sshash's benchmarks, with byte-identical
+  per-k-mer results (verified against a 0.6.4 oracle over ~30M lookups and
+  against the C++ v6 implementation).
+- The sshash `.ssi` header now records the build seed and a hasher guard, so
+  a rapidhash behavior change fails loudly at load instead of silently
+  corrupting minimizer selection.
+
 ## [0.9.2] — unreleased
 
 ### Changed
