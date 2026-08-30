@@ -13,12 +13,13 @@ pre-1.0, a minor bump may carry breaking changes.
   forward density, with the centre-closest tie-break). Existing `.ssi`
   dictionaries cannot be loaded: `piscem build` indexes must be rebuilt, and
   `Dictionary::load` fails on old files with an explicit rebuild message.
-- **`BuildConfig.canonical` / `piscem build --canonical` removed**: the flag
-  chose between modalities that no longer exist. Indexes are always canonical
-  and report match orientation; previously-non-canonical indexes answered
-  both strands via reverse-complement fallback probing, so mapping results
-  are unchanged — lookups now cost a single probe. The py-piscem `canonical=`
-  kwarg is kept but ignored.
+- **`BuildConfig.canonical` removed; `piscem build --canonical` deprecated**:
+  the flag chose between modalities that no longer exist. Indexes are always
+  canonical and report match orientation; previously-non-canonical indexes
+  answered both strands via reverse-complement fallback probing, so mapping
+  results are unchanged — lookups now cost a single probe. The CLI flag and
+  the py-piscem `canonical=` kwarg are accepted for one release and warn
+  (a `DeprecationWarning` in python) when used.
 
 ### Changed
 
