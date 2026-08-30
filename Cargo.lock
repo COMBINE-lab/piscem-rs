@@ -2496,9 +2496,7 @@ checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 
 [[package]]
 name = "sshash-lib"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3273efcc72e4789d134c7e545e809323237c13c8bc848126d8ad6628f29e3f0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "epserde",
@@ -2787,9 +2785,7 @@ dependencies = [
 
 [[package]]
 name = "tiny-dict"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7562b61a97229165f2e8dab3f932fb7171d47a6179026d76c7589b55a73b4864"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "hashbrown 0.17.1",

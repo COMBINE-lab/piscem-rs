@@ -145,9 +145,8 @@ where
     fn make_streaming_query(&self) -> Box<dyn DynStreamingQuery> {
         let k = self.inner.k();
         let m = self.inner.m();
-        let canonical = self.inner.dict().canonical();
         Box::new(ConcreteStreamingQuery::<K> {
-            query: StreamingQuery::new(k, m, canonical),
+            query: StreamingQuery::with_seed(k, m, self.inner.dict().seed()),
             index: Arc::clone(&self.inner),
             prev_query_pos: i32::MIN,
         })
@@ -856,7 +855,8 @@ impl PyReferenceIndex {
     /// :param m: Minimizer length (default 19).
     /// :param threads: Number of threads (default 4, 0 = all cores).
     /// :param build_ec: Whether to build the equivalence class table.
-    /// :param canonical: Whether to use canonical k-mers.
+    /// :param canonical: Deprecated and ignored — the index is always
+    ///     canonical since sshash-lib 0.7 (one indexing modality).
     /// :param decoys: Optional list of decoy FASTA file paths for building a
     ///     poison k-mer table. Compressed files (gzip, bzip2, zstd) are
     ///     supported. If omitted, no poison table is built.
@@ -877,6 +877,8 @@ impl PyReferenceIndex {
     ) -> PyResult<Self> {
         use piscem_rs::index::build::BuildConfig;
 
+        let _ = canonical; // ignored: the index is always canonical
+
         let config = BuildConfig {
             input_prefix: input_prefix.into(),
             output_prefix: output_prefix.into(),
@@ -884,10 +886,11 @@ impl PyReferenceIndex {
             m,
             build_ec_table: build_ec,
             num_threads: threads,
-            canonical,
             seed: 1,
             single_mphf: false,
             emit_tiny: None,
+            tmp_dir: None,
+            ram_limit_gib: None,
         };
         let out_prefix = output_prefix.to_owned();
         let has_poison = decoys.is_some();

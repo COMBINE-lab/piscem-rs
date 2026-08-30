@@ -25,9 +25,6 @@ pub struct BuildArgs {
     /// Build equivalence class table
     #[arg(long)]
     pub build_ec_table: bool,
-    /// Use canonical k-mer mode
-    #[arg(long)]
-    pub canonical: bool,
     /// Hash seed for dictionary construction
     #[arg(short = 's', long, default_value = "1")]
     pub seed: u64,
@@ -59,7 +56,6 @@ pub fn run(args: BuildArgs) -> Result<()> {
         m: args.mlen,
         build_ec_table: args.build_ec_table,
         num_threads: args.threads,
-        canonical: args.canonical,
         seed: args.seed,
         single_mphf: args.single_mphf,
         emit_tiny: match args.dict {
