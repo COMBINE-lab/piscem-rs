@@ -31,6 +31,13 @@ pre-1.0, a minor bump may carry breaking changes.
 - The sshash `.ssi` header now records the build seed and a hasher guard, so
   a rapidhash behavior change fails loudly at load instead of silently
   corrupting minimizer selection.
+- Note on the `.tdct` tiny dictionary: its format is unchanged and
+  self-contained, so `--dict tiny` (and `auto`, when a `.tdct` is present)
+  loads indexes **across** the `.ssi` format break, in both directions.
+  This is sound — the tiny dictionary carries its own copy of the string
+  set, and cross-version RAD outputs are bit-identical — but note that
+  `--dict sshash` and the tiny path can therefore differ in *which* indexes
+  they accept.
 
 ## [0.9.2] — unreleased
 
