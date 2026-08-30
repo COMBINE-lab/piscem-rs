@@ -25,7 +25,9 @@ pub struct BuildArgs {
     /// Build equivalence class table
     #[arg(long)]
     pub build_ec_table: bool,
-    /// Use canonical k-mer mode
+    /// Deprecated, no effect: the index is always canonical (a k-mer and its
+    /// reverse complement share one entry, and lookups report orientation).
+    /// Accepted for one release; ignored with a warning
     #[arg(long)]
     pub canonical: bool,
     /// Hash seed for dictionary construction
@@ -52,6 +54,11 @@ pub struct BuildArgs {
 }
 
 pub fn run(args: BuildArgs) -> Result<()> {
+    if args.canonical {
+        tracing::warn!(
+            "--canonical is deprecated and has no effect: the index is always canonical"
+        );
+    }
     let config = BuildConfig {
         input_prefix: args.input,
         output_prefix: args.output,
@@ -59,7 +66,6 @@ pub fn run(args: BuildArgs) -> Result<()> {
         m: args.mlen,
         build_ec_table: args.build_ec_table,
         num_threads: args.threads,
-        canonical: args.canonical,
         seed: args.seed,
         single_mphf: args.single_mphf,
         emit_tiny: match args.dict {

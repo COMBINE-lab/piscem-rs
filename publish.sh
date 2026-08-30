@@ -9,7 +9,7 @@ die() {
 usage() {
     cat <<'EOF'
 Usage:
-  ./publish.sh <crate> <version> [--publish] [--dry-run]
+  ./publish.sh <crate> <version> [--publish] [--dry-run] [--allow-same-version]
 
 Arguments:
   <crate>    Crate to release: seq_geom_parser or piscem-rs
@@ -18,6 +18,10 @@ Arguments:
 Options:
   --publish  Publish to crates.io after bumping and committing
   --dry-run  Show what would be done without modifying anything
+  --allow-same-version  Proceed when the crate is already at <version>
+             (skips the bump edit and bump commit; check/publish/tag still
+             run). Use when the version was bumped ahead of time so a
+             downstream [patch.crates-io] path override resolves in dev.
   -h, --help Show this help message
 
 Examples:
@@ -45,6 +49,7 @@ CRATE=""
 VERSION=""
 PUBLISH=false
 DRY_RUN=false
+ALLOW_SAME_VERSION=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -53,6 +58,9 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dry-run)
             DRY_RUN=true
+            ;;
+        --allow-same-version)
+            ALLOW_SAME_VERSION=true
             ;;
         -h|--help)
             usage
@@ -122,8 +130,14 @@ pkg_version() {
 CURRENT_VERSION="$(pkg_version "$CARGO_TOML")"
 [[ -n "$CURRENT_VERSION" ]] || die "could not determine [package] version from $CARGO_TOML"
 
+SAME_VERSION=false
 if [[ "$CURRENT_VERSION" == "$VERSION" ]]; then
-    die "crate version is already $VERSION"
+    if [[ "${ALLOW_SAME_VERSION:-false}" == true ]]; then
+        SAME_VERSION=true
+        echo "Crate already at $VERSION; skipping bump edit (--allow-same-version)"
+    else
+        die "crate version is already $VERSION (pass --allow-same-version to release it as-is)"
+    fi
 fi
 
 if git rev-parse "$TAG" >/dev/null 2>&1; then
@@ -154,7 +168,7 @@ echo
 echo "Updating $CARGO_TOML"
 echo "  version: $CURRENT_VERSION -> $VERSION"
 
-if [[ "$DRY_RUN" == false ]]; then
+if [[ "$DRY_RUN" == false && "$SAME_VERSION" == false ]]; then
     # Rewrite only the `version =` line inside the [package] section.
     awk -v ver="$VERSION" '
         /^\[package\]/ { in_pkg = 1 }
@@ -175,8 +189,12 @@ else
 fi
 
 run cargo check -q
-run git add "$CARGO_TOML" "$LOCKFILE"
-run git commit -m "chore(release): bump ${CRATE} to v${VERSION}"
+if [[ "$SAME_VERSION" == false ]]; then
+    run git add "$CARGO_TOML" "$LOCKFILE"
+    run git commit -m "chore(release): bump ${CRATE} to v${VERSION}"
+else
+    echo "Skipping bump commit (crate already at v${VERSION})"
+fi
 
 if [[ "$PUBLISH" == true ]]; then
     run cargo publish $PUBLISH_ARGS --allow-dirty

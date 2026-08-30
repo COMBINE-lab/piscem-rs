@@ -3,6 +3,42 @@
 Notable changes to `piscem-rs`. Versions follow [Semantic Versioning](https://semver.org);
 pre-1.0, a minor bump may carry breaking changes.
 
+## [0.10.0] — unreleased
+
+### Breaking
+
+- **sshash-lib 0.7 / index format break**: sshash-rs 0.7 ports C++ SSHash
+  v6.0.0 — one canonical indexing modality (the minimizer is the locus
+  minimizing the hash of the *canonical* m-mer, mirror-equivariant at plain
+  forward density, with the centre-closest tie-break). Existing `.ssi`
+  dictionaries cannot be loaded: `piscem build` indexes must be rebuilt, and
+  `Dictionary::load` fails on old files with an explicit rebuild message.
+- **`BuildConfig.canonical` removed; `piscem build --canonical` deprecated**:
+  the flag chose between modalities that no longer exist. Indexes are always
+  canonical and report match orientation; previously-non-canonical indexes
+  answered both strands via reverse-complement fallback probing, so mapping
+  results are unchanged — lookups now cost a single probe. The CLI flag and
+  the py-piscem `canonical=` kwarg are accepted for one release and warn
+  (a `DeprecationWarning` in python) when used.
+
+### Changed
+
+- Streaming lookups gain sshash's same-minimizer memos (negative-in-positive
+  streams answer from the previous seed's cached locate set): ~33% faster
+  streaming on 1%-error reads in sshash's benchmarks, with byte-identical
+  per-k-mer results (verified against a 0.6.4 oracle over ~30M lookups and
+  against the C++ v6 implementation).
+- The sshash `.ssi` header now records the build seed and a hasher guard, so
+  a rapidhash behavior change fails loudly at load instead of silently
+  corrupting minimizer selection.
+- Note on the `.tdct` tiny dictionary: its format is unchanged and
+  self-contained, so `--dict tiny` (and `auto`, when a `.tdct` is present)
+  loads indexes **across** the `.ssi` format break, in both directions.
+  This is sound — the tiny dictionary carries its own copy of the string
+  set, and cross-version RAD outputs are bit-identical — but note that
+  `--dict sshash` and the tiny path can therefore differ in *which* indexes
+  they accept.
+
 ## [0.9.2] — unreleased
 
 ### Changed

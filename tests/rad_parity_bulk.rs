@@ -93,7 +93,6 @@ fn ensure_rust_index() -> Result<()> {
         m: 19,
         build_ec_table: true,
         num_threads: 0,
-        canonical: true,
         seed: 1,
         single_mphf: false,
         emit_tiny: None,
@@ -1326,9 +1325,14 @@ fn bulk_pe_rad_parity_struct_constraints() {
 
 #[test]
 fn resolve_refs() {
+    // Ad-hoc debugging helper: prints ref names from a locally produced RAD.
+    // Skips (like the data-gated tests) when the artifact is absent.
     use libradicl::header::RadPrelude;
     use std::io::BufReader;
-    let f = std::fs::File::open("/tmp/cpp_poison_new.rad").unwrap();
+    let Ok(f) = std::fs::File::open("/tmp/cpp_poison_new.rad") else {
+        eprintln!("skipping resolve_refs: /tmp/cpp_poison_new.rad not present");
+        return;
+    };
     let mut r = BufReader::new(f);
     let prelude = RadPrelude::from_bytes(&mut r).unwrap();
     eprintln!("Total refs: {}", prelude.hdr.ref_names.len());

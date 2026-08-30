@@ -179,12 +179,7 @@ impl ReferenceIndex<Dictionary, ContigTable> {
         info!("Loading SSHash dictionary from {}", dict_path.display());
         let dict = Dictionary::load(&dict_path)
             .map_err(|e| anyhow::anyhow!("failed to load dictionary: {e}"))?;
-        info!(
-            "  k={}, {} strings, canonical={}",
-            dict.k(),
-            dict.num_strings(),
-            dict.canonical()
-        );
+        info!("  k={}, {} strings", dict.k(), dict.num_strings());
 
         // 2. Load contig table
         let ctab_path = with_ext(prefix, CTAB_EXT);
@@ -475,12 +470,7 @@ impl ReferenceIndex<TinyDictionary, TinyContigTable> {
         info!("Loading TinyDictionary from {}", tdct_path.display());
         let dict = TinyDictionary::load(&tdct_path)
             .map_err(|e| anyhow::anyhow!("failed to load {}: {e}", tdct_path.display()))?;
-        info!(
-            "  k={}, {} strings, canonical={}",
-            dict.k(),
-            dict.num_strings(),
-            dict.canonical()
-        );
+        info!("  k={}, {} strings", dict.k(), dict.num_strings());
 
         // 2. TinyContigTable
         let tct_path = with_ext(prefix, TCT_EXT);

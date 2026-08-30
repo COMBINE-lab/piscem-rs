@@ -111,7 +111,7 @@ pub fn run(args: StatsArgs) -> Result<()> {
             "num_unitigs": dict.num_strings(),
             "num_minimizers": dict.num_minimizers(),
             "num_bits": dict.num_bits(),
-            "canonical": dict.canonical(),
+            "canonical": true, // always canonical since sshash-lib 0.7
         }),
     );
 
