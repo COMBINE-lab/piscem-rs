@@ -58,19 +58,20 @@ pub struct MapScrnaArgs {
     /// serial because the parallel decoder requires positional reads.
     #[arg(long, default_value = "auto", value_name = "MODE")]
     pub decoder: String,
-    /// Path to a JSON file overriding thread and decoder policy.
+    /// Thread and decoder policy, as inline JSON or a path to a JSON file.
     ///
-    /// Every field is optional and defaults to a measured value, so a file need
-    /// only name what it changes; an unknown field is an error rather than a
-    /// silent no-op. Currently:
+    /// A value beginning with `{` is parsed as inline JSON; anything else is a
+    /// path. Every field is optional and defaults to a measured value, so it
+    /// need only name what it changes; an unknown field is an error rather than
+    /// a silent no-op. Currently:
     ///
     /// `{"parallel_decode": {"min_threads_per_stream": 8}}`
     ///
     /// That value is how many threads must be available per gzip input before
     /// the parallel decoder is used at all. Below it the serial decoder already
     /// supplies one inflate stream per input for free, on threads that also map.
-    #[arg(long, value_name = "FILE")]
-    pub thread_policy: Option<PathBuf>,
+    #[arg(long, value_name = "JSON_OR_PATH")]
+    pub thread_policy: Option<String>,
     /// Protocol geometry (e.g., chromium_v3, chromium_v2_5p)
     #[arg(short = 'g', long)]
     pub geometry: String,

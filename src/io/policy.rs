@@ -19,8 +19,15 @@
 //! name what it changes. Unknown fields are a hard error rather than a silent
 //! no-op: a policy file that looks like it is doing something while doing
 //! nothing is worse than one that refuses to load.
-
-use std::path::Path;
+//!
+//! # Path or inline JSON
+//!
+//! The same value may be given as a path to a JSON file *or* as an inline JSON
+//! document. A value whose first non-whitespace character is `{` is parsed
+//! directly; anything else is treated as a filesystem path. This lets a caller
+//! that constructs a run programmatically (e.g. `simpleaf`) pass a policy without
+//! materialising a temporary file, while a hand-written file path keeps working
+//! unchanged.
 
 use anyhow::{Context, Result};
 
@@ -37,18 +44,39 @@ pub struct ThreadPolicy {
 }
 
 impl ThreadPolicy {
-    /// Read a policy file, or use the defaults when none was given.
-    pub fn load(path: Option<&Path>) -> Result<Self> {
-        let Some(path) = path else {
+    /// Resolve a policy from a `--thread-policy` argument, or use the defaults
+    /// when none was given.
+    ///
+    /// `spec` is either an inline JSON document (first non-whitespace character
+    /// `{`) or a path to a JSON file. Both routes parse to the same
+    /// [`ThreadPolicy`] and reject unknown fields identically; the only
+    /// difference is where the bytes come from and how a parse error names its
+    /// source.
+    pub fn load(spec: Option<&str>) -> Result<Self> {
+        let Some(spec) = spec else {
             return Ok(Self::default());
         };
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("could not read thread policy {}", path.display()))?;
-        let policy: Self = serde_json::from_str(&text)
-            .with_context(|| format!("could not parse thread policy {}", path.display()))?;
+        let inline = spec.trim_start().starts_with('{');
+        let text = if inline {
+            spec.to_string()
+        } else {
+            std::fs::read_to_string(spec)
+                .with_context(|| format!("could not read thread policy file {spec}"))?
+        };
+        let policy: Self = serde_json::from_str(&text).with_context(|| {
+            if inline {
+                format!("could not parse inline thread policy `{spec}`")
+            } else {
+                format!("could not parse thread policy file {spec}")
+            }
+        })?;
         tracing::info!(
             "thread policy from {}: parallel decoding requires {} thread(s) per gzip input",
-            path.display(),
+            if inline {
+                "inline JSON".to_string()
+            } else {
+                spec.to_string()
+            },
             policy.parallel_decode.min_threads_per_stream,
         );
         Ok(policy)
@@ -63,6 +91,12 @@ mod tests {
         let p = dir.join(name);
         std::fs::write(&p, body).unwrap();
         p
+    }
+
+    /// A path is passed to `load` the same way the CLI passes it: as the string
+    /// the user typed.
+    fn load_path(p: &std::path::Path) -> Result<ThreadPolicy> {
+        ThreadPolicy::load(Some(p.to_str().unwrap()))
     }
 
     #[test]
@@ -80,7 +114,7 @@ mod tests {
             "p.json",
             r#"{"parallel_decode": {"min_threads_per_stream": 2}}"#,
         );
-        let p = ThreadPolicy::load(Some(&f)).unwrap();
+        let p = load_path(&f).unwrap();
         assert_eq!(p.parallel_decode.min_threads_per_stream, 2);
     }
 
@@ -88,10 +122,7 @@ mod tests {
     fn an_empty_object_is_the_default() {
         let dir = tempfile::tempdir().unwrap();
         let f = write(dir.path(), "p.json", "{}");
-        assert_eq!(
-            ThreadPolicy::load(Some(&f)).unwrap(),
-            ThreadPolicy::default()
-        );
+        assert_eq!(load_path(&f).unwrap(), ThreadPolicy::default());
     }
 
     /// A typo that silently does nothing is the failure mode a policy file is
@@ -105,16 +136,70 @@ mod tests {
             "p.json",
             r#"{"parallel_decode": {"min_threads_per_input": 2}}"#,
         );
-        let err = ThreadPolicy::load(Some(&f)).unwrap_err().to_string();
+        let err = load_path(&f).unwrap_err().to_string();
         assert!(err.contains("could not parse"), "{err}");
     }
 
     #[test]
     fn a_missing_file_names_itself() {
-        let err = ThreadPolicy::load(Some(std::path::Path::new("/nonexistent/p.json")))
+        let err = ThreadPolicy::load(Some("/nonexistent/p.json"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("/nonexistent/p.json"), "{err}");
+    }
+
+    /// The `simpleaf` route: the policy arrives inline, never touching the disk.
+    #[test]
+    fn inline_json_is_parsed_directly() {
+        let p = ThreadPolicy::load(Some(
+            r#"{"parallel_decode": {"min_threads_per_stream": 4}}"#,
+        ))
+        .unwrap();
+        assert_eq!(p.parallel_decode.min_threads_per_stream, 4);
+    }
+
+    /// Leading whitespace still selects the inline branch, so a value assembled
+    /// with a stray space is not mistaken for a path.
+    #[test]
+    fn inline_json_with_leading_whitespace_is_still_inline() {
+        let p = ThreadPolicy::load(Some(
+            r#"  {"parallel_decode": {"min_threads_per_stream": 4}}"#,
+        ))
+        .unwrap();
+        assert_eq!(p.parallel_decode.min_threads_per_stream, 4);
+    }
+
+    /// The equivalence the plan gates on: an inline document and the same JSON
+    /// in a file resolve to an identical policy.
+    #[test]
+    fn inline_and_file_resolve_identically() {
+        let body = r#"{"parallel_decode": {"min_threads_per_stream": 4}}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let f = write(dir.path(), "p.json", body);
+        assert_eq!(
+            ThreadPolicy::load(Some(body)).unwrap(),
+            load_path(&f).unwrap()
+        );
+    }
+
+    /// Inline JSON gets the same `deny_unknown_fields` treatment as a file.
+    #[test]
+    fn a_misspelled_inline_field_is_rejected() {
+        let err = ThreadPolicy::load(Some(
+            r#"{"parallel_decode": {"min_threads_per_input": 2}}"#,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("could not parse inline"), "{err}");
+    }
+
+    /// Malformed inline JSON names itself as inline rather than as a path.
+    #[test]
+    fn malformed_inline_json_is_named_inline() {
+        let err = ThreadPolicy::load(Some(r#"{"parallel_decode": "#))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("inline"), "{err}");
     }
 
     #[test]
