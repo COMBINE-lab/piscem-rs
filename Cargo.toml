@@ -121,7 +121,7 @@ value-traits = "0.2"
 mem_dbg = "0.4.1"
 
 # RAD file parsing — optional, enabled by parity-test feature
-libradicl = { version = "0.18", optional = true }
+libradicl = { version = "0.20", optional = true }
 mimalloc = { version = "0.1.48", optional = true }
 # `DecoderPool` gives one aggregate decode budget across files with a mutable
 # ceiling, and marker admission is decoupled from the runtime throttle, so a low
@@ -139,7 +139,7 @@ thread-broker = { version = "0.1.0", path = "crates/thread-broker" }
 [dev-dependencies]
 tempfile = "3"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
-libradicl = "0.18"
+libradicl = "0.20"
 
 # Examples that need optional features. These files ship in the package:
 # excluding declared targets breaks maturin's sdist vendoring of this crate
