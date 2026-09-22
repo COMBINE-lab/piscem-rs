@@ -26,6 +26,72 @@ const TAG_ARRAY: u8 = 7;
 const TAG_STRING: u8 = 8;
 
 // ---------------------------------------------------------------------------
+// RAD v2 prelude (self-describing format; COMBINE-lab/libradicl#64)
+// ---------------------------------------------------------------------------
+//
+// Every RAD file this writer emits begins with an 8-byte magic, a `major.minor`
+// spec version, and a length-prefixed (currently empty) extension block, and
+// every tag descriptor carries a semantic role suffix. These bytes are
+// byte-for-byte what libradicl >= 0.20.0 reads; keep them in lockstep with
+// `libradicl::constants` / `libradicl::rad_types::TagRole`.
+
+/// Magic signature at the very start of a versioned RAD prelude.
+pub(crate) const RAD_MAGIC: &[u8; 8] = b"RAD_FILE";
+/// Spec major written by this build (2 = first versioned spec, with tag roles).
+const RAD_SPEC_MAJOR: u8 = 2;
+/// Spec minor written by this build (additive changes bump this).
+const RAD_SPEC_MINOR: u8 = 0;
+
+/// Semantic role of a tag, serialized per descriptor as `[code][plen][payload]`.
+/// Codes and payloads match `libradicl::rad_types::TagRole`.
+#[derive(Clone, Copy, Debug)]
+pub enum TagRole {
+    /// No declared role (the default; all file-level tags here).
+    None,
+    /// A barcode level in the collation key, ordered outer→inner (level 0 =
+    /// outermost/sample); `len` is the nucleotide length.
+    Barcode { level: u8, len: u8 },
+    /// The UMI; `len` is its nucleotide length.
+    Umi { len: u8 },
+    /// An alignment's target reference id.
+    Reference,
+    /// Orientation (or the field packing it, e.g. an ori+ref_id word).
+    Orientation,
+    /// An alignment's mapping start coordinate.
+    MappingPosition,
+    /// The fragment/template length of an alignment.
+    FragmentLength,
+    /// The mapping-category flag for an alignment.
+    MappingType,
+}
+
+impl TagRole {
+    #[inline]
+    fn code(&self) -> u8 {
+        match self {
+            TagRole::None => 0,
+            TagRole::Barcode { .. } => 1,
+            TagRole::Umi { .. } => 2,
+            TagRole::Reference => 3,
+            TagRole::Orientation => 4,
+            TagRole::MappingPosition => 5,
+            TagRole::FragmentLength => 6,
+            TagRole::MappingType => 7,
+        }
+    }
+
+    /// Payload bytes after the `[code][plen]` prefix.
+    #[inline]
+    fn payload(&self) -> ([u8; 2], usize) {
+        match self {
+            TagRole::Barcode { level, len } => ([*level, *len], 2),
+            TagRole::Umi { len } => ([*len, 0], 1),
+            _ => ([0, 0], 0),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RadWriter — binary buffer
 // ---------------------------------------------------------------------------
 
@@ -97,18 +163,43 @@ impl RadWriter {
         self.buf.extend_from_slice(s.as_bytes());
     }
 
-    /// Write a tag description: length-prefixed name + type byte.
-    fn write_tag_desc(&mut self, name: &str, type_id: u8) {
-        self.write_string(name);
-        self.write_u8(type_id);
+    /// Write the RAD v2 prelude prefix: magic + `major.minor` + empty extension
+    /// block (`[ext_len:u32 = 0]`). Must be the very first bytes of the file, and
+    /// backpatch offsets (computed from `len()` afterwards) absorb its width
+    /// automatically. Matches `libradicl::header::RadHeader::from_bytes`.
+    pub fn write_prelude_prefix(&mut self) {
+        self.buf.extend_from_slice(RAD_MAGIC);
+        self.write_u8(RAD_SPEC_MAJOR);
+        self.write_u8(RAD_SPEC_MINOR);
+        self.write_u32(0); // ext_len: no prelude extension block yet
     }
 
-    /// Write an array tag description: name + TAG_ARRAY + length_type + elem_type.
-    fn write_array_tag_desc(&mut self, name: &str, length_type: u8, elem_type: u8) {
+    /// Write a tag's role suffix as `[code:u8][plen:u8][payload]`, matching
+    /// `libradicl::rad_types::TagRole::write`. Uniform for every role including
+    /// `None` (`[0][0]`).
+    #[inline]
+    fn write_role(&mut self, role: TagRole) {
+        let (payload, plen) = role.payload();
+        self.write_u8(role.code());
+        self.write_u8(plen as u8);
+        self.buf.extend_from_slice(&payload[..plen]);
+    }
+
+    /// Write a tag description: length-prefixed name + type byte + role suffix.
+    fn write_tag_desc(&mut self, name: &str, type_id: u8, role: TagRole) {
+        self.write_string(name);
+        self.write_u8(type_id);
+        self.write_role(role);
+    }
+
+    /// Write an array tag description: name + TAG_ARRAY + length_type + elem_type
+    /// + role suffix.
+    fn write_array_tag_desc(&mut self, name: &str, length_type: u8, elem_type: u8, role: TagRole) {
         self.write_string(name);
         self.write_u8(TAG_ARRAY);
         self.write_u8(length_type);
         self.write_u8(elem_type);
+        self.write_role(role);
     }
 
     /// Overwrite a u32 at a specific byte offset (for backpatching counts).
@@ -194,6 +285,9 @@ pub fn write_rad_header_sc<W: Write>(
 ) -> Result<(u64, Option<u64>)> {
     let mut buf = RadWriter::new();
 
+    // RAD v2 prelude (magic + version + empty extension block)
+    buf.write_prelude_prefix();
+
     // is_paired flag (always 0 for SC)
     buf.write_u8(0);
 
@@ -209,31 +303,40 @@ pub fn write_rad_header_sc<W: Write>(
 
     // --- Tag descriptions ---
 
-    // File-level tags: 3 (no position) or 4 (with position)
+    // File-level tags: 3 (no position) or 4 (with position). All roleless — the
+    // barcode/UMI lengths a reader needs come from the read-tag roles below.
     let num_file_tags: u16 = if with_position { 4 } else { 3 };
     buf.write_u16(num_file_tags);
-    buf.write_tag_desc("cblen", TAG_U16);
-    buf.write_tag_desc("ulen", TAG_U16);
-    buf.write_tag_desc("known_rad_type", TAG_STRING);
+    buf.write_tag_desc("cblen", TAG_U16, TagRole::None);
+    buf.write_tag_desc("ulen", TAG_U16, TagRole::None);
+    buf.write_tag_desc("known_rad_type", TAG_STRING, TagRole::None);
     if with_position {
-        buf.write_tag_desc("rlen", TAG_U32);
+        buf.write_tag_desc("rlen", TAG_U32, TagRole::None);
     }
 
-    // Read-level tags: 2 (barcode + UMI)
+    // Read-level tags: 2 (barcode + UMI). The role layout must be exactly
+    // `[Barcode, Umi]` for libradicl's role-driven single-barcode reader.
     buf.write_u16(2);
     // Barcode: u32 if bc_len <= 16, u64 if bc_len <= 32
     let bc_tag_type = if bc_len <= 16 { TAG_U32 } else { TAG_U64 };
-    buf.write_tag_desc("b", bc_tag_type);
+    buf.write_tag_desc(
+        "b",
+        bc_tag_type,
+        TagRole::Barcode {
+            level: 0,
+            len: bc_len as u8,
+        },
+    );
     // UMI: u32 if umi_len <= 16, u64 if umi_len <= 32
     let umi_tag_type = if umi_len <= 16 { TAG_U32 } else { TAG_U64 };
-    buf.write_tag_desc("u", umi_tag_type);
+    buf.write_tag_desc("u", umi_tag_type, TagRole::Umi { len: umi_len as u8 });
 
     // Alignment-level tags: 1 (no position) or 2 (with position)
     let num_aln_tags: u16 = if with_position { 2 } else { 1 };
     buf.write_u16(num_aln_tags);
-    buf.write_tag_desc("compressed_ori_refid", TAG_U32);
+    buf.write_tag_desc("compressed_ori_refid", TAG_U32, TagRole::Orientation);
     if with_position {
-        buf.write_tag_desc("pos", TAG_U32);
+        buf.write_tag_desc("pos", TAG_U32, TagRole::MappingPosition);
     }
 
     // --- File-level tag values ---
@@ -272,6 +375,9 @@ pub fn write_rad_header_bulk<W: Write>(
 ) -> Result<u64> {
     let mut buf = RadWriter::new();
 
+    // RAD v2 prelude (magic + version + empty extension block)
+    buf.write_prelude_prefix();
+
     // is_paired flag
     buf.write_u8(if is_paired { 1 } else { 0 });
 
@@ -289,18 +395,18 @@ pub fn write_rad_header_bulk<W: Write>(
 
     // File-level tags: 2
     buf.write_u16(2);
-    buf.write_tag_desc("known_rad_type", TAG_STRING);
-    buf.write_array_tag_desc("ref_lengths", TAG_U32, TAG_U32);
+    buf.write_tag_desc("known_rad_type", TAG_STRING, TagRole::None);
+    buf.write_array_tag_desc("ref_lengths", TAG_U32, TAG_U32, TagRole::None);
 
-    // Read-level tags: 1
+    // Read-level tags: 1 (bulk has no barcode; the fragment mapping-category flag)
     buf.write_u16(1);
-    buf.write_tag_desc("frag_map_type", TAG_U8);
+    buf.write_tag_desc("frag_map_type", TAG_U8, TagRole::MappingType);
 
     // Alignment-level tags: 3
     buf.write_u16(3);
-    buf.write_tag_desc("compressed_ori_ref", TAG_U32);
-    buf.write_tag_desc("pos", TAG_U32);
-    buf.write_tag_desc("frag_len", TAG_U16);
+    buf.write_tag_desc("compressed_ori_ref", TAG_U32, TagRole::Orientation);
+    buf.write_tag_desc("pos", TAG_U32, TagRole::MappingPosition);
+    buf.write_tag_desc("frag_len", TAG_U16, TagRole::FragmentLength);
 
     // --- File-level tag values ---
     buf.write_string("bulk_with_pos");
@@ -442,6 +548,9 @@ pub fn write_rad_header_atac<W: Write>(
 ) -> Result<u64> {
     let mut buf = RadWriter::new();
 
+    // RAD v2 prelude (magic + version + empty extension block)
+    buf.write_prelude_prefix();
+
     // is_paired=1 (ATAC is always paired)
     buf.write_u8(1);
 
@@ -459,21 +568,28 @@ pub fn write_rad_header_atac<W: Write>(
 
     // File-level tags: 3 (cblen + known_rad_type + ref_lengths)
     buf.write_u16(3);
-    buf.write_tag_desc("cblen", TAG_U16);
-    buf.write_tag_desc("known_rad_type", TAG_STRING);
-    buf.write_array_tag_desc("ref_lengths", TAG_U32, TAG_U32);
+    buf.write_tag_desc("cblen", TAG_U16, TagRole::None);
+    buf.write_tag_desc("known_rad_type", TAG_STRING, TagRole::None);
+    buf.write_array_tag_desc("ref_lengths", TAG_U32, TAG_U32, TagRole::None);
 
     // Read-level tags: 1 (barcode)
     buf.write_u16(1);
     let bc_tag_type = if bc_len <= 16 { TAG_U32 } else { TAG_U64 };
-    buf.write_tag_desc("b", bc_tag_type);
+    buf.write_tag_desc(
+        "b",
+        bc_tag_type,
+        TagRole::Barcode {
+            level: 0,
+            len: bc_len as u8,
+        },
+    );
 
     // Alignment-level tags: 4 (ref, type, start_pos, frag_len)
     buf.write_u16(4);
-    buf.write_tag_desc("ref", TAG_U32);
-    buf.write_tag_desc("type", TAG_U8);
-    buf.write_tag_desc("start_pos", TAG_U32);
-    buf.write_tag_desc("frag_len", TAG_U16);
+    buf.write_tag_desc("ref", TAG_U32, TagRole::Reference);
+    buf.write_tag_desc("type", TAG_U8, TagRole::MappingType);
+    buf.write_tag_desc("start_pos", TAG_U32, TagRole::MappingPosition);
+    buf.write_tag_desc("frag_len", TAG_U16, TagRole::FragmentLength);
 
     // --- File-level tag values ---
     buf.write_u16(bc_len);
@@ -587,6 +703,9 @@ pub fn write_rad_header_sc_multi_bc<W: Write>(
 ) -> Result<(u64, Option<u64>)> {
     let mut buf = RadWriter::new();
 
+    // RAD v2 prelude (magic + version + empty extension block)
+    buf.write_prelude_prefix();
+
     // is_paired flag (always 0 for SC)
     buf.write_u8(0);
 
@@ -606,32 +725,41 @@ pub fn write_rad_header_sc_multi_bc<W: Write>(
     let num_file_tags: u16 =
         1 + barcode_descs.len() as u16 + 1 + 1 + if with_position { 1 } else { 0 };
     buf.write_u16(num_file_tags);
-    buf.write_tag_desc("num_barcodes", TAG_U16);
+    buf.write_tag_desc("num_barcodes", TAG_U16, TagRole::None);
     for desc in barcode_descs {
         let len_tag = format!("{}len", desc.tag_name);
-        buf.write_tag_desc(&len_tag, TAG_U16);
+        buf.write_tag_desc(&len_tag, TAG_U16, TagRole::None);
     }
-    buf.write_tag_desc("ulen", TAG_U16);
-    buf.write_tag_desc("known_rad_type", TAG_STRING);
+    buf.write_tag_desc("ulen", TAG_U16, TagRole::None);
+    buf.write_tag_desc("known_rad_type", TAG_STRING, TagRole::None);
     if with_position {
-        buf.write_tag_desc("rlen", TAG_U32);
+        buf.write_tag_desc("rlen", TAG_U32, TagRole::None);
     }
 
-    // Read-level tags: one per barcode + UMI
+    // Read-level tags: one per barcode + UMI, laid out `[bc…, umi]` in barcode
+    // order (level i = physical index i, outer→inner) so libradicl's role-driven
+    // multi-barcode reader can rebuild the composite collation key from roles.
     buf.write_u16(barcode_descs.len() as u16 + 1);
-    for desc in barcode_descs {
+    for (i, desc) in barcode_descs.iter().enumerate() {
         let tag_type = if desc.len <= 16 { TAG_U32 } else { TAG_U64 };
-        buf.write_tag_desc(&desc.tag_name, tag_type);
+        buf.write_tag_desc(
+            &desc.tag_name,
+            tag_type,
+            TagRole::Barcode {
+                level: i as u8,
+                len: desc.len as u8,
+            },
+        );
     }
     let umi_tag_type = if umi_len <= 16 { TAG_U32 } else { TAG_U64 };
-    buf.write_tag_desc("u", umi_tag_type);
+    buf.write_tag_desc("u", umi_tag_type, TagRole::Umi { len: umi_len as u8 });
 
     // Alignment-level tags
     let num_aln_tags: u16 = if with_position { 2 } else { 1 };
     buf.write_u16(num_aln_tags);
-    buf.write_tag_desc("compressed_ori_refid", TAG_U32);
+    buf.write_tag_desc("compressed_ori_refid", TAG_U32, TagRole::Orientation);
     if with_position {
-        buf.write_tag_desc("pos", TAG_U32);
+        buf.write_tag_desc("pos", TAG_U32, TagRole::MappingPosition);
     }
 
     // --- File-level tag values ---
@@ -775,16 +903,127 @@ mod tests {
     }
 
     #[test]
-    fn test_sc_header_no_magic() {
+    fn test_sc_header_v2_prelude() {
         let mut buf = Vec::new();
         let names = vec!["ref1", "ref2"];
         let (chunk_off, rlen_off) =
             write_rad_header_sc(&mut buf, 2, &names, 16, 12, false).unwrap();
 
-        assert_eq!(buf[0], 0);
-        assert_ne!(&buf[0..4], b"RAD\x01");
-        assert!(chunk_off > 0);
+        // Versioned RAD v2 prelude: magic + major.minor + empty ext block.
+        assert_eq!(&buf[0..8], RAD_MAGIC);
+        assert_eq!(buf[8], RAD_SPEC_MAJOR);
+        assert_eq!(buf[9], RAD_SPEC_MINOR);
+        assert_eq!(&buf[10..14], &0u32.to_le_bytes()); // ext_len = 0
+        assert_eq!(buf[14], 0); // is_paired, right after the prelude prefix
+        // chunk_off is an absolute file offset past the 14-byte prelude.
+        assert!(chunk_off > 14);
         assert!(rlen_off.is_none());
+    }
+
+    /// Round-trip every header through libradicl 0.20's reader and assert the
+    /// declared tag roles, so the bytes we emit are exactly what alevin-fry reads.
+    #[test]
+    fn test_headers_roundtrip_libradicl_roles() {
+        use libradicl::header::RadPrelude;
+        use libradicl::rad_types::TagRole;
+
+        // --- scRNA (with position) ---
+        let mut buf = Vec::new();
+        write_rad_header_sc(&mut buf, 2, &["r0", "r1"], 16, 12, true).unwrap();
+        let p = RadPrelude::from_bytes(&mut &buf[..]).unwrap();
+        assert_eq!(p.hdr.version.major(), 2);
+        assert_eq!(p.hdr.version.minor(), 0);
+        assert_eq!(p.hdr.is_paired, 0);
+        // read tags: exactly [Barcode{level 0, len 16}, Umi{len 12}]
+        assert!(matches!(
+            p.read_tags.tags[0].role,
+            TagRole::Barcode { level: 0, len: 16 }
+        ));
+        assert!(matches!(p.read_tags.tags[1].role, TagRole::Umi { len: 12 }));
+        // aln tags: Orientation, MappingPosition
+        assert!(matches!(p.aln_tags.tags[0].role, TagRole::Orientation));
+        assert!(matches!(p.aln_tags.tags[1].role, TagRole::MappingPosition));
+        // file tags are roleless
+        assert!(
+            p.file_tags
+                .tags
+                .iter()
+                .all(|t| matches!(t.role, TagRole::None))
+        );
+        // libradicl's role-driven single-barcode reader must accept this exact
+        // layout (it enforces `[Barcode@0, Umi@1]`, 2 read tags) and recover the
+        // integer widths from the roles.
+        let ctx = libradicl::record::AlevinFryRecordContext::from_roles(&p.read_tags)
+            .unwrap()
+            .expect("scRNA header should be role-annotated");
+        assert_eq!(ctx.bct, libradicl::rad_types::RadIntId::U32); // bc_len 16 -> u32
+        assert_eq!(ctx.umit, libradicl::rad_types::RadIntId::U32); // umi_len 12 -> u32
+
+        // --- Flex / multi-barcode ---
+        let descs = vec![
+            BarcodeDesc {
+                tag_name: "b0".to_string(),
+                role: crate::mapping::protocols::BarcodeRole::Sample,
+                len: 16,
+            },
+            BarcodeDesc {
+                tag_name: "b1".to_string(),
+                role: crate::mapping::protocols::BarcodeRole::Cell,
+                len: 8,
+            },
+        ];
+        let mut buf = Vec::new();
+        write_rad_header_sc_multi_bc(&mut buf, 1, &["r0"], &descs, 12, false).unwrap();
+        let p = RadPrelude::from_bytes(&mut &buf[..]).unwrap();
+        assert_eq!(p.hdr.version.major(), 2);
+        assert!(matches!(
+            p.read_tags.tags[0].role,
+            TagRole::Barcode { level: 0, len: 16 }
+        ));
+        assert!(matches!(
+            p.read_tags.tags[1].role,
+            TagRole::Barcode { level: 1, len: 8 }
+        ));
+        assert!(matches!(p.read_tags.tags[2].role, TagRole::Umi { len: 12 }));
+        // libradicl's role-driven multi-barcode reader must accept this exact
+        // 2-level layout (barcodes first in level order, UMI immediately after,
+        // cell < 64 bits) and recover the per-level widths from the roles.
+        let mctx = libradicl::record::MultiBarcodeRecordContext::from_roles(&p.read_tags)
+            .unwrap()
+            .expect("Flex header should be role-annotated");
+        assert_eq!(
+            mctx.bc_types.as_slice(),
+            [
+                libradicl::rad_types::RadIntId::U32,
+                libradicl::rad_types::RadIntId::U32
+            ]
+        );
+        assert_eq!(mctx.umit, libradicl::rad_types::RadIntId::U32);
+
+        // --- scATAC ---
+        let mut buf = Vec::new();
+        write_rad_header_atac(&mut buf, 2, &["r0", "r1"], &[100, 200], 16).unwrap();
+        let p = RadPrelude::from_bytes(&mut &buf[..]).unwrap();
+        assert_eq!(p.hdr.version.major(), 2);
+        assert_eq!(p.hdr.is_paired, 1);
+        assert!(matches!(
+            p.read_tags.tags[0].role,
+            TagRole::Barcode { level: 0, len: 16 }
+        ));
+        assert!(matches!(p.aln_tags.tags[0].role, TagRole::Reference));
+        assert!(matches!(p.aln_tags.tags[1].role, TagRole::MappingType));
+        assert!(matches!(p.aln_tags.tags[2].role, TagRole::MappingPosition));
+        assert!(matches!(p.aln_tags.tags[3].role, TagRole::FragmentLength));
+
+        // --- bulk ---
+        let mut buf = Vec::new();
+        write_rad_header_bulk(&mut buf, true, 2, &["r0", "r1"], &[100, 200]).unwrap();
+        let p = RadPrelude::from_bytes(&mut &buf[..]).unwrap();
+        assert_eq!(p.hdr.version.major(), 2);
+        assert!(matches!(p.read_tags.tags[0].role, TagRole::MappingType));
+        assert!(matches!(p.aln_tags.tags[0].role, TagRole::Orientation));
+        assert!(matches!(p.aln_tags.tags[1].role, TagRole::MappingPosition));
+        assert!(matches!(p.aln_tags.tags[2].role, TagRole::FragmentLength));
     }
 
     #[test]
@@ -932,9 +1171,9 @@ mod tests {
         let ref_lens = vec![1000u32, 2000u32];
         let chunk_off = write_rad_header_bulk(&mut buf, true, 2, &names, &ref_lens).unwrap();
 
-        assert_eq!(buf[0], 1);
-        assert_ne!(&buf[0..4], b"RAD\x01");
-        assert!(chunk_off > 0);
+        assert_eq!(&buf[0..8], RAD_MAGIC);
+        assert_eq!(buf[14], 1); // is_paired, right after the 14-byte prelude
+        assert!(chunk_off > 14);
     }
 
     #[test]
@@ -944,8 +1183,9 @@ mod tests {
         let ref_lens = vec![248956422u32, 242193529u32];
         let chunk_off = write_rad_header_atac(&mut buf, 2, &names, &ref_lens, 16).unwrap();
 
-        assert_eq!(buf[0], 1);
-        assert!(chunk_off > 0);
+        assert_eq!(&buf[0..8], RAD_MAGIC);
+        assert_eq!(buf[14], 1); // is_paired, right after the 14-byte prelude
+        assert!(chunk_off > 14);
     }
 
     #[test]

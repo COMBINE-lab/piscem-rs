@@ -33,16 +33,52 @@ struct RadHeader {
 }
 
 /// Read a RAD header from a binary stream.
+///
+/// Handles both the versioned RAD v2 prelude (magic + `major.minor` +
+/// `[ext_len:u32]` extension block) written by piscem-rs and legacy magic-less
+/// files (e.g. from C++ piscem, used in parity comparisons), mirroring
+/// `libradicl::header::RadHeader::from_bytes`.
 fn read_rad_header<R: Read>(reader: &mut R) -> Result<RadHeader> {
-    // is_paired (u8)
-    let mut buf1 = [0u8; 1];
-    reader.read_exact(&mut buf1).context("reading is_paired")?;
-    let is_paired = buf1[0] != 0;
+    use crate::io::rad::RAD_MAGIC;
 
-    // num_refs (u64)
+    // Read the first 8 bytes: either the v2 magic, or `[is_paired][num_refs 0..7]`
+    // of a legacy header.
+    let mut head = [0u8; 8];
+    reader
+        .read_exact(&mut head)
+        .context("reading RAD prelude / is_paired")?;
+
     let mut buf8 = [0u8; 8];
-    reader.read_exact(&mut buf8).context("reading num_refs")?;
-    let num_refs = u64::from_le_bytes(buf8);
+    let (is_paired, num_refs) = if &head == RAD_MAGIC {
+        // Versioned: consume [major:u8][minor:u8], then the extension block.
+        let mut ver = [0u8; 2];
+        reader
+            .read_exact(&mut ver)
+            .context("reading spec version")?;
+        let mut ext_len_buf = [0u8; 4];
+        reader
+            .read_exact(&mut ext_len_buf)
+            .context("reading prelude extension length")?;
+        let ext_len = u32::from_le_bytes(ext_len_buf) as usize;
+        if ext_len > 0 {
+            let mut skip = vec![0u8; ext_len];
+            reader
+                .read_exact(&mut skip)
+                .context("reading prelude extension block")?;
+        }
+        let mut buf1 = [0u8; 1];
+        reader.read_exact(&mut buf1).context("reading is_paired")?;
+        reader.read_exact(&mut buf8).context("reading num_refs")?;
+        (buf1[0] != 0, u64::from_le_bytes(buf8))
+    } else {
+        // Legacy: head = [is_paired][num_refs bytes 0..7]; read the 8th num_refs byte.
+        let is_paired = head[0] != 0;
+        let mut b1 = [0u8; 1];
+        reader.read_exact(&mut b1).context("reading num_refs")?;
+        buf8[..7].copy_from_slice(&head[1..8]);
+        buf8[7] = b1[0];
+        (is_paired, u64::from_le_bytes(buf8))
+    };
 
     // ref_names: num_refs × (u16 len + bytes)
     let mut ref_names = Vec::with_capacity(num_refs as usize);
