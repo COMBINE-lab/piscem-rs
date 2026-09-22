@@ -3,7 +3,33 @@
 Notable changes to `piscem-rs`. Versions follow [Semantic Versioning](https://semver.org);
 pre-1.0, a minor bump may carry breaking changes.
 
-## [0.10.0] — unreleased
+## [0.11.0] — unreleased
+
+### Added
+
+- **Self-describing RAD v2 output.** Every mapping mode (scRNA, Flex /
+  multi-barcode, scATAC, bulk) now emits the versioned RAD v2 format: an
+  8-byte `RAD_FILE` magic, a `major.minor` spec version, a length-prefixed
+  prelude extension block, and a semantic **role** suffix on every tag
+  descriptor — byte-exact to `libradicl >= 0.20`'s reader. Readers can
+  recover the record layout (barcode/UMI widths, collation key, alignment
+  fields) from the declared roles rather than by tag-name convention or
+  field position. Emitted unconditionally. Roles: scRNA `[Barcode, Umi]`;
+  Flex barcodes `Barcode{level}` outer→inner then `Umi`; scATAC barcode +
+  `Reference`/`MappingType`/`MappingPosition`/`FragmentLength`; bulk
+  `MappingType` + `Orientation`/`MappingPosition`/`FragmentLength`. Validated
+  end-to-end (records byte-identical to the legacy header; quantification
+  canonically identical) through alevin-fry for scRNA/Flex/scATAC and through
+  piscem-infer/salmon for bulk.
+
+### Changed
+
+- Bump `libradicl` (parity-test dev-dependency) 0.18 → 0.21. This does not
+  affect emitted bytes — the RAD writer is self-contained and the shipping
+  binary does not link libradicl (see #8) — it only exercises the parity
+  tests against the current reader.
+
+## [0.10.0] — 2026-08-30
 
 ### Breaking
 
