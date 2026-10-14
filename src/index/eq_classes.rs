@@ -17,7 +17,7 @@
 //!
 //! This corresponds to the C++ `equivalence_class_map` class.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use epserde::deser::Deserialize;
 use epserde::ser::Serialize;
 use hashbrown::HashTable;
@@ -244,7 +244,7 @@ impl EqClassMap {
     ///
     /// Format:
     /// ```text
-    /// [magic: 8 bytes "PECTB02\0"]
+    /// [magic: 8 bytes "PECTB04\0"]
     /// [tile_ec_ids: epserde BitFieldVec binary]
     /// [label_list_offsets: epserde EfSeq binary]
     /// [label_entries: epserde BitFieldVec binary]
@@ -278,13 +278,7 @@ impl EqClassMap {
         reader
             .read_exact(&mut magic)
             .context("failed to read EC table magic")?;
-        if magic != *EC_TABLE_MAGIC {
-            bail!(
-                "invalid EC table magic: expected {:?}, got {:?}",
-                EC_TABLE_MAGIC,
-                magic
-            );
-        }
+        super::check_table_magic("EC table", &magic, EC_TABLE_MAGIC)?;
 
         let tile_ec_ids = unsafe {
             BitFieldVec::deserialize_full(reader)
@@ -312,7 +306,7 @@ impl EqClassMap {
     }
 }
 
-const EC_TABLE_MAGIC: &[u8; 8] = b"PECTB03\0";
+const EC_TABLE_MAGIC: &[u8; 8] = b"PECTB04\0";
 
 impl std::fmt::Debug for EqClassMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -747,6 +741,13 @@ mod tests {
         let data = b"BADMAGIC";
         let result = EqClassMap::load(&mut &data[..]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_old_format_asks_for_rebuild() {
+        let data = b"PECTB03\0";
+        let err = format!("{:#}", EqClassMap::load(&mut &data[..]).unwrap_err());
+        assert!(err.contains("PECTB03") && err.contains("PECTB04") && err.contains("rebuilt"), "{err}");
     }
 
     #[test]

@@ -337,7 +337,7 @@ impl ContigTable {
     ///
     /// Format:
     /// ```text
-    /// [magic: 8 bytes "PCTAB02\0"]
+    /// [magic: 8 bytes "PCTAB04\0"]
     /// [ref_len_bits: u64 LE]
     /// [num_ref_bits: u64 LE]
     /// [ctg_offsets: epserde EfSeq binary]
@@ -368,13 +368,7 @@ impl ContigTable {
         reader
             .read_exact(&mut magic)
             .context("failed to read contig table magic")?;
-        if magic != *CONTIG_TABLE_MAGIC {
-            bail!(
-                "invalid contig table magic: expected {:?}, got {:?}",
-                CONTIG_TABLE_MAGIC,
-                magic
-            );
-        }
+        super::check_table_magic("contig table", &magic, CONTIG_TABLE_MAGIC)?;
 
         let ref_len_bits = read_u64_le(reader).context("failed to read ref_len_bits")?;
         let num_ref_bits = read_u64_le(reader).context("failed to read num_ref_bits")?;
@@ -400,7 +394,7 @@ impl ContigTable {
     }
 }
 
-const CONTIG_TABLE_MAGIC: &[u8; 8] = b"PCTAB03\0";
+const CONTIG_TABLE_MAGIC: &[u8; 8] = b"PCTAB04\0";
 
 fn read_u64_le<R: Read>(reader: &mut R) -> std::io::Result<u64> {
     let mut buf = [0u8; 8];
@@ -1071,6 +1065,15 @@ mod tests {
                 assert_eq!(enc.orientation(a), enc.orientation(b));
             }
         }
+    }
+
+    #[test]
+    fn test_old_format_asks_for_rebuild() {
+        let data = b"PCTAB03\0";
+        let err = format!("{:#}", ContigTable::load(&mut &data[..]).unwrap_err());
+        assert!(err.contains("PCTAB03") && err.contains("PCTAB04") && err.contains("rebuilt"), "{err}");
+        let err = format!("{:#}", ContigTable::load(&mut &b"BADMAGIC"[..]).unwrap_err());
+        assert!(err.contains("invalid contig table magic"), "{err}");
     }
 
     #[test]

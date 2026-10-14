@@ -5,6 +5,20 @@ pre-1.0, a minor bump may carry breaking changes.
 
 ## [0.11.0] — unreleased
 
+### Breaking
+
+- **Index format break (sux 0.15 / PHastR)**: sshash-lib now uses sux 0.15's
+  `PHastR` as its MPHF (in place of `ph`'s PHast), and sux 0.15 moves to
+  epserde 0.13, whose serialized format is incompatible with 0.12. Indexes
+  must be rebuilt: the sshash `.ssi` fails with its format-version error, and
+  the contig table and EC table magics are bumped (`PCTAB03` → `PCTAB04`,
+  `PECTB03` → `PECTB04`) since both embed epserde `EfSeq`/`BitFieldVec`
+  data. An older contig or EC table now fails with an "unsupported ... format,
+  must be rebuilt" error instead of a raw magic mismatch. The `.tct` tiny
+  contig table has no epserde data and is unchanged.
+- Dependencies: sux 0.14 → 0.15.2, epserde 0.12.5 → 0.13.2, value-traits
+  0.2 → 0.3; `ph-temp` is no longer a dependency.
+
 ### Added
 
 - **Self-describing RAD v2 output.** Every mapping mode (scRNA, Flex /
@@ -24,6 +38,11 @@ pre-1.0, a minor bump may carry breaking changes.
 
 ### Changed
 
+- `piscem build` is faster and leaner: sshash streams the minimizers into a
+  single PHastR (offline, in `--tmp-dir`, for large references). Human
+  (32 threads): 149.6 s → 105.7 s, peak RSS 26.7 GB → 18.7 GB. Indexes are
+  byte-identical whatever `--threads` they are built with; mapping output and
+  speed are unchanged.
 - Bump `libradicl` (parity-test dev-dependency) 0.18 → 0.21. This does not
   affect emitted bytes — the RAD writer is self-contained and the shipping
   binary does not link libradicl (see #8) — it only exercises the parity
