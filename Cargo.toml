@@ -199,7 +199,3 @@ required-features = ["rapidgzip"]
 # already been acknowledged, briefly running past the thread budget (the
 # `paraseq_resize_safety` flake). Drop this once a paraseq release includes it.
 paraseq = { git = "https://github.com/rob-p/paraseq", branch = "release/paraseq-0.6.1-pool-fix" }
-# sshash-lib / tiny-dict 0.8.0 (COMBINE-lab/sshash-rs tag v0.8.0). Drop these
-# and use crates.io once 0.8.0 is published there.
-sshash-lib = { git = "https://github.com/COMBINE-lab/sshash-rs", tag = "v0.8.0" }
-tiny-dict = { git = "https://github.com/COMBINE-lab/sshash-rs", tag = "v0.8.0" }

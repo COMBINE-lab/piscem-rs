@@ -2239,7 +2239,8 @@ checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 [[package]]
 name = "sshash-lib"
 version = "0.8.0"
-source = "git+https://github.com/COMBINE-lab/sshash-rs?tag=v0.8.0#ae7a1915843e2cda1708a6ffbad113365aabd1bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9547b4612d43612c58c67185ee6596d4d8a9e9cb404d5cfbce7b16e8a70d97b3"
 dependencies = [
  "anyhow",
  "dsi-progress-logger",
@@ -2399,7 +2400,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys",
@@ -2500,7 +2501,8 @@ dependencies = [
 [[package]]
 name = "tiny-dict"
 version = "0.8.0"
-source = "git+https://github.com/COMBINE-lab/sshash-rs?tag=v0.8.0#ae7a1915843e2cda1708a6ffbad113365aabd1bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e17e72cd82578cb6661a9b3850cf2c002c24d80f31f6b32ea276c145eab1dc9"
 dependencies = [
  "anyhow",
  "hashbrown 0.17.1",
