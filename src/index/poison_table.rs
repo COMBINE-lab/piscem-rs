@@ -16,6 +16,7 @@ use ahash::RandomState;
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::sync::OnceLock;
 use tracing::info;
 
 use crate::mapping::kmer_value::CanonicalKmer;
@@ -37,6 +38,108 @@ fn fixed_hash_state() -> RandomState {
 
 /// Type alias for the poison k-mer hash map.
 type PoisonMap = HashMap<CanonicalKmer, u64, RandomState>;
+
+// ---------------------------------------------------------------------------
+// Read-side pre-filter
+// ---------------------------------------------------------------------------
+
+/// A blocked Bloom filter over the poison k-mers, keyed the way a read is
+/// scanned rather than the way the table is keyed.
+///
+/// Poison scanning visits every k-mer of every mapped read, and essentially
+/// every one of them is absent from the table: poison k-mers are only the
+/// decoy k-mers on present/absent edges (38 of them for the 10x Flex human
+/// `included=FALSE` probes). Answering each visit with a canonical k-mer
+/// (rolling a reverse-complement word, taking the min) and an ahash +
+/// SwissTable probe cost more than the rest of mapping put together.
+///
+/// So the filter is keyed by the *forward* k-mer word in the hit searcher's
+/// read encoding — base `i` of the window in bits `2i..2i+2`, `(b >> 1) & 3`
+/// per base (`A=0 C=1 T=2 G=3`) — and holds *both* orientations of
+/// every poison k-mer. A read scan then rolls one word per base and pays one
+/// multiply and one L1-resident load per k-mer. Only filter hits (real poison
+/// k-mers plus a small false-positive rate) need the canonical k-mer and the
+/// exact table query.
+///
+/// Each key sets two bits within one `u64` word; the filter is sized at ~16
+/// bits per inserted word, and at least 32 Kbit (4 KiB, L1-resident) so small
+/// tables get a negligible false-positive rate. It is derived from the keys and
+/// `k`, so it is built on first use and is not part of the serialized table.
+pub(crate) struct ReadKmerFilter {
+    words: Vec<u64>,
+    /// `64 - log2(words.len())`: shift that maps a hash to a word index.
+    word_shift: u32,
+    k: u32,
+}
+
+impl ReadKmerFilter {
+    const MIN_LOG2_WORDS: u32 = 9;
+    const BITS_PER_ENTRY: usize = 16;
+
+    fn build<'a>(keys: impl ExactSizeIterator<Item = &'a CanonicalKmer>, k: u32) -> Self {
+        assert!(
+            (1..=31).contains(&k),
+            "poison k-mers support 1 <= k <= 31, got {k}"
+        );
+        let n_entries = 2 * keys.len();
+        let n_words = (n_entries * Self::BITS_PER_ENTRY / 64)
+            .next_power_of_two()
+            .max(1 << Self::MIN_LOG2_WORDS);
+        let mut f = Self {
+            words: vec![0u64; n_words],
+            word_shift: 64 - n_words.trailing_zeros(),
+            k,
+        };
+        for &km in keys {
+            let (fw, rc) = Self::read_words_of(km, k);
+            for word in [fw, rc] {
+                let (w, bits) = f.slot(word);
+                f.words[w] |= bits;
+            }
+        }
+        f
+    }
+
+    /// The two read-encoding words a canonical k-mer can appear as.
+    ///
+    /// `km` is packed first-base-most-significant with `A=0 C=1 G=2 T=3`.
+    fn read_words_of(km: CanonicalKmer, k: u32) -> (u64, u64) {
+        // ACGT code -> read code (A=0 C=1 T=2 G=3): swap G and T.
+        let to_read = |c: u64| c ^ (c >> 1);
+        let v = km.as_u64();
+        let (mut fw, mut rc) = (0u64, 0u64);
+        for i in 0..k {
+            let c = (v >> (2 * (k - 1 - i))) & 3;
+            fw |= to_read(c) << (2 * i);
+            rc |= to_read(c ^ 3) << (2 * (k - 1 - i));
+        }
+        (fw, rc)
+    }
+
+    /// Word index and two-bit mask for a read-encoded k-mer word.
+    #[inline(always)]
+    fn slot(&self, word: u64) -> (usize, u64) {
+        // Multiplicative hashing: the high product bits depend on all of the
+        // (at most 62) input bits, so take the word index from the top and
+        // the two bit positions from just below it.
+        let h = word.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let w = (h >> self.word_shift) as usize;
+        let b1 = (h >> (self.word_shift - 6)) & 63;
+        let b2 = (h >> (self.word_shift - 12)) & 63;
+        (w, (1u64 << b1) | (1u64 << b2))
+    }
+
+    /// `false` means the k-mer whose read-encoded forward word is `word` is
+    /// definitely not a poison k-mer (in either orientation).
+    #[inline(always)]
+    pub(crate) fn may_contain(&self, word: u64) -> bool {
+        let (w, bits) = self.slot(word);
+        // SAFETY: `w < words.len()`: `h >> word_shift` keeps only the top
+        // log2(words.len()) bits of `h`.
+        let filter_word = unsafe { *self.words.get_unchecked(w) };
+        filter_word & bits == bits
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Occurrence types
@@ -90,6 +193,8 @@ pub struct PoisonTable {
     offsets: Vec<u32>,
     /// Flat array of poison k-mer occurrences.
     poison_occs: Vec<PoisonOcc>,
+    /// Read-side pre-filter, built on first use; see [`ReadKmerFilter`].
+    read_filter: OnceLock<ReadKmerFilter>,
 }
 
 impl PoisonTable {
@@ -121,6 +226,7 @@ impl PoisonTable {
 
         if occs.is_empty() {
             return Ok(Self {
+                read_filter: OnceLock::new(),
                 poison_map: HashMap::with_hasher(fixed_hash_state()),
                 offsets: Vec::new(),
                 poison_occs: Vec::new(),
@@ -174,6 +280,7 @@ impl PoisonTable {
         );
 
         Ok(Self {
+            read_filter: OnceLock::new(),
             poison_map,
             offsets,
             poison_occs,
@@ -255,6 +362,19 @@ impl PoisonTable {
             .map(|w| w[1] - w[0])
             .max()
             .unwrap_or(0)
+    }
+
+    /// The read-side pre-filter for k-mer length `k`, built on first use.
+    ///
+    /// An index has a single `k`, so the filter is built once and shared by
+    /// all mapping threads.
+    #[inline]
+    pub(crate) fn read_filter(&self, k: u32) -> &ReadKmerFilter {
+        let f = self
+            .read_filter
+            .get_or_init(|| ReadKmerFilter::build(self.poison_map.keys(), k));
+        debug_assert_eq!(f.k, k, "poison read filter requested for a different k");
+        f
     }
 
     // -----------------------------------------------------------------------
@@ -356,6 +476,7 @@ impl PoisonTable {
         }
 
         Ok(Self {
+            read_filter: OnceLock::new(),
             poison_map,
             offsets,
             poison_occs,

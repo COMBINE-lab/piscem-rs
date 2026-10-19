@@ -22,6 +22,22 @@ pre-1.0, a minor bump may carry breaking changes.
   canonically identical) through alevin-fry for scRNA/Flex/scATAC and through
   piscem-infer/salmon for bulk.
 
+### Performance
+
+- **Poison (decoy) filtering no longer slows mapping.** `scan_raw_hits` used
+  to canonicalize every k-mer of every read with hits and probe the poison
+  hash map with each one, even though nearly all of them miss. On 10x Flex
+  with the 499 `included=FALSE` human probes passed as decoys (38 poison
+  k-mers), that took mapping from 27.9 s to 43.1 s single-threaded (20M
+  reads). The poison table now carries a read-side pre-filter keyed by the
+  hit searcher's own forward k-mer encoding, holding both orientations of
+  each poison k-mer. The scan rolls one word per base and does one
+  L1-resident probe, and computes the canonical k-mer, interval and exact
+  query only for filter hits. Poison overhead on that dataset drops from
+  +55% to +9% (single thread), and wall time at 16 threads matches the
+  no-decoy run. Output is byte-identical. The filter is built in memory on
+  first use, so the index format is unchanged.
+
 ### Changed
 
 - Bump `libradicl` (parity-test dev-dependency) 0.18 → 0.21. This does not
