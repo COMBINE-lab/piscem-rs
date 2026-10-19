@@ -49,6 +49,14 @@ pre-1.0, a minor bump may carry breaking changes.
   reads each) RAD files are byte-identical to 0.11.0-dev at 1 and 4 threads
   and record-for-record identical at 16, with equal `map_info.json` counts and
   unmapped-barcode tallies.
+- paraseq is patched to rob-p/paraseq `release/paraseq-0.6.1-pool-fix`
+  (0.6.1 plus noamteyssier/paraseq#100) until a release includes that fix.
+  0.6.1's pool checked a worker's index and counted it live as two steps, so a
+  shrink landing in between, or a newly woken worker starting beside retirees,
+  let one batch per such worker run after the broker had seen the shrink take
+  effect: up to a few extra threads for one batch. Output was never affected;
+  `paraseq_resize_safety` failed about 1 run in 10; with the fix it passed
+  300 of 300 runs.
 - paraseq is used with `default-features = false`. Its defaults enable
   `niffler/default`, and from niffler 3.0.1 that links liblzma 0.4, which
   cannot be resolved alongside sshash-lib's needletail (liblzma 0.3).

@@ -193,3 +193,10 @@ required-features = ["rapidgzip"]
 name = "decode_parallelism"
 required-features = ["rapidgzip"]
 
+
+# paraseq 0.6.1 plus the pool admission fix offered upstream as
+# noamteyssier/paraseq#100: a worker could be counted live after a shrink had
+# already been acknowledged, briefly running past the thread budget (the
+# `paraseq_resize_safety` flake). Drop this once a paraseq release includes it.
+[patch.crates-io]
+paraseq = { git = "https://github.com/rob-p/paraseq", branch = "release/paraseq-0.6.1-pool-fix" }
