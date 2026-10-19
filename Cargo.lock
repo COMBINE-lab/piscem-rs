@@ -1674,9 +1674,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
-name = "paraseq"
-version = "0.6.1"
-source = "git+https://github.com/rob-p/paraseq?branch=release%2Fparaseq-0.6.1-pool-fix#3c347aab1be89c87e1d29b1dc00698a47d512598"
+name = "paraseq-temp"
+version = "0.6.2-pre.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b3557bbf59512a3e10d973bba6f26f6531bc3b7cf95381d07cdeb04cf65d4fd"
 dependencies = [
  "crossbeam-channel",
  "either",
@@ -1742,7 +1743,7 @@ dependencies = [
  "mem_dbg",
  "mimalloc",
  "niffler",
- "paraseq",
+ "paraseq-temp",
  "rapidgzip-core",
  "seq_geom_parser",
  "serde",
