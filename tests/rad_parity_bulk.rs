@@ -94,7 +94,7 @@ fn ensure_rust_index() -> Result<()> {
         build_ec_table: true,
         num_threads: 0,
         seed: 1,
-        single_mphf: false,
+        mphf_build: Default::default(),
         emit_tiny: None,
         tmp_dir: None,
         // Auto-detect, as a normal build does — these harnesses build real
