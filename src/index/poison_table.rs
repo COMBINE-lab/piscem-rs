@@ -14,7 +14,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use std::io::{BufWriter, Read, Write};
 use std::sync::OnceLock;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::mapping::kmer_value::CanonicalKmer;
 
@@ -290,6 +290,57 @@ const POISON_MAGIC_V1: &[u8; 8] = b"PPOIS01\0";
 /// array and overflow occurrences verbatim, so loading is a bulk read.
 const POISON_MAGIC_V2: &[u8; 8] = b"PPOIS02\0";
 
+/// Seed of layout attempt `attempt`; see [`PoisonTable::layout`]. Every
+/// writer tries them in this order, so a key set always gets the same seed
+/// (almost always attempt 0's) and the same file.
+const fn seed_for(attempt: u64) -> u64 {
+    (attempt + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// Seeds tried before placing without a probe budget. Never reached in
+/// practice: no seed of 6,200 tried on real decoy k-mers (40 to 3.7M keys)
+/// exceeded the budget, and a seed only fails on a key set built against it.
+const MAX_LAYOUT_ATTEMPTS: u64 = 16;
+
+/// murmur3's 64-bit finalizer: a bijection with full avalanche.
+#[inline(always)]
+fn fmix64(mut k: u64) -> u64 {
+    k ^= k >> 33;
+    k = k.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    k ^= k >> 33;
+    k = k.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    k ^ (k >> 33)
+}
+
+/// Home slot of `key` in a table of `num_slots` slots under `seed`:
+/// fastrange over `fmix64(key ^ seed)`.
+#[inline(always)]
+fn home_slot(key: u64, seed: u64, num_slots: usize) -> usize {
+    ((u128::from(fmix64(key ^ seed)) * num_slots as u128) >> 64) as usize
+}
+
+/// How much probing a layout may need before it is rejected.
+///
+/// With a random hash, linear probing at load 2/3 displaces a key by 1 slot on
+/// average (2 probes per hit, 5 per miss) and the longest displacement for
+/// 3.7M keys is ~100-150. The budget is 3x the mean plus slack for small
+/// tables, and a longest displacement of `64 + 16 log2(n)` (~410 at 3.7M
+/// keys), so a layout within it queries like a random hash's and a seed
+/// that clusters some keys is caught.
+struct ProbeBudget {
+    total: u64,
+    max: usize,
+}
+
+impl ProbeBudget {
+    fn for_keys(n: usize) -> Self {
+        Self {
+            total: 3 * n as u64 + 1024,
+            max: 64 + 16 * (usize::BITS - n.leading_zeros()) as usize,
+        }
+    }
+}
+
 /// One slot of the [`PoisonTable`] array.
 ///
 /// `key` is the canonical k-mer (< 2^62), with [`Slot::MULTI`] set when the
@@ -345,9 +396,18 @@ impl Slot {
 /// itself — so a typical query is one cache line, against four dependent
 /// accesses (hash control bytes, map slot, offsets, occurrences) for a hash
 /// map of offset indices. Slot placement depends only on the keys (inserted
-/// in sorted order), so the array is deterministic and serialized as is.
+/// in sorted order) and the hash seed, so the array is deterministic and
+/// serialized as is.
+///
+/// The seed is chosen per key set, not fixed: [`PoisonTable::layout`] keeps
+/// the first seed whose layout probes no more than a random hash would (see
+/// [`ProbeBudget`]), and loading re-checks that bound, rebuilding with a new
+/// seed if a file does not meet it. So no key set, however structured, can
+/// leave the table slow to build, load or query.
 pub struct PoisonTable {
     slots: Vec<Slot>,
+    /// Home-slot hash seed; see [`home_slot`].
+    seed: u64,
     /// Occurrences of the k-mers with more than one, grouped by k-mer.
     overflow: Vec<PoisonOcc>,
     num_kmers: usize,
@@ -414,14 +474,8 @@ impl PoisonTable {
             "Too many poison k-mer occurrences ({num_occs}) for u32 overflow indices"
         );
         let num_kmers = groups.len();
-        let cap = Self::capacity_for(num_kmers);
-        let mut table = Self {
-            slots: vec![Slot::EMPTY; cap],
-            overflow: Vec::new(),
-            num_kmers,
-            num_occs,
-            read_filter: OnceLock::new(),
-        };
+        let mut entries = Vec::with_capacity(num_kmers);
+        let mut overflow = Vec::new();
         let mut prev: Option<u64> = None;
         for (km, mut occs) in groups {
             let key = km.as_u64();
@@ -439,33 +493,143 @@ impl PoisonTable {
                     b: first.unitig_pos,
                 },
                 Some(second) => {
-                    let start = table.overflow.len();
-                    table.overflow.extend([first, second]);
-                    table.overflow.extend(occs);
+                    let start = overflow.len();
+                    overflow.extend([first, second]);
+                    overflow.extend(occs);
                     Slot {
                         key: key | Slot::MULTI,
                         a: start as u32,
-                        b: (table.overflow.len() - start) as u32,
+                        b: (overflow.len() - start) as u32,
                     }
                 }
             };
-            let mut i = table.home(key);
-            while table.slots[i] != Slot::EMPTY {
-                i = if i + 1 == cap { 0 } else { i + 1 };
-            }
-            table.slots[i] = slot;
+            entries.push(slot);
         }
-        let inline = table
+        let inline = entries.iter().filter(|s| s.key & Slot::MULTI == 0).count();
+        ensure!(
+            inline + overflow.len() == num_occs,
+            "poison table holds {} occurrences, expected {num_occs}",
+            inline + overflow.len()
+        );
+        let (slots, seed) = Self::layout(&entries);
+        Ok(Self {
+            slots,
+            seed,
+            overflow,
+            num_kmers,
+            num_occs,
+            read_filter: OnceLock::new(),
+        })
+    }
+
+    /// Place `entries` (distinct keys, in increasing k-mer order) under the
+    /// first seed of [`seed_for`]'s sequence whose layout stays within the
+    /// [`ProbeBudget`]. An attempt is abandoned as soon as it exceeds the
+    /// budget, so even a seed that sends every key to one slot costs O(n).
+    fn layout(entries: &[Slot]) -> (Vec<Slot>, u64) {
+        let budget = ProbeBudget::for_keys(entries.len());
+        for attempt in 0..MAX_LAYOUT_ATTEMPTS {
+            let seed = seed_for(attempt);
+            if let Some(slots) = Self::place(entries, seed, Some(&budget)) {
+                if attempt > 0 {
+                    info!(
+                        "[poison_table]: hash seed {attempt} of the sequence used; \
+                         earlier seeds clustered these {} k-mers",
+                        entries.len()
+                    );
+                }
+                return (slots, seed);
+            }
+        }
+        let seed = seed_for(MAX_LAYOUT_ATTEMPTS);
+        let slots = Self::place(entries, seed, None).expect("unbudgeted placement cannot fail");
+        (slots, seed)
+    }
+
+    /// Linear-probing insertion of `entries` in order, or `None` once the
+    /// layout exceeds `budget`.
+    fn place(entries: &[Slot], seed: u64, budget: Option<&ProbeBudget>) -> Option<Vec<Slot>> {
+        let cap = Self::capacity_for(entries.len());
+        let mut slots = vec![Slot::EMPTY; cap];
+        let mut total = 0u64;
+        for e in entries {
+            let mut i = home_slot(e.kmer(), seed, cap);
+            let mut d = 0usize;
+            while slots[i] != Slot::EMPTY {
+                i = if i + 1 == cap { 0 } else { i + 1 };
+                d += 1;
+                if budget.is_some_and(|b| d > b.max) {
+                    return None;
+                }
+            }
+            total += d as u64;
+            if budget.is_some_and(|b| total > b.total) {
+                return None;
+            }
+            slots[i] = *e;
+        }
+        Some(slots)
+    }
+
+    /// Check a loaded slot array: every key reachable from its home slot (else
+    /// the file is corrupt) and every overflow range in bounds. Returns
+    /// whether the layout is within the [`ProbeBudget`]. One linear pass, so
+    /// it costs O(slots) however badly the keys are placed.
+    fn check_layout(&self) -> Result<bool> {
+        let cap = self.slots.len();
+        let budget = ProbeBudget::for_keys(self.num_kmers);
+        let start = self
             .slots
             .iter()
-            .filter(|s| **s != Slot::EMPTY && s.key & Slot::MULTI == 0)
-            .count();
+            .position(|s| *s == Slot::EMPTY)
+            .context("corrupt poison table: no empty slot")?;
+        // `run`: occupied slots immediately before the current one. A key is
+        // reachable iff every slot from its home up to its own is occupied,
+        // i.e. iff its displacement is at most `run`.
+        let (mut run, mut total, mut max, mut n, mut inline) =
+            (0usize, 0u64, 0usize, 0usize, 0usize);
+        for j in 1..=cap {
+            let p = (start + j) % cap;
+            let s = &self.slots[p];
+            if *s == Slot::EMPTY {
+                run = 0;
+                continue;
+            }
+            let km = s.kmer();
+            ensure!(
+                km < 1 << 62,
+                "corrupt poison table: k-mer {km:#x} exceeds 62 bits"
+            );
+            let d = (p + cap - home_slot(km, self.seed, cap)) % cap;
+            ensure!(
+                d <= run,
+                "corrupt poison table: k-mer {km:#x} not reachable from its home slot"
+            );
+            if s.key & Slot::MULTI == 0 {
+                inline += 1;
+            } else {
+                ensure!(
+                    s.b >= 2 && (s.a as usize + s.b as usize) <= self.overflow.len(),
+                    "corrupt poison table: overflow range out of bounds"
+                );
+            }
+            total += d as u64;
+            max = max.max(d);
+            n += 1;
+            run += 1;
+        }
         ensure!(
-            inline + table.overflow.len() == num_occs,
-            "poison table holds {} occurrences, expected {num_occs}",
-            inline + table.overflow.len()
+            n == self.num_kmers,
+            "poison table holds {n} k-mers, header says {}",
+            self.num_kmers
         );
-        Ok(table)
+        ensure!(
+            inline + self.overflow.len() == self.num_occs,
+            "poison table holds {} occurrences, header says {}",
+            inline + self.overflow.len(),
+            self.num_occs
+        );
+        Ok(total <= budget.total && max <= budget.max)
     }
 
     /// Slot count for `n` keys: load factor at most 2/3, never full.
@@ -473,11 +637,10 @@ impl PoisonTable {
         (n + n / 2).max(n + 1).max(8)
     }
 
-    /// Home slot of `key`: fastrange over a multiplicative hash.
+    /// Home slot of `key` in this table.
     #[inline(always)]
     fn home(&self, key: u64) -> usize {
-        let h = (key ^ (key >> 31)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        ((u128::from(h) * self.slots.len() as u128) >> 64) as usize
+        home_slot(key, self.seed, self.slots.len())
     }
 
     #[inline]
@@ -602,25 +765,23 @@ impl PoisonTable {
     // Serialization
     // -----------------------------------------------------------------------
 
-    /// Serialize the poison table in the flat `PPOIS02` layout.
-    ///
-    /// Not yet the default: piscem-rs releases before this one cannot read
-    /// it, so [`PoisonTable::save`] still writes `PPOIS01`. `PPOIS02` is meant
-    /// to become the default in a release that breaks index compatibility
-    /// anyway (see `notes/poison-table-format.md`); it saves the load-time
-    /// table rebuild (~0.06 s for a 3.3M-k-mer genome decoy) and ~13% of the
-    /// file size.
+    /// Serialize the poison table in the flat `PPOIS02` layout (the
+    /// default since piscem-rs 0.11.0, whose indexes must be rebuilt anyway).
+    /// It saves the load-time table rebuild and ~13% of the file size against
+    /// `PPOIS01`, which [`PoisonTable::save_v1`] still writes. Releases before
+    /// 0.11.0 cannot read it.
     ///
     /// Format (all little-endian):
     /// ```text
     /// [magic: 8 bytes "PPOIS02\0"]
     /// [num_kmers: u64] [num_occs: u64] [num_slots: u64] [num_overflow: u64]
+    /// [seed: u64]
     /// [slots: num_slots × {key: u64, a: u32, b: u32}]
     /// [overflow: num_overflow × {unitig_id: u32, unitig_pos: u32}]
     /// ```
-    /// Slot positions follow from [`PoisonTable::home`]'s hash, which is
-    /// therefore part of the format.
-    pub fn save_v2<W: Write>(&self, writer: &mut W) -> Result<()> {
+    /// Slot positions follow from [`home_slot`] under `seed`; the hash
+    /// function is part of the format, the seed is per file.
+    pub fn save<W: Write>(&self, writer: &mut W) -> Result<()> {
         let mut w = BufWriter::new(writer);
         w.write_all(POISON_MAGIC_V2)?;
         for n in [
@@ -631,6 +792,7 @@ impl PoisonTable {
         ] {
             w.write_all(&(n as u64).to_le_bytes())?;
         }
+        w.write_all(&self.seed.to_le_bytes())?;
         for s in &self.slots {
             w.write_all(&s.to_le_bytes())?;
         }
@@ -642,9 +804,10 @@ impl PoisonTable {
         Ok(())
     }
 
-    /// Serialize the poison table (`PPOIS01`, the layout every piscem-rs
-    /// release reads). [`PoisonTable::load`] converts it into the flat
-    /// in-memory table; [`PoisonTable::save_v2`] writes that table directly.
+    /// Serialize the poison table in the original `PPOIS01` layout, which
+    /// every piscem-rs release reads (and C++ piscem writes).
+    /// [`PoisonTable::load`] converts it into the flat in-memory table;
+    /// [`PoisonTable::save`] writes that table directly.
     ///
     /// ```text
     /// [magic: 8 bytes "PPOIS01\0"]
@@ -655,7 +818,7 @@ impl PoisonTable {
     /// [poison_occs: num_occs × {unitig_id: u32 LE, unitig_pos: u32 LE}]
     /// [map_entries: num_kmers × {canonical_kmer: u64 LE, offset_idx: u64 LE}]
     /// ```
-    pub fn save<W: Write>(&self, writer: &mut W) -> Result<()> {
+    pub fn save_v1<W: Write>(&self, writer: &mut W) -> Result<()> {
         let mut keyed: Vec<&Slot> = self.slots.iter().filter(|s| **s != Slot::EMPTY).collect();
         keyed.sort_unstable_by_key(|s| s.kmer());
         let mut w = BufWriter::new(writer);
@@ -715,11 +878,13 @@ impl PoisonTable {
     }
 
     fn load_v2<R: Read>(r: &mut R) -> Result<Self> {
-        let mut header = [0u64; 4];
+        let mut header = [0u64; 5];
         for h in &mut header {
             *h = read_u64_le(r).context("failed to read poison table header")?;
         }
-        let [num_kmers, num_occs, num_slots, num_overflow] = header.map(|h| h as usize);
+        let seed = header[4];
+        let [num_kmers, num_occs, num_slots, num_overflow] =
+            [header[0], header[1], header[2], header[3]].map(|h| h as usize);
         ensure!(
             num_slots == Self::capacity_for(num_kmers) && num_overflow <= num_occs,
             "inconsistent poison table header ({num_kmers} k-mers, {num_occs} occurrences, \
@@ -729,8 +894,9 @@ impl PoisonTable {
             .context("failed to read poison slots")?;
         let overflow = read_records(r, num_overflow, PoisonOcc::from_le_bytes)
             .context("failed to read poison overflow occurrences")?;
-        let table = Self {
+        let mut table = Self {
             slots,
+            seed,
             overflow,
             num_kmers,
             num_occs,
@@ -738,23 +904,38 @@ impl PoisonTable {
         };
         // Every key must be findable from its home slot, and every overflow
         // range in bounds, or queries could miss or panic.
-        let mut n = 0usize;
-        for s in table.slots.iter().filter(|s| **s != Slot::EMPTY) {
-            n += 1;
+        if table.check_layout()? {
+            // Within the probe budget, so this pass is linear too. It catches
+            // duplicate keys, which `find` would resolve to the first copy.
+            for s in table.slots.iter().filter(|s| **s != Slot::EMPTY) {
+                ensure!(
+                    table.find(CanonicalKmer::new(s.kmer())) == Some(s),
+                    "corrupt poison table: duplicate k-mer {:#x}",
+                    s.kmer()
+                );
+            }
+        } else {
+            // Valid but clustered (not something `save` writes): lay the
+            // keys out again rather than query a slow table.
+            let mut entries: Vec<Slot> = table
+                .slots
+                .iter()
+                .copied()
+                .filter(|s| *s != Slot::EMPTY)
+                .collect();
+            entries.sort_unstable_by_key(|s| s.kmer());
             ensure!(
-                table.find(CanonicalKmer::new(s.kmer())) == Some(s),
-                "corrupt poison table: k-mer {:#x} not reachable from its home slot",
-                s.kmer()
+                entries.windows(2).all(|w| w[0].kmer() < w[1].kmer()),
+                "corrupt poison table: duplicate k-mers"
             );
-            ensure!(
-                s.key & Slot::MULTI == 0 || (s.a as usize + s.b as usize) <= table.overflow.len(),
-                "corrupt poison table: overflow range out of bounds"
+            let (slots, seed) = Self::layout(&entries);
+            warn!(
+                "poison table layout (seed {:#x}) exceeds the probe budget; re-laid out in memory",
+                table.seed
             );
+            table.slots = slots;
+            table.seed = seed;
         }
-        ensure!(
-            n == num_kmers,
-            "poison table holds {n} k-mers, header says {num_kmers}"
-        );
         Ok(table)
     }
 
@@ -941,38 +1122,167 @@ mod tests {
             assert_matches_model(&t, &model, 210, &format!("built n={n}"));
 
             let mut v2 = Vec::new();
-            t.save_v2(&mut v2).unwrap();
+            t.save(&mut v2).unwrap();
             let t2 = PoisonTable::load(&mut v2.as_slice()).unwrap();
             assert_matches_model(&t2, &model, 210, &format!("PPOIS02 n={n}"));
             assert_eq!(t2.max_poison_occ(), t.max_poison_occ());
             assert_eq!(t2.num_poison_occs(), t.num_poison_occs());
 
             let mut v1 = Vec::new();
-            t.save(&mut v1).unwrap();
+            t.save_v1(&mut v1).unwrap();
             let t1 = PoisonTable::load(&mut v1.as_slice()).unwrap();
             assert_matches_model(&t1, &model, 210, &format!("PPOIS01 n={n}"));
             // Saving is deterministic in both formats.
             let (mut v2b, mut v1b) = (Vec::new(), Vec::new());
-            t1.save_v2(&mut v2b).unwrap();
-            t2.save(&mut v1b).unwrap();
+            t1.save(&mut v2b).unwrap();
+            t2.save_v1(&mut v1b).unwrap();
             assert_eq!(v2b, v2, "PPOIS02 bytes n={n}");
             assert_eq!(v1b, v1, "PPOIS01 bytes n={n}");
         }
     }
 
     #[test]
-    fn test_default_save_writes_ppois01() {
+    fn test_default_save_writes_ppois02() {
         let occs = vec![LabeledPoisonOcc {
             canonical_kmer: CanonicalKmer::new(42),
             unitig_id: 3,
             unitig_pos: 9,
         }];
         let t = PoisonTable::build_from_occs(occs).unwrap();
-        let (mut v1, mut v2) = (Vec::new(), Vec::new());
-        t.save(&mut v1).unwrap();
-        t.save_v2(&mut v2).unwrap();
-        assert_eq!(&v1[..8], POISON_MAGIC_V1);
+        let (mut v2, mut v1) = (Vec::new(), Vec::new());
+        t.save(&mut v2).unwrap();
+        t.save_v1(&mut v1).unwrap();
         assert_eq!(&v2[..8], POISON_MAGIC_V2);
+        assert_eq!(&v1[..8], POISON_MAGIC_V1);
+    }
+
+    /// Inverse of [`fmix64`], to build key sets a given seed sends to one slot.
+    fn unfmix64(mut k: u64) -> u64 {
+        let inv = |a: u64| {
+            let mut x = a;
+            for _ in 0..6 {
+                x = x.wrapping_mul(2u64.wrapping_sub(a.wrapping_mul(x)));
+            }
+            x
+        };
+        k ^= k >> 33;
+        k = k.wrapping_mul(inv(0xc4ce_b9fe_1a85_ec53));
+        k ^= k >> 33;
+        k = k.wrapping_mul(inv(0xff51_afd7_ed55_8ccd));
+        k ^ (k >> 33)
+    }
+
+    /// `n` distinct 62-bit keys that all hash to slot 0 under `seed`.
+    fn colliding_keys(seed: u64, n: usize) -> Vec<u64> {
+        let keys: Vec<u64> = (1u64..)
+            .map(|i| unfmix64(i) ^ seed)
+            .filter(|&k| k < 1 << 62)
+            .take(n)
+            .collect();
+        for &k in &keys {
+            assert_eq!(fmix64(k ^ seed) >> 40, 0);
+        }
+        keys
+    }
+
+    /// Queries on a table built from `occs_of(keys)`, plus absent keys that
+    /// collide with them.
+    fn check_occs(t: &PoisonTable, keys: &[u64], absent: &[u64], what: &str) {
+        for (i, &k) in keys.iter().enumerate() {
+            let c = CanonicalKmer::new(k);
+            let u = i as u32;
+            assert!(t.key_exists(c), "{what}: key {i}");
+            assert!(t.key_occurs_in_unitig(c, u), "{what}: unitig {i}");
+            assert!(
+                !t.key_occurs_in_unitig(c, u + 1),
+                "{what}: other unitig {i}"
+            );
+            assert!(
+                t.key_occurs_in_unitig_between(c, u, 0, 0),
+                "{what}: pos 0 {i}"
+            );
+            assert_eq!(
+                t.key_occurs_in_unitig_between(c, u, 1, 1),
+                i % 3 == 0,
+                "{what}: pos 1 {i}"
+            );
+        }
+        for &k in absent {
+            assert!(
+                !t.key_exists(CanonicalKmer::new(k)),
+                "{what}: absent {k:#x}"
+            );
+        }
+    }
+
+    fn occs_of(keys: &[u64]) -> Vec<LabeledPoisonOcc> {
+        keys.iter()
+            .enumerate()
+            .flat_map(|(i, &k)| {
+                // every third k-mer gets a second occurrence
+                (0..1 + (i % 3 == 0) as u32).map(move |j| LabeledPoisonOcc {
+                    canonical_kmer: CanonicalKmer::new(k),
+                    unitig_id: i as u32,
+                    unitig_pos: j,
+                })
+            })
+            .collect()
+    }
+
+    /// A key set the first seed piles onto one slot (quadratic to build and
+    /// to query) is laid out under the next seed, deterministically, and
+    /// within the probe budget.
+    #[test]
+    fn test_clustering_key_set_gets_another_seed() {
+        let all = colliding_keys(seed_for(0), 5100);
+        let (keys, absent) = all.split_at(5000);
+        let occs = occs_of(keys);
+        let t = PoisonTable::build_from_occs(occs.clone()).unwrap();
+        assert_ne!(t.seed, seed_for(0));
+        assert!(t.check_layout().unwrap());
+        check_occs(&t, keys, absent, "reseeded");
+        // Same input, any order: same file.
+        let mut shuffled = occs;
+        shuffled.reverse();
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        t.save(&mut a).unwrap();
+        PoisonTable::build_from_occs(shuffled)
+            .unwrap()
+            .save(&mut b)
+            .unwrap();
+        assert_eq!(a, b);
+        let t2 = PoisonTable::load(&mut a.as_slice()).unwrap();
+        assert_eq!(t2.seed, t.seed);
+        check_occs(&t2, keys, absent, "reseeded, reloaded");
+    }
+
+    /// A valid `PPOIS02` file whose layout exceeds the probe budget (which
+    /// `save` never writes) is re-laid out on load, not rejected or used as is.
+    #[test]
+    fn test_clustered_file_is_relaid_on_load() {
+        let seed = seed_for(0);
+        let all = colliding_keys(seed, 3100);
+        let (keys, absent) = all.split_at(3000);
+        let mut t = PoisonTable::build_from_occs(occs_of(keys)).unwrap();
+        let mut entries: Vec<Slot> = t
+            .slots
+            .iter()
+            .copied()
+            .filter(|s| *s != Slot::EMPTY)
+            .collect();
+        entries.sort_unstable_by_key(|s| s.kmer());
+        t.slots = PoisonTable::place(&entries, seed, None).unwrap();
+        t.seed = seed;
+        assert!(
+            !t.check_layout().unwrap(),
+            "test layout should be clustered"
+        );
+        let mut bytes = Vec::new();
+        t.save(&mut bytes).unwrap();
+        let t2 = PoisonTable::load(&mut bytes.as_slice()).unwrap();
+        assert_ne!(t2.seed, seed);
+        assert!(t2.check_layout().unwrap());
+        check_occs(&t2, keys, absent, "re-laid out");
     }
 
     #[test]
@@ -986,10 +1296,10 @@ mod tests {
             .collect();
         let t = PoisonTable::build_from_occs(occs).unwrap();
         let mut v2 = Vec::new();
-        t.save_v2(&mut v2).unwrap();
+        t.save(&mut v2).unwrap();
         // Move a key out of its probe sequence: swap the first occupied slot's
         // key with an empty slot's far away.
-        let slot_bytes = &mut v2[8 + 32..];
+        let slot_bytes = &mut v2[8 + 40..];
         let occupied = (0..t.slots.len())
             .find(|&i| t.slots[i] != Slot::EMPTY)
             .unwrap();
@@ -1003,7 +1313,7 @@ mod tests {
         assert!(PoisonTable::load(&mut v2.as_slice()).is_err());
         // Truncation.
         let mut v2 = Vec::new();
-        t.save_v2(&mut v2).unwrap();
+        t.save(&mut v2).unwrap();
         v2.truncate(v2.len() - 3);
         assert!(PoisonTable::load(&mut v2.as_slice()).is_err());
     }
@@ -1020,7 +1330,7 @@ mod tests {
             let bytes = std::fs::read(path).unwrap();
             let t = PoisonTable::load(&mut bytes.as_slice()).unwrap();
             let mut out = Vec::new();
-            t.save(&mut out).unwrap();
+            t.save_v1(&mut out).unwrap();
             assert!(out == bytes, "{path}: PPOIS01 re-save differs");
             eprintln!(
                 "{path}: {} k-mers, {} occurrences, round-trips byte for byte",
