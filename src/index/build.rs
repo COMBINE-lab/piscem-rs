@@ -39,14 +39,15 @@ pub struct BuildConfig {
     pub num_threads: usize,
     /// Hash seed for the dictionary.
     pub seed: u64,
-    /// Use a single monolithic MPHF instead of partitioned.
-    pub single_mphf: bool,
+    /// How sshash builds the minimizer MPHF (see [`sshash_lib::MphfBuild`]).
+    pub mphf_build: sshash_lib::MphfBuild,
     /// Whether to emit TinyDictionary/TinyContigTable artifacts
     /// (`.tdct` + `.tct`). `Some(true)`/`Some(false)` forces the choice;
     /// `None` means "auto" — decide based on the canonical-k-mer count
     /// against [`crate::cli::AUTO_TINY_KMER_THRESHOLD`].
     pub emit_tiny: Option<bool>,
-    /// Directory sshash uses for its external minimizer-sort scratch files.
+    /// Directory sshash uses for its temporary files (external minimizer
+    /// sort, offline MPHF construction records).
     /// `None` keeps sshash's default (`sshash_tmp`, relative to the current
     /// working directory); `Some(dir)` redirects it so the caller controls the
     /// location and cleanup. The directory is created by sshash if absent.
@@ -164,7 +165,7 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid build configuration: {e}"))?;
     build_cfg.seed = config.seed;
     build_cfg.num_threads = config.num_threads;
-    build_cfg.partitioned_mphf = !config.single_mphf;
+    build_cfg.mphf_build = config.mphf_build;
     if let Some(dir) = &config.tmp_dir {
         build_cfg.tmp_dirname = dir.clone();
     }
@@ -806,7 +807,7 @@ mod tests {
             build_ec_table: true,
             num_threads: 0,
             seed: 1,
-            single_mphf: false,
+            mphf_build: Default::default(),
             emit_tiny: Some(false),
             tmp_dir: None,
             ram_limit_gib: None,

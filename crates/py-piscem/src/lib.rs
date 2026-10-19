@@ -895,7 +895,7 @@ impl PyReferenceIndex {
             build_ec_table: build_ec,
             num_threads: threads,
             seed: 1,
-            single_mphf: false,
+            mphf_build: Default::default(),
             emit_tiny: None,
             tmp_dir: None,
             ram_limit_gib: None,

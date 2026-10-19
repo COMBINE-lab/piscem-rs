@@ -5,8 +5,36 @@ pre-1.0, a minor bump may carry breaking changes.
 
 ## [0.11.0] — unreleased
 
+### Breaking
+
+- **Index format break (sshash-lib 0.8 / sux 0.15 / PHastR)**: sshash-lib 0.8
+  uses sux 0.15's `PHastR` as its MPHF (in place of `ph`'s PHast), and sux
+  0.15 moves to epserde 0.13, whose serialized format is incompatible with
+  0.12. Indexes must be rebuilt: the sshash `.ssi` fails with its
+  format-version error, and the contig table and EC table magics are bumped
+  (`PCTAB03` → `PCTAB04`, `PECTB03` → `PECTB04`) since both embed epserde
+  `EfSeq`/`BitFieldVec` data. An older contig or EC table now fails with an
+  "unsupported ... format, must be rebuilt" error instead of a raw magic
+  mismatch. The `.tct` tiny contig table has no epserde data and is
+  unchanged. Decoy `.poison` files are now written as `PPOIS02` (see Added),
+  which earlier releases cannot read; `PPOIS01` files are still read.
+- `BuildConfig::single_mphf` is replaced by `mphf_build:
+  sshash_lib::MphfBuild` (library users of `index::build`).
+- Dependencies: sshash-lib and tiny-dict 0.7.1 → 0.8.0, sux 0.14 → 0.15.2,
+  epserde 0.12.5 → 0.13.2, value-traits 0.2 → 0.3; `ph-temp` is no longer a
+  dependency.
+
 ### Added
 
+- `piscem build --mphf streaming|in-memory|partitioned` and
+  `--mphf-offline auto|always|never` choose how sshash builds the minimizer
+  MPHF (sshash-lib's `MphfBuild`). `streaming` (default) streams the sorted
+  minimizers into one function, offline in `--tmp-dir` from 2^24
+  minimizers on (`--mphf-offline` overrides); `in-memory` builds one
+  function from a copy of the minimizers (no temporary disk); `partitioned`
+  builds ~3M-key functions in parallel (no temporary disk, ~25% slower
+  minimizer lookups). The index format is the same. `--tmp-dir` now also
+  holds the offline MPHF construction records.
 - **Self-describing RAD v2 output.** Every mapping mode (scRNA, Flex /
   multi-barcode, scATAC, bulk) now emits the versioned RAD v2 format: an
   8-byte `RAD_FILE` magic, a `major.minor` spec version, a length-prefixed
@@ -61,6 +89,17 @@ pre-1.0, a minor bump may carry breaking changes.
 
 ### Changed
 
+- `piscem build` is faster and leaner (sshash-lib 0.8): sshash streams the
+  minimizers into a single PHastR (offline, in `--tmp-dir`, for large
+  references), no longer builds a minimizer → bucket hash map, packs its
+  build-time tuples and bucket records tighter, and encodes sequences in
+  parallel. Human (cuttlefish human-cr3, 32 threads): 149.6 s → 78.2 s, peak
+  RSS 26.7 GB → 7.4 GB (4 threads: 96 s, 7.1 GB). Indexes are byte-identical
+  whatever `--threads` they are built with; mapping output and speed are
+  unchanged.
+- `--single-mphf` is deprecated (hidden; same as `--mphf in-memory`, with a
+  warning). It had stopped having any effect once sshash streamed the
+  minimizer MPHF.
 - Bump `libradicl` (parity-test dev-dependency) 0.18 → 0.21. This does not
   affect emitted bytes — the RAD writer is self-contained and the shipping
   binary does not link libradicl (see #8) — it only exercises the parity
