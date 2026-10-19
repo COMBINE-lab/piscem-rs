@@ -11,8 +11,8 @@ license-file = "LICENSE"
 repository = "https://github.com/COMBINE-lab/sshash-rs"
 
 [workspace.dependencies]
-sshash-lib = { version = "0.7.1" }
-tiny-dict = { version = "0.7.1" }
+sshash-lib = { version = "0.8.0" }
+tiny-dict = { version = "0.8.0" }
 sux = { version = "0.15.2", features = ["epserde"] }
 anyhow = "1.0"
 thiserror = "2.0"
@@ -71,8 +71,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sshash-lib = "0.7.1"
-tiny-dict = "0.7.1"
+sshash-lib = "0.8.0"
+tiny-dict = "0.8.0"
 # Total physical memory, portably. Paired with getrlimit and cgroup reads in
 # `index::mem_budget`, which cover the limits `sysinfo` cannot see.
 # Held at 0.36: `sux` -> `dsi-progress-logger` pins `sysinfo = "0.36.1"`, which

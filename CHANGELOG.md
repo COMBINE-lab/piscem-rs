@@ -7,17 +7,19 @@ pre-1.0, a minor bump may carry breaking changes.
 
 ### Breaking
 
-- **Index format break (sux 0.15 / PHastR)**: sshash-lib now uses sux 0.15's
-  `PHastR` as its MPHF (in place of `ph`'s PHast), and sux 0.15 moves to
-  epserde 0.13, whose serialized format is incompatible with 0.12. Indexes
+- **Index format break (sshash-lib 0.8 / sux 0.15 / PHastR)**: sshash-lib 0.8
+  uses sux 0.15's `PHastR` as its MPHF (in place of `ph`'s PHast), and sux
+  0.15 moves to epserde 0.13, whose serialized format is incompatible with
+  0.12. Indexes
   must be rebuilt: the sshash `.ssi` fails with its format-version error, and
   the contig table and EC table magics are bumped (`PCTAB03` → `PCTAB04`,
   `PECTB03` → `PECTB04`) since both embed epserde `EfSeq`/`BitFieldVec`
   data. An older contig or EC table now fails with an "unsupported ... format,
   must be rebuilt" error instead of a raw magic mismatch. The `.tct` tiny
   contig table has no epserde data and is unchanged.
-- Dependencies: sux 0.14 → 0.15.2, epserde 0.12.5 → 0.13.2, value-traits
-  0.2 → 0.3; `ph-temp` is no longer a dependency.
+- Dependencies: sshash-lib and tiny-dict 0.7.1 → 0.8.0, sux 0.14 → 0.15.2,
+  epserde 0.12.5 → 0.13.2, value-traits 0.2 → 0.3; `ph-temp` is no longer a
+  dependency.
 
 ### Added
 
