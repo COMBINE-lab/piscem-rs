@@ -22,21 +22,38 @@ pre-1.0, a minor bump may carry breaking changes.
   canonically identical) through alevin-fry for scRNA/Flex/scATAC and through
   piscem-infer/salmon for bulk.
 
+- **Reader for a flat `PPOIS02` poison table format** (the in-memory table
+  written verbatim; ~13% smaller and loaded without a rebuild). Not written
+  by default yet — `.poison` files are still `PPOIS01`, so indexes stay
+  readable by earlier releases; `PoisonTable::save_v2` writes it. See
+  `notes/poison-table-format.md` for the layout and the plan to make it the
+  default in a release that breaks index compatibility anyway.
+
 ### Performance
 
 - **Poison (decoy) filtering no longer slows mapping.** `scan_raw_hits` used
   to canonicalize every k-mer of every read with hits and probe the poison
   hash map with each one, even though nearly all of them miss. On 10x Flex
-  with the 499 `included=FALSE` human probes passed as decoys (38 poison
-  k-mers), that took mapping from 27.9 s to 43.1 s single-threaded (20M
-  reads). The poison table now carries a read-side pre-filter keyed by the
-  hit searcher's own forward k-mer encoding, holding both orientations of
-  each poison k-mer. The scan rolls one word per base and does one
-  L1-resident probe, and computes the canonical k-mer, interval and exact
-  query only for filter hits. Poison overhead on that dataset drops from
-  +55% to +9% (single thread), and wall time at 16 threads matches the
-  no-decoy run. Output is byte-identical. The filter is built in memory on
-  first use, so the index format is unchanged.
+  with the 499 `included=FALSE` human probes as decoys (38 poison k-mers;
+  simpleaf's `--excluded-probes decoy` default), that took mapping from
+  27.9 s to 43.1 s single-threaded (20M reads). Now:
+  - a read-side pre-filter keyed by the hit searcher's own forward k-mer
+    encoding (both orientations of each poison k-mer) lets the scan roll one
+    word per base and probe once per k-mer;
+  - for small tables (up to a few thousand poison k-mers) the scan instead
+    tests a q-gram every `k - q + 1` bases against a bitmap of the poison
+    k-mers' q-grams (~10 tests per 150 bp read instead of 128 probes);
+  - only k-mers that pass either filter get the canonical k-mer, the
+    position-dependent query and the exact table lookup, so the verdict is
+    unchanged;
+  - the exact table is a flat open-addressing array with single occurrences
+    stored inline (one cache line per lookup instead of four dependent
+    accesses), canonicalized from the rolled word.
+
+  Flex decoy overhead: +55% → ~+2% single-threaded; 16-thread wall time
+  matches the no-decoy run. scRNA with a GRCh38 decoy (3.3M poison k-mers):
+  −10% cycles vs. 0.10, poison load time 0.23 s → 0.11 s, −34 MB peak RSS.
+  Output is byte-identical. The filters are built in memory on first use.
 
 ### Changed
 

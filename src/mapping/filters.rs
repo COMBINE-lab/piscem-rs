@@ -4,7 +4,7 @@
 //! is loaded, reads whose mapping intervals contain poison k-mers are
 //! discarded to improve specificity.
 
-use crate::index::poison_table::{PoisonTable, QgramSampler, ReadKmerFilter};
+use crate::index::poison_table::{PoisonTable, QgramSampler, ReadKmerFilter, reverse_groups};
 use crate::mapping::hit_searcher::SkippingStrategy;
 use crate::mapping::hits::FragmentEnd;
 use crate::mapping::kmer_value::CanonicalKmer;
@@ -15,6 +15,7 @@ use crate::mapping::projected_hits::ProjectedHits;
 // ---------------------------------------------------------------------------
 
 /// Encode a base as 2-bit value: A=0, C=1, G=2, T=3.
+#[cfg(test)]
 #[inline]
 fn base_to_bits(b: u8) -> Option<u64> {
     match b {
@@ -27,6 +28,7 @@ fn base_to_bits(b: u8) -> Option<u64> {
 }
 
 /// Complement of a 2-bit encoded base.
+#[cfg(test)]
 #[inline]
 fn complement_bits(b: u64) -> u64 {
     b ^ 3
@@ -87,7 +89,9 @@ fn is_low_complexity(kmer: u64, k: u32) -> bool {
     false
 }
 
-/// Iterator over canonical k-mers in a byte sequence.
+/// Iterator over canonical k-mers in a byte sequence: the original scan's
+/// k-mer source, kept for the test oracle.
+#[cfg(test)]
 pub(crate) struct CanonicalKmerIter<'a> {
     seq: &'a [u8],
     k: u32,
@@ -100,6 +104,7 @@ pub(crate) struct CanonicalKmerIter<'a> {
     valid_bases: u32,
 }
 
+#[cfg(test)]
 impl<'a> CanonicalKmerIter<'a> {
     pub(crate) fn new(seq: &'a [u8], k: u32) -> Self {
         let mask = if k >= 32 {
@@ -120,6 +125,7 @@ impl<'a> CanonicalKmerIter<'a> {
     }
 }
 
+#[cfg(test)]
 impl Iterator for CanonicalKmerIter<'_> {
     /// Returns `(canonical_kmer, forward_kmer, read_position)`.
     ///
@@ -286,7 +292,7 @@ fn scan_rolling(
     for (pos, &b) in seq[ku - 1..].iter().enumerate() {
         fw = roll(fw, b);
         if filter.may_contain(fw)
-            && candidate_is_poisoned(ptab, &seq[pos..pos + ku], pos, k, raw_hits, strat)
+            && candidate_is_poisoned(ptab, &seq[pos..pos + ku], fw, pos, k, raw_hits, strat)
         {
             return true;
         }
@@ -353,7 +359,9 @@ fn scan_sampled(
                     .iter()
                     .enumerate()
                     .fold(0u64, |w, (i, &b)| w | (read_code(b) << (2 * i)));
-                if word == pattern && candidate_is_poisoned(ptab, window, pos, k, raw_hits, strat) {
+                if word == pattern
+                    && candidate_is_poisoned(ptab, window, word, pos, k, raw_hits, strat)
+                {
                     return true;
                 }
             }
@@ -361,6 +369,28 @@ fn scan_sampled(
         sample += sampler.stride;
     }
     false
+}
+
+/// The canonical k-mer and forward k-mer (both ACGT, first base most
+/// significant — the poison table's key layout) of the window `kmer`,
+/// given its read-encoded forward word `word`; `None` if the window holds a
+/// non-ACGT byte (which the read encoding silently maps to some base).
+#[inline]
+fn canonical_from_read_word(kmer: &[u8], word: u64, k: u32) -> Option<(CanonicalKmer, u64)> {
+    if !kmer
+        .iter()
+        .all(|b| matches!(b, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't'))
+    {
+        return None;
+    }
+    // Read code -> ACGT code per 2-bit group (swap G and T); base i stays in
+    // bits 2i..2i+2. Reversing the group order puts the first base on top;
+    // complementing (`^ 0b11` per group) without reversing is the reverse
+    // complement in that same first-base-on-top layout.
+    let c = word ^ ((word >> 1) & 0x5555_5555_5555_5555);
+    let fw = reverse_groups(c, k);
+    let rc = c ^ ((1u64 << (2 * k)) - 1);
+    Some((CanonicalKmer::new(fw.min(rc)), fw))
 }
 
 /// The exact poison verdict for the k-mer `kmer` at read position `pos`.
@@ -383,13 +413,14 @@ fn scan_sampled(
 fn candidate_is_poisoned(
     ptab: &PoisonTable,
     kmer: &[u8],
+    word: u64,
     pos: usize,
     k: u32,
     raw_hits: &[(i32, ProjectedHits<'_>)],
     strat: SkippingStrategy,
 ) -> bool {
     // `None` iff the window holds a non-ACGT byte: no such k-mer exists.
-    let Some((canonical, fw_kmer, _)) = CanonicalKmerIter::new(kmer, k).next() else {
+    let Some((canonical, fw_kmer)) = canonical_from_read_word(kmer, word, k) else {
         return false;
     };
 
@@ -636,6 +667,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_canonical_from_read_word_matches_iter() {
+        let mut rng = Rng(0x6c62_272e_07bb_0142);
+        for k in [1u32, 5, 19, 23, 31] {
+            for _ in 0..3000 {
+                let window: Vec<u8> = (0..k)
+                    .map(|_| match rng.below(40) {
+                        0 => b'N',
+                        _ => b"ACGTacgt"[rng.below(8) as usize],
+                    })
+                    .collect();
+                let word = window
+                    .iter()
+                    .enumerate()
+                    .fold(0u64, |w, (i, &b)| w | (read_code(b) << (2 * i)));
+                let expected = CanonicalKmerIter::new(&window, k)
+                    .next()
+                    .map(|(c, fw, _)| (c, fw));
+                assert_eq!(
+                    canonical_from_read_word(&window, word, k),
+                    expected,
+                    "k={k} window={}",
+                    String::from_utf8_lossy(&window)
+                );
+            }
+        }
+    }
+
     /// `scan_raw_hits` must give the original scan's verdict on every input.
     #[test]
     fn test_scan_raw_hits_matches_reference() {
@@ -718,7 +777,7 @@ mod tests {
             let filter = pt.read_filter(k);
             let patterns: Vec<u64> = pt
                 .keys()
-                .flat_map(|&km| {
+                .flat_map(|km| {
                     let (fw, rc) = ReadKmerFilter::read_words_of(km, k);
                     [fw, rc]
                 })
