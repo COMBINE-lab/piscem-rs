@@ -43,6 +43,101 @@ type PoisonMap = HashMap<CanonicalKmer, u64, RandomState>;
 // Read-side pre-filter
 // ---------------------------------------------------------------------------
 
+/// Reverse the order of the low `k` 2-bit groups of `x` (`k <= 32`).
+#[inline]
+fn reverse_groups(x: u64, k: u32) -> u64 {
+    let r = x.reverse_bits();
+    // Full bit reversal also swaps the two bits inside each group; undo that.
+    let r = ((r & 0x5555_5555_5555_5555) << 1) | ((r >> 1) & 0x5555_5555_5555_5555);
+    r >> (64 - 2 * k)
+}
+
+/// Sub-linear candidate enumeration for small poison tables.
+///
+/// The read filter costs a roll and a probe at every one of the read's
+/// k-mer positions. For a small table — e.g. the 38 poison k-mers of 10x
+/// Flex `included=FALSE` probes — that per-position work is most of the
+/// remaining poison cost, and almost all of it answers "no".
+///
+/// Instead, sample the read's q-grams (read encoding, `q < k`) at every
+/// `stride = k - q + 1` positions. Any k-mer window `[p, p + k)` contains a
+/// sampled q-gram, at the sample `s` with `p <= s <= p + k - q` (an interval
+/// of `stride` positions), and if the window is a poison k-mer (in either
+/// orientation) that q-gram is the pattern's q-gram at offset `s - p`. So a
+/// bitmap over all patterns' q-grams, plus the list of `(pattern, offset)`
+/// pairs behind each one, enumerates every window that could be poison; each
+/// is then confirmed by a word compare and the exact query. A 150 bp read
+/// needs ~10 bitmap tests instead of 128 probes.
+///
+/// Only built when the bitmap is sparse — the worst-case q-gram density is at
+/// most [`QgramSampler::MAX_DENSITY`] for some `q <= 12` (a bitmap of at most
+/// 2 MiB) — i.e. for up to a few thousand poison k-mers.
+pub(crate) struct QgramSampler {
+    pub(crate) q: u32,
+    pub(crate) stride: usize,
+    /// Bit `c` set iff some pattern has q-gram code `c`.
+    bitmap: Vec<u64>,
+    /// `(q-gram code, offset in pattern, pattern word)`, sorted by code.
+    entries: Vec<(u32, u32, u64)>,
+}
+
+impl QgramSampler {
+    const MIN_Q: u32 = 8;
+    const MAX_Q: u32 = 12;
+    /// Worst-case fraction of bitmap bits set.
+    const MAX_DENSITY: usize = 128;
+
+    /// The q-gram length to sample with for `n_patterns` read-encoded
+    /// patterns (both orientations of each poison k-mer), if any is sparse
+    /// enough to pay off.
+    fn q_for(n_patterns: usize, k: u32) -> Option<u32> {
+        (Self::MIN_Q.min(k)..=Self::MAX_Q.min(k)).find(|&q| {
+            let max_codes = n_patterns * (k - q + 1) as usize;
+            max_codes * Self::MAX_DENSITY <= 1usize << (2 * q)
+        })
+    }
+
+    /// Build a sampler with q-gram length `q` (`1 <= q <= k`).
+    pub(crate) fn build(words: &[u64], k: u32, q: u32) -> Self {
+        assert!(1 <= q && q <= k && q <= 16, "q-gram length {q} for k={k}");
+        let qmask = (1u64 << (2 * q)) - 1;
+        let mut entries: Vec<(u32, u32, u64)> = words
+            .iter()
+            .flat_map(|&w| (0..=k - q).map(move |off| (((w >> (2 * off)) & qmask) as u32, off, w)))
+            .collect();
+        entries.sort_unstable();
+        entries.dedup();
+        let mut bitmap = vec![0u64; ((1usize << (2 * q)) / 64).max(1)];
+        for &(code, _, _) in &entries {
+            bitmap[code as usize / 64] |= 1u64 << (code % 64);
+        }
+        Self {
+            q,
+            stride: (k - q + 1) as usize,
+            bitmap,
+            entries,
+        }
+    }
+
+    /// Whether some pattern has q-gram `code`.
+    #[inline(always)]
+    pub(crate) fn has(&self, code: u32) -> bool {
+        // SAFETY: `code < 4^q` and the bitmap holds `4^q` bits.
+        let w = unsafe { *self.bitmap.get_unchecked(code as usize / 64) };
+        (w >> (code % 64)) & 1 != 0
+    }
+
+    /// The `(offset, pattern word)` pairs behind q-gram `code`.
+    #[inline]
+    pub(crate) fn patterns_with(&self, code: u32) -> impl Iterator<Item = (u32, u64)> + '_ {
+        let start = self.entries.partition_point(|e| e.0 < code);
+        self.entries[start..]
+            .iter()
+            .take_while(move |e| e.0 == code)
+            .map(|e| (e.1, e.2))
+    }
+}
+
 /// A blocked Bloom filter over the poison k-mers, keyed the way a read is
 /// scanned rather than the way the table is keyed.
 ///
@@ -67,6 +162,8 @@ type PoisonMap = HashMap<CanonicalKmer, u64, RandomState>;
 /// `k`, so it is built on first use and is not part of the serialized table.
 pub(crate) struct ReadKmerFilter {
     words: Vec<u64>,
+    /// Sampled-scan alternative for small tables; see [`QgramSampler`].
+    pub(crate) sampler: Option<QgramSampler>,
     /// `64 - log2(words.len())`: shift that maps a hash to a word index.
     word_shift: u32,
     k: u32,
@@ -76,26 +173,50 @@ impl ReadKmerFilter {
     const MIN_LOG2_WORDS: u32 = 9;
     const BITS_PER_ENTRY: usize = 16;
 
-    fn build<'a>(keys: impl ExactSizeIterator<Item = &'a CanonicalKmer>, k: u32) -> Self {
+    /// Build the filter (and, for small tables, the sampler) over the
+    /// `n_keys` canonical poison k-mers produced by `keys`.
+    fn build(keys: impl Iterator<Item = CanonicalKmer> + Clone, n_keys: usize, k: u32) -> Self {
         assert!(
             (1..=31).contains(&k),
             "poison k-mers support 1 <= k <= 31, got {k}"
         );
-        let n_entries = 2 * keys.len();
-        let n_words = (n_entries * Self::BITS_PER_ENTRY / 64)
+        let words = |keys: &mut dyn Iterator<Item = CanonicalKmer>| -> Vec<u64> {
+            keys.flat_map(|km| {
+                let (fw, rc) = Self::read_words_of(km, k);
+                [fw, rc]
+            })
+            .collect()
+        };
+        let n_patterns = 2 * n_keys;
+        // Only small tables get a sampler, so only they materialize the
+        // pattern list; a genome-scale table streams straight into the filter.
+        let sampler = QgramSampler::q_for(n_patterns, k)
+            .map(|q| QgramSampler::build(&words(&mut keys.clone()), k, q));
+        let n_words = (n_patterns * Self::BITS_PER_ENTRY / 64)
             .next_power_of_two()
             .max(1 << Self::MIN_LOG2_WORDS);
         let mut f = Self {
             words: vec![0u64; n_words],
+            sampler,
             word_shift: 64 - n_words.trailing_zeros(),
             k,
         };
-        for &km in keys {
+        for km in keys {
             let (fw, rc) = Self::read_words_of(km, k);
             for word in [fw, rc] {
                 let (w, bits) = f.slot(word);
                 f.words[w] |= bits;
             }
+        }
+        match &f.sampler {
+            Some(s) => info!(
+                "poison scan: sampled ({n_patterns} patterns, q={}, stride {})",
+                s.q, s.stride
+            ),
+            None => info!(
+                "poison scan: every position ({n_patterns} patterns, {} KiB filter)",
+                n_words * 8 / 1024
+            ),
         }
         f
     }
@@ -103,16 +224,17 @@ impl ReadKmerFilter {
     /// The two read-encoding words a canonical k-mer can appear as.
     ///
     /// `km` is packed first-base-most-significant with `A=0 C=1 G=2 T=3`.
-    fn read_words_of(km: CanonicalKmer, k: u32) -> (u64, u64) {
-        // ACGT code -> read code (A=0 C=1 T=2 G=3): swap G and T.
-        let to_read = |c: u64| c ^ (c >> 1);
+    /// Register-only, so building the filter for millions of keys is cheap.
+    pub(crate) fn read_words_of(km: CanonicalKmer, k: u32) -> (u64, u64) {
+        // ACGT code -> read code (A=0 C=1 T=2 G=3) in every 2-bit group: swap
+        // G and T by flipping the low bit wherever the high bit is set.
         let v = km.as_u64();
-        let (mut fw, mut rc) = (0u64, 0u64);
-        for i in 0..k {
-            let c = (v >> (2 * (k - 1 - i))) & 3;
-            fw |= to_read(c) << (2 * i);
-            rc |= to_read(c ^ 3) << (2 * (k - 1 - i));
-        }
+        let v = v ^ ((v >> 1) & 0x5555_5555_5555_5555);
+        // Read as LSB-first, `v` spells the k-mer backwards; reversing the
+        // group order gives the forward word. Backwards *and* complemented
+        // (read-encoding complement is `^ 0b10`) is the reverse complement.
+        let fw = reverse_groups(v, k);
+        let rc = v ^ (0xAAAA_AAAA_AAAA_AAAA >> (64 - 2 * k));
         (fw, rc)
     }
 
@@ -370,9 +492,9 @@ impl PoisonTable {
     /// all mapping threads.
     #[inline]
     pub(crate) fn read_filter(&self, k: u32) -> &ReadKmerFilter {
-        let f = self
-            .read_filter
-            .get_or_init(|| ReadKmerFilter::build(self.poison_map.keys(), k));
+        let f = self.read_filter.get_or_init(|| {
+            ReadKmerFilter::build(self.poison_map.keys().copied(), self.poison_map.len(), k)
+        });
         debug_assert_eq!(f.k, k, "poison read filter requested for a different k");
         f
     }
@@ -529,6 +651,38 @@ fn read_u32_le<R: Read>(reader: &mut R) -> std::io::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-base construction `read_words_of` replaced, kept as its oracle.
+    fn read_words_of_per_base(km: CanonicalKmer, k: u32) -> (u64, u64) {
+        let to_read = |c: u64| c ^ (c >> 1);
+        let v = km.as_u64();
+        let (mut fw, mut rc) = (0u64, 0u64);
+        for i in 0..k {
+            let c = (v >> (2 * (k - 1 - i))) & 3;
+            fw |= to_read(c) << (2 * i);
+            rc |= to_read(c ^ 3) << (2 * (k - 1 - i));
+        }
+        (fw, rc)
+    }
+
+    #[test]
+    fn test_read_words_of_matches_per_base() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        for k in 1..=31u32 {
+            let mask = (1u64 << (2 * k)) - 1;
+            for _ in 0..2000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let km = CanonicalKmer::new(x & mask);
+                assert_eq!(
+                    ReadKmerFilter::read_words_of(km, k),
+                    read_words_of_per_base(km, k),
+                    "k={k} km={km:?}"
+                );
+            }
+        }
+    }
 
     fn make_test_occs() -> Vec<LabeledPoisonOcc> {
         vec![

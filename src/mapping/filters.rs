@@ -4,7 +4,7 @@
 //! is loaded, reads whose mapping intervals contain poison k-mers are
 //! discarded to improve specificity.
 
-use crate::index::poison_table::PoisonTable;
+use crate::index::poison_table::{PoisonTable, QgramSampler, ReadKmerFilter};
 use crate::mapping::hit_searcher::SkippingStrategy;
 use crate::mapping::hits::FragmentEnd;
 use crate::mapping::kmer_value::CanonicalKmer;
@@ -248,31 +248,119 @@ impl<'a> PoisonState<'a> {
             return false;
         }
 
-        let ku = k as usize;
-        if seq.len() < ku {
+        if seq.len() < k as usize {
             return false;
         }
         let filter = ptab.read_filter(k);
+        match &filter.sampler {
+            Some(sampler) => scan_sampled(ptab, sampler, seq, k, raw_hits, strat),
+            None => scan_rolling(ptab, filter, seq, k, raw_hits, strat),
+        }
+    }
+}
 
-        // Roll the forward k-mer word exactly as the hit searcher's
-        // `ReadKmerIter` does — `(b >> 1) & 3` per base, base i of the window
-        // in bits 2i..2i+2, so each new base enters at the top. That encoding
-        // is branchless and maps non-ACGT bytes to *some* base, so windows
-        // spanning an `N` are rejected in the cold path instead
-        // (`candidate_is_poisoned` re-reads the window and skips them).
-        let top_shift = 2 * (k - 1);
-        let roll = |fw: u64, b: u8| (fw >> 2) | (u64::from((b >> 1) & 3) << top_shift);
-        let mut fw = seq[..ku - 1].iter().fold(0u64, |fw, &b| roll(fw, b));
-        for (pos, &b) in seq[ku - 1..].iter().enumerate() {
-            fw = roll(fw, b);
-            if filter.may_contain(fw)
-                && candidate_is_poisoned(ptab, &seq[pos..pos + ku], pos, k, raw_hits, strat)
-            {
-                return true;
+/// Encode a read base as the hit searcher's `ReadKmerIter` does: `(b >> 1) &
+/// 3` (A=0 C=1 T=2 G=3). Branchless; non-ACGT bytes map to *some* base, so a
+/// window spanning one is rejected later by `candidate_is_poisoned`, which
+/// re-reads the window.
+#[inline(always)]
+fn read_code(b: u8) -> u64 {
+    u64::from((b >> 1) & 3)
+}
+
+/// Every-position scan: roll the forward k-mer word (base i of the window in
+/// bits 2i..2i+2, each new base entering at the top) and probe the read
+/// filter at each window. Used for tables too large for [`scan_sampled`].
+fn scan_rolling(
+    ptab: &PoisonTable,
+    filter: &ReadKmerFilter,
+    seq: &[u8],
+    k: u32,
+    raw_hits: &[(i32, ProjectedHits<'_>)],
+    strat: SkippingStrategy,
+) -> bool {
+    let ku = k as usize;
+    let top_shift = 2 * (k - 1);
+    let roll = |fw: u64, b: u8| (fw >> 2) | (read_code(b) << top_shift);
+    let mut fw = seq[..ku - 1].iter().fold(0u64, |fw, &b| roll(fw, b));
+    for (pos, &b) in seq[ku - 1..].iter().enumerate() {
+        fw = roll(fw, b);
+        if filter.may_contain(fw)
+            && candidate_is_poisoned(ptab, &seq[pos..pos + ku], pos, k, raw_hits, strat)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Read-encoded code of the `q <= 16` bases at `seq[at..at + q]`, base i in
+/// bits 2i..2i+2 (bits above 2q may be set; callers mask).
+#[inline(always)]
+fn qgram_code(seq: &[u8], at: usize, q: usize) -> u64 {
+    // Pack the 2-bit codes of 8 bytes (byte j's code in bits 8j..8j+2) into
+    // 16 bits, base j at bits 2j..2j+2.
+    #[inline(always)]
+    fn pack8(bytes: u64) -> u64 {
+        let c = (bytes >> 1) & 0x0303_0303_0303_0303;
+        let c = (c | (c >> 6)) & 0x000F_000F_000F_000F;
+        let c = (c | (c >> 12)) & 0x0000_00FF_0000_00FF;
+        (c | (c >> 24)) & 0xFFFF
+    }
+    let load8 = |i: usize| u64::from_le_bytes(seq[i..i + 8].try_into().unwrap());
+    if q <= 8 && at + 8 <= seq.len() {
+        pack8(load8(at))
+    } else if at + 16 <= seq.len() {
+        pack8(load8(at)) | (pack8(load8(at + 8)) << 16)
+    } else {
+        seq[at..at + q]
+            .iter()
+            .enumerate()
+            .fold(0u64, |c, (i, &b)| c | (read_code(b) << (2 * i)))
+    }
+}
+
+/// Sampled scan for small tables: test the q-gram at every `stride`-th read
+/// position against the sampler's bitmap, and confirm only the windows a hit
+/// implicates. Every window that is a poison k-mer contains a sampled q-gram
+/// that the bitmap knows (see [`QgramSampler`]), so the verdict matches
+/// [`scan_rolling`]'s.
+fn scan_sampled(
+    ptab: &PoisonTable,
+    sampler: &QgramSampler,
+    seq: &[u8],
+    k: u32,
+    raw_hits: &[(i32, ProjectedHits<'_>)],
+    strat: SkippingStrategy,
+) -> bool {
+    let ku = k as usize;
+    let q = sampler.q as usize;
+    let n_kmers = seq.len() + 1 - ku;
+    let qmask = (1u64 << (2 * q)) - 1;
+    let mut sample = 0usize;
+    while sample + q <= seq.len() {
+        let code = (qgram_code(seq, sample, q) & qmask) as u32;
+        if sampler.has(code) {
+            for (offset, pattern) in sampler.patterns_with(code) {
+                let Some(pos) = sample.checked_sub(offset as usize) else {
+                    continue;
+                };
+                if pos >= n_kmers {
+                    continue;
+                }
+                let window = &seq[pos..pos + ku];
+                let word = window
+                    .iter()
+                    .enumerate()
+                    .fold(0u64, |w, (i, &b)| w | (read_code(b) << (2 * i)));
+                if word == pattern && candidate_is_poisoned(ptab, window, pos, k, raw_hits, strat) {
+                    return true;
+                }
             }
         }
-        false
+        sample += sampler.stride;
     }
+    false
 }
 
 /// The exact poison verdict for the k-mer `kmer` at read position `pos`.
@@ -530,6 +618,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_qgram_code_matches_per_base() {
+        let mut rng = Rng(0x51_7cc1_b727_220a);
+        let seq: Vec<u8> = (0..97)
+            .map(|_| b"ACGTacgtN"[rng.below(9) as usize])
+            .collect();
+        for q in 1..=16usize {
+            let mask = (1u64 << (2 * q)) - 1;
+            for at in 0..=seq.len() - q {
+                let expected = seq[at..at + q]
+                    .iter()
+                    .enumerate()
+                    .fold(0u64, |c, (i, &b)| c | (read_code(b) << (2 * i)));
+                assert_eq!(qgram_code(&seq, at, q) & mask, expected, "q={q} at={at}");
+            }
+        }
+    }
+
     /// `scan_raw_hits` must give the original scan's verdict on every input.
     #[test]
     fn test_scan_raw_hits_matches_reference() {
@@ -607,15 +713,33 @@ mod tests {
                 .collect();
 
             let ps = PoisonState::new(Some(&pt));
+            // Each scan path on its own, the sampled one at a random q-gram
+            // length (q = 1..=min(k, 8): every stride down to 1 for small k).
+            let filter = pt.read_filter(k);
+            let patterns: Vec<u64> = pt
+                .keys()
+                .flat_map(|&km| {
+                    let (fw, rc) = ReadKmerFilter::read_words_of(km, k);
+                    [fw, rc]
+                })
+                .collect();
+            let sampler =
+                QgramSampler::build(&patterns, k, 1 + rng.below(u64::from(k.min(8))) as u32);
             for strat in [SkippingStrategy::Permissive, SkippingStrategy::Strict] {
                 let expected = reference_scan(&pt, &read, k, &raw_hits, strat);
+                let ctx = || {
+                    format!(
+                        "trial {trial} k={k} q={} strat={strat:?} read={}",
+                        sampler.q,
+                        String::from_utf8_lossy(&read)
+                    )
+                };
                 let got = ps.scan_raw_hits(&read, k, &raw_hits, strat);
-                assert_eq!(
-                    got,
-                    expected,
-                    "trial {trial} k={k} strat={strat:?} read={}",
-                    String::from_utf8_lossy(&read)
-                );
+                assert_eq!(got, expected, "dispatch: {}", ctx());
+                let got = scan_rolling(&pt, filter, &read, k, &raw_hits, strat);
+                assert_eq!(got, expected, "rolling: {}", ctx());
+                let got = scan_sampled(&pt, &sampler, &read, k, &raw_hits, strat);
+                assert_eq!(got, expected, "sampled: {}", ctx());
                 n_poisoned += usize::from(expected);
             }
         }
