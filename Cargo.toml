@@ -97,20 +97,29 @@ hashbrown = "0.17"
 dashmap = "6"
 smallvec = "1.13"
 crossbeam = "0.8"
-# TEMPORARY: a republication of paraseq's released 0.5.0 plus the resizable
-# worker pool offered upstream as noamteyssier/paraseq#78 (a fixed spawn set
-# with parking; worker count bounded by construction).
+# The official crate again (it replaced the `paraseq-temp` republication).
+# paraseq 0.5.1 first shipped the resizable worker pool from
+# noamteyssier/paraseq#78 behind a `pool` feature; since 0.6.0 it is always on
+# and backs every parallel entry point. `ThreadPool` is what lets the mapping
+# thread count change mid-run, so a bad decode/map split can be corrected
+# rather than merely avoided.
 #
-# `ThreadPool` is what lets the mapping thread count change mid-run, so a bad
-# decode/map split can be corrected rather than merely avoided. `paraseq` is
-# the official crate -- move back to it once the pool lands there. The lib
-# target is still named `paraseq`, so every `use paraseq::...` is unaffected.
-paraseq-temp = "0.5.0-pre.2"
-niffler = { version = "3", default-features = false, features = [
-  "gz",
-  "bz2",
-  "zstd",
-] }
+# Default features are off on purpose: piscem opens and decompresses its own
+# inputs (niffler below, or rapidgzip) and hands paraseq plain readers, so it
+# needs none of paraseq's optional features. paraseq's defaults would also turn
+# on `niffler/default`, and with it niffler >= 3.0.1's `lzma` feature, which
+# links liblzma 0.4 -- unresolvable next to sshash-lib's needletail 0.7, which
+# links liblzma 0.3 (only one crate may link the native `lzma`).
+paraseq = { version = "0.6.1", default-features = false }
+# niffler with its *default* features: exactly the set piscem has always been
+# built with, since paraseq-temp's defaults enabled `niffler/default` and
+# features unify. The old `default-features = false` list here was inert, and
+# is wrong on its own: niffler 3.0.0's `bz2` does not enable a bzip2 backend
+# (only `bzip2/default` does, via niffler's defaults), so it fails to compile
+# once paraseq stops supplying them. Defaults also keep .xz input working.
+# While needletail (via sshash-lib) links liblzma 0.3 this resolves to niffler
+# 3.0.0, since 3.0.1's `lzma` moved to liblzma 0.4.
+niffler = "3"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 indicatif = "0.18"
 
@@ -184,3 +193,10 @@ required-features = ["rapidgzip"]
 name = "decode_parallelism"
 required-features = ["rapidgzip"]
 
+
+# paraseq 0.6.1 plus the pool admission fix offered upstream as
+# noamteyssier/paraseq#100: a worker could be counted live after a shrink had
+# already been acknowledged, briefly running past the thread budget (the
+# `paraseq_resize_safety` flake). Drop this once a paraseq release includes it.
+[patch.crates-io]
+paraseq = { git = "https://github.com/rob-p/paraseq", branch = "release/paraseq-0.6.1-pool-fix" }

@@ -66,6 +66,44 @@ pre-1.0, a minor bump may carry breaking changes.
   binary does not link libradicl (see #8) — it only exercises the parity
   tests against the current reader.
 
+### Dependencies
+
+- **`paraseq` 0.6.1 replaces `paraseq-temp` 0.5.0-pre.2** — back on the
+  official crate. The resizable worker pool from noamteyssier/paraseq#78
+  first shipped in paraseq 0.5.1 (behind a `pool` feature); since 0.6.0 it is
+  always on and is the only implementation behind every parallel entry point.
+  Its `ThreadPool` and worker loop are the code paraseq-temp carried, unchanged
+  apart from doc comments and the `ProcessError` → `Error` merge, so the thread
+  broker drives exactly the same pool; the `Collection` batching (readers per
+  batch, share per reader) is the same arithmetic in one consolidated helper.
+  No piscem source changes were needed. Other 0.6 changes that reach piscem:
+  SIMD record-boundary scanning (faster parsing, identical records), and CRLF
+  line endings — a `\r` before `\n` is no longer read as part of the
+  sequence. CRLF FASTQ previously mapped the same reads, but each read was one
+  base longer, which moved the reported positions of about half the records;
+  it now maps exactly like the LF file. For LF input mapping output is
+  unchanged: on a synthetic index (scRNA Chromium v3, bulk PE and SE, 200 k
+  reads each) RAD files are byte-identical to 0.11.0-dev at 1 and 4 threads
+  and record-for-record identical at 16, with equal `map_info.json` counts and
+  unmapped-barcode tallies.
+- paraseq is patched to rob-p/paraseq `release/paraseq-0.6.1-pool-fix`
+  (0.6.1 plus noamteyssier/paraseq#100) until a release includes that fix.
+  0.6.1's pool checked a worker's index and counted it live as two steps, so a
+  shrink landing in between, or a newly woken worker starting beside retirees,
+  let one batch per such worker run after the broker had seen the shrink take
+  effect: up to a few extra threads for one batch. Output was never affected;
+  `paraseq_resize_safety` failed about 1 run in 10; with the fix it passed
+  300 of 300 runs.
+- paraseq is used with `default-features = false`. Its defaults enable
+  `niffler/default`, and from niffler 3.0.1 that links liblzma 0.4, which
+  cannot be resolved alongside sshash-lib's needletail (liblzma 0.3).
+- `niffler` now uses its default features explicitly. That is the set piscem
+  was always built with — paraseq-temp's defaults switched them on through
+  feature unification, which made the old `default-features = false` list
+  inert — so .xz/.bz2/.zst input keeps working. On its own that list would no
+  longer build: niffler 3.0.0's `bz2` feature does not enable a bzip2 backend.
+  niffler stays at 3.0.0 while needletail links liblzma 0.3.
+
 ## [0.10.0] — 2026-08-30
 
 ### Breaking
