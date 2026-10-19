@@ -22,12 +22,16 @@ pre-1.0, a minor bump may carry breaking changes.
   canonically identical) through alevin-fry for scRNA/Flex/scATAC and through
   piscem-infer/salmon for bulk.
 
-- **Reader for a flat `PPOIS02` poison table format** (the in-memory table
-  written verbatim; ~13% smaller and loaded without a rebuild). Not written
-  by default yet — `.poison` files are still `PPOIS01`, so indexes stay
-  readable by earlier releases; `PoisonTable::save_v2` writes it. See
-  `notes/poison-table-format.md` for the layout and the plan to make it the
-  default in a release that breaks index compatibility anyway.
+- **`.poison` files are written as `PPOIS02`**, a flat format holding the
+  in-memory table verbatim: 13% smaller (GRCh38 decoy, 3.76M k-mers:
+  106.9 MB → 93.1 MB) and loaded without a rebuild (0.14 s → 0.08 s).
+  Earlier releases cannot read it, but this release already requires indexes
+  to be rebuilt. `PPOIS01` files are still read; `PoisonTable::save_v1`
+  still writes them, byte-identical to earlier releases' files. The table's
+  hash seed is stored in the file and chosen per key set: a seed whose layout
+  probes more than a random hash's would is skipped at build time, and such a
+  layout in a file is re-laid out on load, so no key set can make the table
+  slow to build, load or query. See `notes/poison-table-format.md`.
 
 ### Performance
 
