@@ -1,10 +1,23 @@
 //! Parity smoke tests.
 //!
 //! These tests validate that RAD file headers are well-formed when written
-//! by our RAD writer and that we can read them back.
+//! by our RAD writer and that libradicl (alevin-fry's reader) reads them back.
 
+use libradicl::header::RadPrelude;
 use paraseq::Record;
 use piscem_rs::io::rad::{write_rad_header_atac, write_rad_header_bulk, write_rad_header_sc};
+
+/// Parse a header we wrote back with libradicl's reader (the one alevin-fry
+/// uses) and check the fields every RAD mode shares.
+fn read_back(buf: &[u8], is_paired: u8, names: &[&str]) -> RadPrelude {
+    let p = RadPrelude::from_bytes(&mut &buf[..]).expect("libradicl rejects our header");
+    assert_eq!(&buf[..8], b"RAD_FILE", "RAD v2 magic");
+    assert_eq!(p.hdr.version.major(), 2);
+    assert_eq!(p.hdr.is_paired, is_paired);
+    assert_eq!(p.hdr.ref_count, names.len() as u64);
+    assert_eq!(p.hdr.ref_names, names);
+    p
+}
 
 #[test]
 fn parity_smoke_bulk_header_roundtrip() {
@@ -14,8 +27,7 @@ fn parity_smoke_bulk_header_roundtrip() {
     let chunk_off = write_rad_header_bulk(&mut buf, true, 3, &names, &ref_lens).unwrap();
 
     assert!(chunk_off > 0);
-    assert!(buf.len() > 20); // sanity: header should be non-trivial
-    assert_eq!(buf[0], 1); // is_paired
+    read_back(&buf, 1, &names);
 }
 
 #[test]
@@ -26,7 +38,8 @@ fn parity_smoke_sc_header_roundtrip() {
 
     assert!(chunk_off > 0);
     assert!(rlen_off.is_some());
-    assert_eq!(buf[0], 0); // is_paired=false for SC
+    let p = read_back(&buf, 0, &names);
+    assert_eq!(p.read_tags.tags.len(), 2); // barcode, UMI
 }
 
 #[test]
@@ -37,7 +50,7 @@ fn parity_smoke_atac_header_roundtrip() {
     let chunk_off = write_rad_header_atac(&mut buf, 1, &names, &ref_lens, 16).unwrap();
 
     assert!(chunk_off > 0);
-    assert_eq!(buf[0], 1); // is_paired=true for ATAC
+    read_back(&buf, 1, &names);
 }
 
 /// Integration test: load Rust-format index and verify k-mer lookup works.
@@ -62,11 +75,10 @@ fn integration_rust_index_lookup() {
 
     let dict = index.dict();
     eprintln!(
-        "Index loaded: k={}, {} refs, {} strings, canonical={}",
+        "Index loaded: k={}, {} refs, {} strings",
         index.k(),
         index.num_refs(),
-        dict.num_strings(),
-        dict.canonical()
+        dict.num_strings()
     );
 
     // Read first read from test FASTQ
