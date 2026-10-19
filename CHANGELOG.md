@@ -68,8 +68,9 @@ pre-1.0, a minor bump may carry breaking changes.
 
 ### Dependencies
 
-- **`paraseq` 0.6.1 replaces `paraseq-temp` 0.5.0-pre.2** — back on the
-  official crate. The resizable worker pool from noamteyssier/paraseq#78
+- **paraseq 0.6.1 replaces 0.5.0**, through `paraseq-temp` 0.6.2-pre.1
+  (0.6.1 plus a pool fix; see below) in place of `paraseq-temp` 0.5.0-pre.2.
+  The resizable worker pool from noamteyssier/paraseq#78
   first shipped in paraseq 0.5.1 (behind a `pool` feature); since 0.6.0 it is
   always on and is the only implementation behind every parallel entry point.
   Its `ThreadPool` and worker loop are the code paraseq-temp carried, unchanged
@@ -86,9 +87,10 @@ pre-1.0, a minor bump may carry breaking changes.
   reads each) RAD files are byte-identical to 0.11.0-dev at 1 and 4 threads
   and record-for-record identical at 16, with equal `map_info.json` counts and
   unmapped-barcode tallies.
-- paraseq is patched to rob-p/paraseq `release/paraseq-0.6.1-pool-fix`
-  (0.6.1 plus noamteyssier/paraseq#100) until a release includes that fix.
-  0.6.1's pool checked a worker's index and counted it live as two steps, so a
+- `paraseq-temp` 0.6.2-pre.1 is upstream 0.6.1 plus
+  noamteyssier/paraseq#100, published from rob-p/paraseq until a paraseq
+  release includes that fix (its library is still named `paraseq`, so
+  switching back is a one-line dependency change). 0.6.1's pool checked a worker's index and counted it live as two steps, so a
   shrink landing in between, or a newly woken worker starting beside retirees,
   let one batch per such worker run after the broker had seen the shrink take
   effect: up to a few extra threads for one batch. Output was never affected;
