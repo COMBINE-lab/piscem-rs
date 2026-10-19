@@ -6,9 +6,9 @@ exclude = ["sshash-rs", "scripts/hb-vs-phast"]
 edition = "2024"
 rust-version = "1.91"
 version = "0.5.0"
-authors = ["SSHash Contributors"]
+authors = ["piscem-rs Contributors"]
 license-file = "LICENSE"
-repository = "https://github.com/COMBINE-lab/sshash-rs"
+repository = "https://github.com/COMBINE-lab/piscem-rs"
 
 [workspace.dependencies]
 sshash-lib = { version = "0.8.0" }

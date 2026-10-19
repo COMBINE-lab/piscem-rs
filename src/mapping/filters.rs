@@ -237,7 +237,7 @@ impl<'a> PoisonState<'a> {
     /// the OR over k-mers, and which phase (and interval) a k-mer falls in
     /// depends only on its read position, so it is computed here only for
     /// k-mers that pass the table's read-side pre-filter; see
-    /// [`candidate_is_poisoned`].
+    /// `candidate_is_poisoned`.
     pub fn scan_raw_hits(
         &self,
         seq: &[u8],

@@ -399,9 +399,9 @@ impl Slot {
 /// in sorted order) and the hash seed, so the array is deterministic and
 /// serialized as is.
 ///
-/// The seed is chosen per key set, not fixed: [`PoisonTable::layout`] keeps
+/// The seed is chosen per key set, not fixed: `PoisonTable::layout` keeps
 /// the first seed whose layout probes no more than a random hash would (see
-/// [`ProbeBudget`]), and loading re-checks that bound, rebuilding with a new
+/// `ProbeBudget`), and loading re-checks that bound, rebuilding with a new
 /// seed if a file does not meet it. So no key set, however structured, can
 /// leave the table slow to build, load or query.
 pub struct PoisonTable {
@@ -779,7 +779,7 @@ impl PoisonTable {
     /// [slots: num_slots × {key: u64, a: u32, b: u32}]
     /// [overflow: num_overflow × {unitig_id: u32, unitig_pos: u32}]
     /// ```
-    /// Slot positions follow from [`home_slot`] under `seed`; the hash
+    /// Slot positions follow from `home_slot` under `seed`; the hash
     /// function is part of the format, the seed is per file.
     pub fn save<W: Write>(&self, writer: &mut W) -> Result<()> {
         let mut w = BufWriter::new(writer);

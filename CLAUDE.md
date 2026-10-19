@@ -12,7 +12,7 @@ The full implementation plan with C++ → Rust type mappings, architectural note
 
 - **Phase 0**: Project bootstrap with CLI skeleton and parity harness scaffolding
 - **Phase 1A–1E: Index data structures + build pipeline** — ContigTable (EF offsets + packed entries), RefInfo, ReferenceIndex, EqClassMap, end-to-end build from cuttlefish output
-- **Phase 2: PoisonTable** — `AHashMap<CanonicalKmer, u64>` with fixed-seed ahash, serialization (`PPOIS01\0`), query methods
+- **Phase 2: PoisonTable** — flat open-addressing table (seeded `fmix64` home slot, probe-budget-checked), serialization (`PPOIS02\0` written; `PPOIS01\0` still read), query methods
 - **Phase 3: Mapping core** — ProjectedHits, PiscemStreamingQuery (sshash-rs wrapper + unitig-end cache), HitSearcher (PERMISSIVE/STRICT modes)
 - **Phase 4: Mapping infrastructure** — `map_read<K, S>()` kernel, MappingCache, SketchHitInfo trait, RadWriter, Protocol trait
 - **Phase 5: Protocol implementations + CLI** — Bulk/scRNA/scATAC mapping CLIs, ChromiumProtocol, custom geometry parser
@@ -81,8 +81,8 @@ Key optimizations applied:
 7. **UnitigEndCache is scATAC-only**: Bulk and scRNA pass `None` to avoid DashMap overhead
 6. **Succinct data structure crates**: `sux` 0.12 git main (with epserde feature), NOT `cseq` or `sucds`
 7. **Test data**: Pre-built C++ indices expected in `test_data/` directory
-8. **libradicl**: Use git dependency to `develop` branch for RAD comparison
-9. **sshash-rs dependency**: Git dependency (`branch = "main"`) in Cargo.toml. Local checkout at `./sshash-rs/` is gitignored and used automatically by Cargo for development.
+8. **libradicl**: crates.io dev-dependency (`libradicl` 0.21, `parity-test` feature) for RAD comparison
+9. **sshash-rs dependency**: `sshash-lib`/`tiny-dict` from crates.io (0.8). For development against a local checkout, add a `[patch.crates-io]` path override locally (don't commit it); `./sshash-rs/` is gitignored.
 
 ## Threading Architecture
 

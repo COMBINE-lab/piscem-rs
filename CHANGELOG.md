@@ -3,7 +3,7 @@
 Notable changes to `piscem-rs`. Versions follow [Semantic Versioning](https://semver.org);
 pre-1.0, a minor bump may carry breaking changes.
 
-## [0.11.0] — unreleased
+## [0.11.0] — 2026-10-19
 
 ### Breaking
 
@@ -18,11 +18,16 @@ pre-1.0, a minor bump may carry breaking changes.
   mismatch. The `.tct` tiny contig table has no epserde data and is
   unchanged. Decoy `.poison` files are now written as `PPOIS02` (see Added),
   which earlier releases cannot read; `PPOIS01` files are still read.
-- `BuildConfig::single_mphf` is replaced by `mphf_build:
-  sshash_lib::MphfBuild` (library users of `index::build`).
-- Dependencies: sshash-lib and tiny-dict 0.7.1 → 0.8.0, sux 0.14 → 0.15.2,
-  epserde 0.12.5 → 0.13.2, value-traits 0.2 → 0.3; `ph-temp` is no longer a
-  dependency.
+- **RAD output is v2** (see Added): it needs a v2-aware reader, i.e. one
+  built on `libradicl` ≥ 0.20. No released alevin-fry can read it yet
+  (0.18.3 uses libradicl 0.19), nor piscem-infer 0.6.0; use the alevin-fry
+  and piscem-infer releases that follow this one, and keep pipelines
+  (simpleaf, bioconda) on piscem 0.10 until those are available.
+- Library API: `BuildConfig::single_mphf` is replaced by `mphf_build:
+  sshash_lib::MphfBuild` (users of `index::build`). `PoisonTable::keys()`
+  yields `CanonicalKmer` by value instead of `&CanonicalKmer`, and
+  `PoisonTable::save` writes `PPOIS02`; the previous writer is
+  `PoisonTable::save_v1`.
 
 ### Added
 
@@ -49,7 +54,6 @@ pre-1.0, a minor bump may carry breaking changes.
   end-to-end (records byte-identical to the legacy header; quantification
   canonically identical) through alevin-fry for scRNA/Flex/scATAC and through
   piscem-infer/salmon for bulk.
-
 - **`.poison` files are written as `PPOIS02`**, a flat format holding the
   in-memory table verbatim: 13% smaller (GRCh38 decoy, 3.76M k-mers:
   106.9 MB → 93.1 MB) and loaded without a rebuild (0.14 s → 0.08 s).
@@ -107,6 +111,9 @@ pre-1.0, a minor bump may carry breaking changes.
 
 ### Dependencies
 
+- sshash-lib and tiny-dict 0.7.1 → 0.8.0, sux 0.14 → 0.15.2, epserde
+  0.12.5 → 0.13.2, value-traits 0.2 → 0.3; `ph-temp` is no longer a
+  dependency (see Breaking for the index format).
 - **paraseq 0.6.1 replaces 0.5.0**, through `paraseq-temp` 0.6.2-pre.1
   (0.6.1 plus a pool fix; see below) in place of `paraseq-temp` 0.5.0-pre.2.
   The resizable worker pool from noamteyssier/paraseq#78
@@ -181,7 +188,7 @@ pre-1.0, a minor bump may carry breaking changes.
   `--dict sshash` and the tiny path can therefore differ in *which* indexes
   they accept.
 
-## [0.9.2] — unreleased
+## [0.9.2] — 2026-08-10
 
 ### Changed
 
