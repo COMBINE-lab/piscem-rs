@@ -15,6 +15,14 @@ cd crates/py-piscem
 maturin develop --release
 ```
 
+## Index compatibility
+
+Version 0.4 is built on piscem-rs 0.11, which changed the index format.
+Indexes built with piscem-rs 0.10 or earlier (or piscem 0.3 and earlier from
+PyPI) must be rebuilt; loading one fails with a "must be rebuilt" error.
+Decoy `.poison` files are now written in a newer format (`PPOIS02`) that
+older releases cannot read.
+
 ## Quick start
 
 ```python
