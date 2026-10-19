@@ -16,7 +16,8 @@ pre-1.0, a minor bump may carry breaking changes.
   `EfSeq`/`BitFieldVec` data. An older contig or EC table now fails with an
   "unsupported ... format, must be rebuilt" error instead of a raw magic
   mismatch. The `.tct` tiny contig table has no epserde data and is
-  unchanged.
+  unchanged. Decoy `.poison` files are now written as `PPOIS02` (see Added),
+  which earlier releases cannot read; `PPOIS01` files are still read.
 - `BuildConfig::single_mphf` is replaced by `mphf_build:
   sshash_lib::MphfBuild` (library users of `index::build`).
 - Dependencies: sshash-lib and tiny-dict 0.7.1 → 0.8.0, sux 0.14 → 0.15.2,
@@ -49,6 +50,43 @@ pre-1.0, a minor bump may carry breaking changes.
   canonically identical) through alevin-fry for scRNA/Flex/scATAC and through
   piscem-infer/salmon for bulk.
 
+- **`.poison` files are written as `PPOIS02`**, a flat format holding the
+  in-memory table verbatim: 13% smaller (GRCh38 decoy, 3.76M k-mers:
+  106.9 MB → 93.1 MB) and loaded without a rebuild (0.14 s → 0.08 s).
+  Earlier releases cannot read it, but this release already requires indexes
+  to be rebuilt. `PPOIS01` files are still read; `PoisonTable::save_v1`
+  still writes them, byte-identical to earlier releases' files. The table's
+  hash seed is stored in the file and chosen per key set: a seed whose layout
+  probes more than a random hash's would is skipped at build time, and such a
+  layout in a file is re-laid out on load, so no key set can make the table
+  slow to build, load or query. See `notes/poison-table-format.md`.
+
+### Performance
+
+- **Poison (decoy) filtering no longer slows mapping.** `scan_raw_hits` used
+  to canonicalize every k-mer of every read with hits and probe the poison
+  hash map with each one, even though nearly all of them miss. On 10x Flex
+  with the 499 `included=FALSE` human probes as decoys (38 poison k-mers;
+  simpleaf's `--excluded-probes decoy` default), that took mapping from
+  27.9 s to 43.1 s single-threaded (20M reads). Now:
+  - a read-side pre-filter keyed by the hit searcher's own forward k-mer
+    encoding (both orientations of each poison k-mer) lets the scan roll one
+    word per base and probe once per k-mer;
+  - for small tables (up to a few thousand poison k-mers) the scan instead
+    tests a q-gram every `k - q + 1` bases against a bitmap of the poison
+    k-mers' q-grams (~10 tests per 150 bp read instead of 128 probes);
+  - only k-mers that pass either filter get the canonical k-mer, the
+    position-dependent query and the exact table lookup, so the verdict is
+    unchanged;
+  - the exact table is a flat open-addressing array with single occurrences
+    stored inline (one cache line per lookup instead of four dependent
+    accesses), canonicalized from the rolled word.
+
+  Flex decoy overhead: +55% → ~+2% single-threaded; 16-thread wall time
+  matches the no-decoy run. scRNA with a GRCh38 decoy (3.3M poison k-mers):
+  −10% cycles vs. 0.10, poison load time 0.23 s → 0.11 s, −34 MB peak RSS.
+  Output is byte-identical. The filters are built in memory on first use.
+
 ### Changed
 
 - `piscem build` is faster and leaner (sshash-lib 0.8): sshash streams the
@@ -66,6 +104,44 @@ pre-1.0, a minor bump may carry breaking changes.
   affect emitted bytes — the RAD writer is self-contained and the shipping
   binary does not link libradicl (see #8) — it only exercises the parity
   tests against the current reader.
+
+### Dependencies
+
+- **`paraseq` 0.6.1 replaces `paraseq-temp` 0.5.0-pre.2** — back on the
+  official crate. The resizable worker pool from noamteyssier/paraseq#78
+  first shipped in paraseq 0.5.1 (behind a `pool` feature); since 0.6.0 it is
+  always on and is the only implementation behind every parallel entry point.
+  Its `ThreadPool` and worker loop are the code paraseq-temp carried, unchanged
+  apart from doc comments and the `ProcessError` → `Error` merge, so the thread
+  broker drives exactly the same pool; the `Collection` batching (readers per
+  batch, share per reader) is the same arithmetic in one consolidated helper.
+  No piscem source changes were needed. Other 0.6 changes that reach piscem:
+  SIMD record-boundary scanning (faster parsing, identical records), and CRLF
+  line endings — a `\r` before `\n` is no longer read as part of the
+  sequence. CRLF FASTQ previously mapped the same reads, but each read was one
+  base longer, which moved the reported positions of about half the records;
+  it now maps exactly like the LF file. For LF input mapping output is
+  unchanged: on a synthetic index (scRNA Chromium v3, bulk PE and SE, 200 k
+  reads each) RAD files are byte-identical to 0.11.0-dev at 1 and 4 threads
+  and record-for-record identical at 16, with equal `map_info.json` counts and
+  unmapped-barcode tallies.
+- paraseq is patched to rob-p/paraseq `release/paraseq-0.6.1-pool-fix`
+  (0.6.1 plus noamteyssier/paraseq#100) until a release includes that fix.
+  0.6.1's pool checked a worker's index and counted it live as two steps, so a
+  shrink landing in between, or a newly woken worker starting beside retirees,
+  let one batch per such worker run after the broker had seen the shrink take
+  effect: up to a few extra threads for one batch. Output was never affected;
+  `paraseq_resize_safety` failed about 1 run in 10; with the fix it passed
+  300 of 300 runs.
+- paraseq is used with `default-features = false`. Its defaults enable
+  `niffler/default`, and from niffler 3.0.1 that links liblzma 0.4, which
+  cannot be resolved alongside sshash-lib's needletail (liblzma 0.3).
+- `niffler` now uses its default features explicitly. That is the set piscem
+  was always built with — paraseq-temp's defaults switched them on through
+  feature unification, which made the old `default-features = false` list
+  inert — so .xz/.bz2/.zst input keeps working. On its own that list would no
+  longer build: niffler 3.0.0's `bz2` feature does not enable a bzip2 backend.
+  niffler stays at 3.0.0 while needletail links liblzma 0.3.
 
 ## [0.10.0] — 2026-08-30
 

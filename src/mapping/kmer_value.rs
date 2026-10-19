@@ -30,7 +30,7 @@
 //! 4. **UnitigEndCache**: `DashMap<CanonicalKmer, CachedLookup>` works
 //!    directly.
 //!
-//! 5. **Serialization**: A new format version (e.g., `PPOIS02\0`) would write
+//! 5. **Serialization**: A new format version (e.g., `PPOIS03\0`) would write
 //!    the wider type, with backward-compatible loading.
 //!
 //! 6. **Construct from `Kmer<K>`**: Add `CanonicalKmer::from_kmer()` using

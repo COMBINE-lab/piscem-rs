@@ -326,7 +326,7 @@ where
     let mut found_in_dict = 0usize;
     let mut checked = 0usize;
 
-    for &kmer in table.keys() {
+    for kmer in table.keys() {
         // Convert packed canonical k-mer to bytes
         let raw = kmer.as_u64();
         let mut s: Vec<u8> = Vec::with_capacity(k);

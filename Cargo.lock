@@ -914,6 +914,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "fearless_simd"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3296eb97d869113eaf148a6bdf01884e90b3828ad7ae2340b0f93362fc158611"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1133,15 +1139,6 @@ name = "itertools"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
 dependencies = [
  "either",
 ]
@@ -1677,33 +1674,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
-name = "paraseq-temp"
-version = "0.5.0-pre.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e46e492f850391b70aa1a63e47fe34d85b5c3473cfd355b4819706fa1730d05a"
+name = "paraseq"
+version = "0.6.1"
+source = "git+https://github.com/rob-p/paraseq?branch=release%2Fparaseq-0.6.1-pool-fix#3c347aab1be89c87e1d29b1dc00698a47d512598"
 dependencies = [
- "anyhow",
  "crossbeam-channel",
  "either",
  "env_logger",
- "itertools 0.14.0",
+ "fearless_simd",
+ "itertools 0.15.0",
  "log",
  "memchr",
- "niffler",
  "num_cpus",
- "parking_lot",
  "smallvec",
  "thiserror 2.0.20",
-]
-
-[[package]]
-name = "parking_lot"
-version = "0.12.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
-dependencies = [
- "lock_api",
- "parking_lot_core",
 ]
 
 [[package]]
@@ -1758,7 +1742,7 @@ dependencies = [
  "mem_dbg",
  "mimalloc",
  "niffler",
- "paraseq-temp",
+ "paraseq",
  "rapidgzip-core",
  "seq_geom_parser",
  "serde",
@@ -2255,7 +2239,7 @@ checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 [[package]]
 name = "sshash-lib"
 version = "0.8.0"
-source = "git+https://github.com/COMBINE-lab/sshash-rs?branch=feat%2Fsux-0.15-phastr#598c1d74a5dcef9877f8c7724842e837b7601e69"
+source = "git+https://github.com/COMBINE-lab/sshash-rs?tag=v0.8.0#ae7a1915843e2cda1708a6ffbad113365aabd1bb"
 dependencies = [
  "anyhow",
  "dsi-progress-logger",
@@ -2415,7 +2399,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys",
@@ -2516,7 +2500,7 @@ dependencies = [
 [[package]]
 name = "tiny-dict"
 version = "0.8.0"
-source = "git+https://github.com/COMBINE-lab/sshash-rs?branch=feat%2Fsux-0.15-phastr#598c1d74a5dcef9877f8c7724842e837b7601e69"
+source = "git+https://github.com/COMBINE-lab/sshash-rs?tag=v0.8.0#ae7a1915843e2cda1708a6ffbad113365aabd1bb"
 dependencies = [
  "anyhow",
  "hashbrown 0.17.1",
