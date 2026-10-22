@@ -55,6 +55,11 @@ pre-1.0, a minor bump may carry breaking changes.
   the index in two. Loading is unchanged (`-i dir/` still reads `dir.ssi`,
   ...), but when nothing is there the error now says the prefix ends in a
   separator and names any index inside the directory.
+- `build --ram-limit-gib` help: unset does not mean a fixed 8 GiB. It is
+  half the memory the process may use (the least of physical RAM,
+  `RLIMIT_AS` and the cgroup limit), at least 8 GiB — or all of it when
+  less than 8 GiB is usable — and 8 GiB when memory cannot be detected; `0`
+  means unlimited.
 
 ### Added
 
