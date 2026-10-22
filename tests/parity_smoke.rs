@@ -59,10 +59,11 @@ fn parity_smoke_atac_header_roundtrip() {
 #[test]
 #[ignore]
 fn integration_rust_index_lookup() {
+    use piscem_rs::index::paths::{DICT_EXT, index_artifact_path};
     use std::path::Path;
 
     let index_prefix = Path::new("test_data/gencode_pc_v44_index_rust/gencode_pc_v44_index");
-    if !index_prefix.with_extension("ssi").exists() {
+    if !index_artifact_path(index_prefix, DICT_EXT).exists() {
         eprintln!(
             "Skipping: Rust index not found at {}",
             index_prefix.display()

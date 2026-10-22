@@ -8,21 +8,21 @@
 
 use anyhow::{Context, Result};
 use sshash_lib::{Dictionary, Kmer, KmerBits, KmerDictionary};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tiny_dict::TinyDictionary;
 use tracing::{info, warn};
 
 use super::contig_table::{ContigTable, ContigTableLike, EntryEncoding, TinyContigTable};
 use super::eq_classes::EqClassMap;
+use super::paths::{
+    CTAB_EXT, DICT_EXT, ECTAB_EXT, IndexLayout, IndexPaths, POISON_EXT, POISON_JSON_EXT,
+    REFINFO_EXT, SIGS_EXT, TCT_EXT, TDCT_EXT,
+};
 use super::poison_table::PoisonTable;
 use super::refinfo::RefInfo;
 
 use crate::mapping::projected_hits::ProjectedHits;
 use sshash_lib::LookupResult;
-
-// ---------------------------------------------------------------------------
-// File extension helpers
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // RefSigInfo
@@ -41,44 +41,10 @@ pub struct RefSigInfo {
 }
 
 impl RefSigInfo {
-    /// Try to load from `{prefix}.sigs.json`. Returns `None` if the file
-    /// does not exist. Warns and returns `None` if the file exists but
-    /// cannot be read or parsed.
-    fn try_load(prefix: &Path) -> Option<Self> {
-        let path = {
-            let mut p = prefix.to_path_buf();
-            let ext = match p.extension() {
-                Some(e) => format!("{}.sigs.json", e.to_string_lossy()),
-                None => "sigs.json".to_owned(),
-            };
-            p.set_extension(&ext);
-            p
-        };
-        if !path.exists() {
-            return None;
-        }
-        let file = match std::fs::File::open(&path) {
-            Ok(f) => f,
-            Err(e) => {
-                warn!(
-                    "Signature file {} exists but could not be opened: {}",
-                    path.display(),
-                    e
-                );
-                return None;
-            }
-        };
-        let v: serde_json::Value = match serde_json::from_reader(std::io::BufReader::new(file)) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(
-                    "Signature file {} could not be parsed: {}",
-                    path.display(),
-                    e
-                );
-                return None;
-            }
-        };
+    /// From the parsed signature file at `path` (`{prefix}.sigs.json`, read
+    /// by [`read_sigs_json`]); `None` if there is none.
+    fn from_json(path: &Path, v: Option<&serde_json::Value>) -> Option<Self> {
+        let v = v?;
         let get = |key: &str| v.get(key).and_then(|s| s.as_str()).unwrap_or("").to_owned();
         info!("Loaded reference signatures from {}", path.display());
         Some(Self {
@@ -90,36 +56,90 @@ impl RefSigInfo {
     }
 }
 
-// ---------------------------------------------------------------------------
-// File extension helpers
-// ---------------------------------------------------------------------------
-
-/// File extension for the sshash dictionary (base path for `.ssi` + `.ssi.mphf`).
-const DICT_EXT: &str = "ssi";
-/// File extension for the contig table.
-const CTAB_EXT: &str = "ctab";
-/// File extension for the Tiny dictionary (serialized `TinyDictionary`).
-const TDCT_EXT: &str = "tdct";
-/// File extension for the Tiny contig table (serialized `TinyContigTable`).
-const TCT_EXT: &str = "tct";
-/// File extension for reference info.
-const REFINFO_EXT: &str = "refinfo";
-/// File extension for the equivalence class table (optional).
-const ECTAB_EXT: &str = "ectab";
-/// File extension for the poison table (optional).
-const POISON_EXT: &str = "poison";
-/// File extension for the poison stats JSON (optional).
-const POISON_JSON_EXT: &str = "poison.json";
-
-fn with_ext(prefix: &Path, ext: &str) -> PathBuf {
-    let mut p = prefix.to_path_buf();
-    p.set_extension(ext);
-    p
+/// The parsed signature file, or `None` (with a warning if it exists but is
+/// unreadable).
+fn read_sigs_json(path: &Path) -> Option<serde_json::Value> {
+    if !path.exists() {
+        return None;
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(
+                "Signature file {} exists but could not be opened: {}",
+                path.display(),
+                e
+            );
+            return None;
+        }
+    };
+    match serde_json::from_reader(std::io::BufReader::new(file)) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!(
+                "Signature file {} could not be parsed: {}",
+                path.display(),
+                e
+            );
+            None
+        }
+    }
 }
 
-/// Whether both `.tdct` and `.tct` files exist alongside the index prefix.
+/// For a [`IndexLayout::Legacy`] index, warn when the core files hold a
+/// different number of references than the signature file (`sigs`, as
+/// parsed by [`read_sigs_json`]) records: the replaced-suffix paths are
+/// shared by every prefix with the same stem, so another index may have
+/// overwritten them.
+fn check_legacy_ref_count(paths: &IndexPaths, num_refs: usize, sigs: Option<&serde_json::Value>) {
+    if paths.layout() != IndexLayout::Legacy {
+        return;
+    }
+    let Some(recorded) = sigs.and_then(|v| v.get("num_records").and_then(|n| n.as_u64())) else {
+        return;
+    };
+    if recorded != num_refs as u64 {
+        warn!(
+            "{} holds {} references, but {} records {}: the index files were probably \
+             overwritten by another index built at a prefix with the same stem, and mapping \
+             results will be wrong. Rebuild the index",
+            paths.file(REFINFO_EXT).display(),
+            num_refs,
+            paths.file(SIGS_EXT).display(),
+            recorded
+        );
+    }
+}
+
+/// The error for the first index file a load cannot read: `msg`, plus a
+/// note when `prefix` ends in a path separator (see
+/// [`super::paths::directory_prefix_hint`]).
+fn first_file_error(prefix: &Path, msg: String) -> anyhow::Error {
+    match super::paths::directory_prefix_hint(prefix) {
+        Some(hint) => anyhow::anyhow!("{msg} ({hint})"),
+        None => anyhow::anyhow!(msg),
+    }
+}
+
+/// Find the index at `prefix` (once per load) and report how it was found.
+fn resolve_for_load(prefix: &Path) -> Result<IndexPaths> {
+    if prefix.file_name().is_none() {
+        anyhow::bail!(
+            "index prefix {:?} names a directory, not an index: pass the prefix the index \
+             was built with (e.g. {:?})",
+            prefix,
+            prefix.join("index")
+        );
+    }
+    let paths = IndexPaths::resolve(prefix);
+    paths.log_resolution();
+    Ok(paths)
+}
+
+/// Whether both `.tdct` and `.tct` files exist for the index at `prefix`
+/// (in whichever layout [`IndexPaths::resolve`] finds it).
 pub fn tiny_artifacts_exist(prefix: &Path) -> bool {
-    with_ext(prefix, TDCT_EXT).exists() && with_ext(prefix, TCT_EXT).exists()
+    IndexPaths::resolve(prefix).tiny_artifacts_exist()
 }
 
 // ---------------------------------------------------------------------------
@@ -136,12 +156,18 @@ pub fn tiny_artifacts_exist(prefix: &Path) -> bool {
 ///
 /// # Loading
 ///
-/// Given a prefix like `/path/to/index`, the following files are expected:
+/// Given a prefix like `/path/to/index`, the following files are expected
+/// (each is the full prefix plus an extension, see
+/// [`crate::index::paths::index_artifact_path`]):
 /// - `/path/to/index.ssi` + `/path/to/index.ssi.mphf` — SSHash dictionary
 /// - `/path/to/index.ctab` — contig table
 /// - `/path/to/index.refinfo` — reference names and lengths
 /// - `/path/to/index.ectab` — equivalence class table (optional)
 /// - `/path/to/index.poison` — poison k-mer table (optional)
+/// - `/path/to/index.sigs.json` — reference signatures (optional)
+///
+/// Indexes that piscem-rs 0.11.0 and earlier wrote at a dotted prefix are
+/// still loaded, with a warning; see [`IndexPaths::resolve`].
 pub struct ReferenceIndex<D = Dictionary, C = ContigTable>
 where
     D: KmerDictionary,
@@ -174,15 +200,21 @@ impl ReferenceIndex<Dictionary, ContigTable> {
     /// loads the equivalence class table if `load_ec` is true and the
     /// poison table if `load_poison` is true (and their files exist).
     pub fn load(prefix: &Path, load_ec: bool, load_poison: bool) -> Result<Self> {
+        let paths = resolve_for_load(prefix)?;
+
         // 1. Load SSHash dictionary
-        let dict_path = with_ext(prefix, DICT_EXT);
+        let dict_path = paths.file(DICT_EXT);
         info!("Loading SSHash dictionary from {}", dict_path.display());
-        let dict = Dictionary::load(&dict_path)
-            .map_err(|e| anyhow::anyhow!("failed to load dictionary: {e}"))?;
+        let dict = Dictionary::load(&dict_path).map_err(|e| {
+            first_file_error(
+                prefix,
+                format!("failed to load dictionary {}: {e}", dict_path.display()),
+            )
+        })?;
         info!("  k={}, {} strings", dict.k(), dict.num_strings());
 
         // 2. Load contig table
-        let ctab_path = with_ext(prefix, CTAB_EXT);
+        let ctab_path = paths.file(CTAB_EXT);
         info!("Loading contig table from {}", ctab_path.display());
         let ctab_file = std::fs::File::open(&ctab_path)
             .with_context(|| format!("failed to open {}", ctab_path.display()))?;
@@ -197,7 +229,7 @@ impl ReferenceIndex<Dictionary, ContigTable> {
         );
 
         // 3. Load reference info
-        let refinfo_path = with_ext(prefix, REFINFO_EXT);
+        let refinfo_path = paths.file(REFINFO_EXT);
         info!("Loading reference info from {}", refinfo_path.display());
         let refinfo_file = std::fs::File::open(&refinfo_path)
             .with_context(|| format!("failed to open {}", refinfo_path.display()))?;
@@ -209,10 +241,13 @@ impl ReferenceIndex<Dictionary, ContigTable> {
             ref_info.num_refs(),
             ref_info.max_ref_len(),
         );
+        let sigs_path = paths.file(SIGS_EXT);
+        let sigs = read_sigs_json(&sigs_path);
+        check_legacy_ref_count(&paths, ref_info.num_refs(), sigs.as_ref());
 
         // 4. Optionally load equivalence class table
         let ec_table = if load_ec {
-            let ectab_path = with_ext(prefix, ECTAB_EXT);
+            let ectab_path = paths.file(ECTAB_EXT);
             if ectab_path.exists() {
                 info!(
                     "Loading equivalence class table from {}",
@@ -250,7 +285,7 @@ impl ReferenceIndex<Dictionary, ContigTable> {
 
         // 6. Optionally load poison table
         let poison_table = if load_poison {
-            let poison_path = with_ext(prefix, POISON_EXT);
+            let poison_path = paths.file(POISON_EXT);
             if poison_path.exists() {
                 info!("Loading poison table from {}", poison_path.display());
                 let poison_file = std::fs::File::open(&poison_path)
@@ -273,7 +308,7 @@ impl ReferenceIndex<Dictionary, ContigTable> {
         };
 
         // 7. Optionally load reference signature info
-        let sig_info = RefSigInfo::try_load(prefix);
+        let sig_info = RefSigInfo::from_json(&sigs_path, sigs.as_ref());
 
         Ok(Self {
             dict,
@@ -288,15 +323,16 @@ impl ReferenceIndex<Dictionary, ContigTable> {
 
     /// Save the index to files with the given path prefix.
     pub fn save(&self, prefix: &Path) -> Result<()> {
+        let paths = IndexPaths::new(prefix);
         // 1. Save dictionary
-        let dict_path = with_ext(prefix, DICT_EXT);
+        let dict_path = paths.file(DICT_EXT);
         info!("Saving SSHash dictionary to {}", dict_path.display());
         self.dict
             .save(&dict_path)
             .map_err(|e| anyhow::anyhow!("failed to save dictionary: {e}"))?;
 
         // 2. Save contig table
-        let ctab_path = with_ext(prefix, CTAB_EXT);
+        let ctab_path = paths.file(CTAB_EXT);
         info!("Saving contig table to {}", ctab_path.display());
         let ctab_file = std::fs::File::create(&ctab_path)
             .with_context(|| format!("failed to create {}", ctab_path.display()))?;
@@ -306,7 +342,7 @@ impl ReferenceIndex<Dictionary, ContigTable> {
             .with_context(|| format!("failed to save {}", ctab_path.display()))?;
 
         // 3. Save reference info
-        let refinfo_path = with_ext(prefix, REFINFO_EXT);
+        let refinfo_path = paths.file(REFINFO_EXT);
         info!("Saving reference info to {}", refinfo_path.display());
         let refinfo_file = std::fs::File::create(&refinfo_path)
             .with_context(|| format!("failed to create {}", refinfo_path.display()))?;
@@ -317,7 +353,7 @@ impl ReferenceIndex<Dictionary, ContigTable> {
 
         // 4. Save EC table if present
         if let Some(ref ec) = self.ec_table {
-            let ectab_path = with_ext(prefix, ECTAB_EXT);
+            let ectab_path = paths.file(ECTAB_EXT);
             info!("Saving equivalence class table to {}", ectab_path.display());
             let ectab_file = std::fs::File::create(&ectab_path)
                 .with_context(|| format!("failed to create {}", ectab_path.display()))?;
@@ -328,7 +364,7 @@ impl ReferenceIndex<Dictionary, ContigTable> {
 
         // 5. Save poison table if present
         if let Some(ref pt) = self.poison_table {
-            let poison_path = with_ext(prefix, POISON_EXT);
+            let poison_path = paths.file(POISON_EXT);
             info!("Saving poison table to {}", poison_path.display());
             let poison_file = std::fs::File::create(&poison_path)
                 .with_context(|| format!("failed to create {}", poison_path.display()))?;
@@ -336,7 +372,7 @@ impl ReferenceIndex<Dictionary, ContigTable> {
             pt.save(&mut poison_writer)
                 .with_context(|| format!("failed to save {}", poison_path.display()))?;
 
-            let json_path = with_ext(prefix, POISON_JSON_EXT);
+            let json_path = paths.file(POISON_JSON_EXT);
             info!("Saving poison stats to {}", json_path.display());
             let json_file = std::fs::File::create(&json_path)
                 .with_context(|| format!("failed to create {}", json_path.display()))?;
@@ -407,7 +443,8 @@ impl ReferenceIndex<Dictionary, ContigTable> {
     where
         Kmer<K>: KmerBits,
     {
-        let tdct_path = with_ext(prefix, TDCT_EXT);
+        let paths = IndexPaths::new(prefix);
+        let tdct_path = paths.file(TDCT_EXT);
         info!(
             "Building and saving TinyDictionary to {}",
             tdct_path.display()
@@ -417,7 +454,7 @@ impl ReferenceIndex<Dictionary, ContigTable> {
             .save(&tdct_path)
             .map_err(|e| anyhow::anyhow!("failed to save {}: {e}", tdct_path.display()))?;
 
-        let tct_path = with_ext(prefix, TCT_EXT);
+        let tct_path = paths.file(TCT_EXT);
         info!(
             "Building and saving TinyContigTable to {}",
             tct_path.display()
@@ -465,15 +502,21 @@ impl ReferenceIndex<TinyDictionary, TinyContigTable> {
     /// Expects the same companion files as the sshash loader
     /// (`.refinfo`, optional `.ectab`, `.poison`, `.sigs.json`).
     pub fn load_tiny(prefix: &Path, load_ec: bool, load_poison: bool) -> Result<Self> {
+        let paths = resolve_for_load(prefix)?;
+
         // 1. TinyDictionary
-        let tdct_path = with_ext(prefix, TDCT_EXT);
+        let tdct_path = paths.file(TDCT_EXT);
         info!("Loading TinyDictionary from {}", tdct_path.display());
-        let dict = TinyDictionary::load(&tdct_path)
-            .map_err(|e| anyhow::anyhow!("failed to load {}: {e}", tdct_path.display()))?;
+        let dict = TinyDictionary::load(&tdct_path).map_err(|e| {
+            first_file_error(
+                prefix,
+                format!("failed to load {}: {e}", tdct_path.display()),
+            )
+        })?;
         info!("  k={}, {} strings", dict.k(), dict.num_strings());
 
         // 2. TinyContigTable
-        let tct_path = with_ext(prefix, TCT_EXT);
+        let tct_path = paths.file(TCT_EXT);
         info!("Loading TinyContigTable from {}", tct_path.display());
         let tct_file = std::fs::File::open(&tct_path)
             .with_context(|| format!("failed to open {}", tct_path.display()))?;
@@ -487,16 +530,19 @@ impl ReferenceIndex<TinyDictionary, TinyContigTable> {
         );
 
         // 3. Reference info
-        let refinfo_path = with_ext(prefix, REFINFO_EXT);
+        let refinfo_path = paths.file(REFINFO_EXT);
         let refinfo_file = std::fs::File::open(&refinfo_path)
             .with_context(|| format!("failed to open {}", refinfo_path.display()))?;
         let mut refinfo_reader = std::io::BufReader::new(refinfo_file);
         let ref_info = RefInfo::load(&mut refinfo_reader)
             .with_context(|| format!("failed to load {}", refinfo_path.display()))?;
+        let sigs_path = paths.file(SIGS_EXT);
+        let sigs = read_sigs_json(&sigs_path);
+        check_legacy_ref_count(&paths, ref_info.num_refs(), sigs.as_ref());
 
         // 4. EC table
         let ec_table = if load_ec {
-            let ectab_path = with_ext(prefix, ECTAB_EXT);
+            let ectab_path = paths.file(ECTAB_EXT);
             if ectab_path.exists() {
                 let ectab_file = std::fs::File::open(&ectab_path)
                     .with_context(|| format!("failed to open {}", ectab_path.display()))?;
@@ -514,7 +560,7 @@ impl ReferenceIndex<TinyDictionary, TinyContigTable> {
 
         // 5. Poison table
         let poison_table = if load_poison {
-            let poison_path = with_ext(prefix, POISON_EXT);
+            let poison_path = paths.file(POISON_EXT);
             if poison_path.exists() {
                 let poison_file = std::fs::File::open(&poison_path)
                     .with_context(|| format!("failed to open {}", poison_path.display()))?;
@@ -530,7 +576,7 @@ impl ReferenceIndex<TinyDictionary, TinyContigTable> {
             None
         };
 
-        let sig_info = RefSigInfo::try_load(prefix);
+        let sig_info = RefSigInfo::from_json(&sigs_path, sigs.as_ref());
         let encoding = contig_table.encoding();
 
         Ok(Self {

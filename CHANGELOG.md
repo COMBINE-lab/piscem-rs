@@ -3,6 +3,69 @@
 Notable changes to `piscem-rs`. Versions follow [Semantic Versioning](https://semver.org);
 pre-1.0, a minor bump may carry breaking changes.
 
+## [0.11.1] — Unreleased
+
+### Fixed
+
+- **Index files at a dotted prefix are named after the whole prefix.**
+  `build -o idx/gencode.v49` wrote its core files with the prefix's last
+  dotted component *replaced* (`idx/gencode.ssi`, `.ssi.mphf`, `.ctab`,
+  `.refinfo`, `.ectab`, `.tdct`, `.tct`), while `build-poison`, py-piscem
+  and the piscem wrapper *appended* (`idx/gencode.v49.poison`,
+  `.poison.json`, `.sigs.json`). Two consequences, both silent:
+  - a second build at `idx/gencode.v44` overwrote the first one's
+    dictionary, so mapping against `idx/gencode.v49` used v44's references
+    while `map_info.json` still reported v49's signatures;
+  - a decoy table built for a dotted prefix was never loaded (the loader
+    looked for `idx/gencode.poison`), so its decoys had no effect.
+
+  Every index file is now `<prefix>.<ext>`, in `build`, `build-poison`,
+  `stats`, the loaders and py-piscem. **Decoys built for a dotted-prefix
+  index now take effect** wherever poison filtering is enabled, so mapping
+  results for such indexes change (reads from decoy sequence are now
+  reported as poisoned instead of mapped), exactly as they always did for an
+  undotted prefix. Prefixes without a dot in their file name, such as
+  simpleaf's `piscem_idx`, are unaffected: same paths, byte-identical files.
+- **Indexes built at a dotted prefix by piscem-rs ≤ 0.11.0 still load**,
+  with a warning to rebuild. If the core files are absent at the appended
+  paths and complete at the old replaced-suffix ones, the whole set is
+  loaded from there, never mixed with new-layout files. Signatures come from
+  `<prefix>.sigs.json`, where the wrapper wrote them. The poison table and
+  its `.poison.json` come from `<prefix>.poison` (written by
+  `build-poison -i idx/gencode.v49`) if it exists, else from
+  `idx/gencode.poison` (written by `build-poison -i idx/gencode`, and the
+  one 0.11.0 read); both were built against the same core files. Such an
+  index therefore keeps the decoys 0.11.0 applied and gains the ones built
+  at its dotted prefix, which win where both exist; the warning names the
+  stem's table when that is the one used. `build-poison` at a dotted prefix
+  writes `<prefix>.poison` and leaves the stem's table alone. Because every
+  prefix sharing the stem wrote to the old core paths, a second warning
+  flags old-layout files whose reference count disagrees with
+  `<prefix>.sigs.json`. A rebuild writes the new names and leaves the old
+  files in place. An index file given in place of the prefix
+  (`-i idx/gencode.ssi`) still loads the index at `idx/gencode`, poison
+  table included.
+- `-i idx/gencode.ssi` (an index file in place of the prefix) now reads the
+  signatures from `idx/gencode.sigs.json`. 0.11.0 looked for
+  `idx/gencode.ssi.sigs.json`, so `map_info.json` had no signatures.
+- **`build -o dir/` is rejected** before any work, with a message suggesting
+  `dir/index`: the prefix must end in a file name (so `dir/.` and `dir/..`
+  are rejected too). It used to write `dir.ssi`, ... beside the directory,
+  and through the piscem wrapper, which puts its own files inside it, split
+  the index in two. Loading is unchanged (`-i dir/` still reads `dir.ssi`,
+  ...), but when nothing is there the error now says the prefix ends in a
+  separator and names any index inside the directory.
+
+### Added
+
+- `piscem_rs::index::paths`, so callers such as the piscem wrapper name index
+  files the way piscem-rs does instead of concatenating strings:
+  `index_artifact_path(prefix, ext)`, `validate_index_prefix(prefix)`,
+  `IndexPaths` (finds an index's files on disk in either layout), the
+  extension constants, and `BUILD_ARTIFACT_EXTENSIONS` /
+  `POISON_ARTIFACT_EXTENSIONS` (the files `build` and `build-poison` own,
+  e.g. for `--overwrite` cleanup).
+
 ## [0.11.0] — 2026-10-19
 
 ### Breaking

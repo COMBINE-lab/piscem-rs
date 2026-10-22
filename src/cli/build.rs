@@ -11,7 +11,8 @@ pub struct BuildArgs {
     /// Input prefix (cuttlefish basename, e.g. path/to/index_cfish)
     #[arg(short = 'i', long)]
     pub input: PathBuf,
-    /// Output prefix for index files
+    /// Output prefix for index files, e.g. `idx/gencode.v49` writes
+    /// `idx/gencode.v49.ssi`, `idx/gencode.v49.ctab`, ... (not a directory)
     #[arg(short = 'o', long)]
     pub output: PathBuf,
     /// K-mer length

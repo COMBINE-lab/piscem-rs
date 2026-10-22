@@ -18,6 +18,7 @@ use sshash_lib::{Kmer, KmerBits, LookupResult, StreamingQuery, dispatch_on_k};
 
 use piscem_rs::index::build_poison::{build_poison_table, verify_poison_table};
 use piscem_rs::index::contig_table::ContigTable;
+use piscem_rs::index::paths::{POISON_EXT, POISON_JSON_EXT, index_artifact_path};
 use piscem_rs::index::reference_index::ReferenceIndex;
 use piscem_rs::mapping::binning::BinPos;
 use piscem_rs::mapping::cache::MappingCache;
@@ -850,7 +851,9 @@ impl PyReferenceIndex {
     /// Build a new index from cuttlefish output files.
     ///
     /// :param input_prefix: Basename for cuttlefish output files (.cf_seg, .cf_seq, .json).
-    /// :param output_prefix: Output prefix for index files.
+    /// :param output_prefix: Output prefix for index files, which are named
+    ///     ``<output_prefix>.ssi``, ``<output_prefix>.ctab``, ... . It must end
+    ///     in a file name, not a directory.
     /// :param k: K-mer length (default 31).
     /// :param m: Minimizer length (default 19).
     /// :param threads: Number of threads (default 4, 0 = all cores).
@@ -930,17 +933,15 @@ impl PyReferenceIndex {
                     ));
                 }
 
-                // Save poison table and stats JSON
-                let mut poison_path = PathBuf::from(&out_prefix);
-                poison_path.add_extension("poison");
+                // Save poison table and stats JSON where `load` looks for them
+                let poison_path = index_artifact_path(Path::new(&out_prefix), POISON_EXT);
                 let mut f = std::fs::File::create(&poison_path)
                     .map_err(|e| format!("Failed to create {}: {e}", poison_path.display()))?;
                 table
                     .save(&mut f)
                     .map_err(|e| format!("Failed to save poison table: {e}"))?;
 
-                let mut json_path = poison_path;
-                json_path.add_extension("json");
+                let json_path = index_artifact_path(Path::new(&out_prefix), POISON_JSON_EXT);
                 let mut f = std::fs::File::create(&json_path)
                     .map_err(|e| format!("Failed to create {}: {e}", json_path.display()))?;
                 table

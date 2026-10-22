@@ -16,6 +16,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use piscem_rs::index::build::BuildConfig;
+use piscem_rs::index::paths::{DICT_EXT, index_artifact_path};
 use piscem_rs::verify::rad_compare::compare_sc_rad_full;
 
 // ---------------------------------------------------------------------------
@@ -76,7 +77,7 @@ fn ensure_cpp_index() -> Result<()> {
 
 /// Build the Rust-format index if it doesn't already exist.
 fn ensure_rust_index() -> Result<()> {
-    let marker = PathBuf::from(RUST_INDEX_PREFIX).with_extension("ssi");
+    let marker = index_artifact_path(Path::new(RUST_INDEX_PREFIX), DICT_EXT);
     if marker.exists() {
         eprintln!("Rust index already exists at {}", marker.display());
         return Ok(());

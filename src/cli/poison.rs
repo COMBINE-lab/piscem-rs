@@ -8,6 +8,7 @@ use sshash_lib::{Kmer, KmerBits, dispatch_on_k};
 use tracing::info;
 
 use crate::index::build_poison::{build_poison_table, verify_poison_table};
+use crate::index::paths::{IndexPaths, POISON_EXT, POISON_JSON_EXT, index_artifact_path};
 use crate::index::reference_index::ReferenceIndex;
 
 #[derive(Args, Debug)]
@@ -53,16 +54,19 @@ pub fn run(args: BuildPoisonArgs) -> Result<()> {
         );
     }
 
-    // Save poison table
-    let mut poison_path = args.index.clone();
-    poison_path.add_extension("poison");
+    // Save the poison table at `<prefix>.poison`, in either index layout.
+    // `load` prefers that path, so this table is the one used. For an index
+    // in the pre-0.11.1 layout that is not `paths.file(POISON_EXT)` when the
+    // loader would otherwise fall back to the stem's table, which is left
+    // as it is (it may belong to the index at the stem).
+    let paths = IndexPaths::resolve(&args.index);
+    let poison_path = index_artifact_path(paths.prefix(), POISON_EXT);
     info!("Saving poison table to {}", poison_path.display());
     let mut poison_file = std::fs::File::create(&poison_path)?;
     table.save(&mut poison_file)?;
 
     // Save stats JSON
-    let mut json_path = poison_path.clone();
-    json_path.add_extension("json");
+    let json_path = index_artifact_path(paths.prefix(), POISON_JSON_EXT);
     info!("Saving poison stats to {}", json_path.display());
     let mut json_file = std::fs::File::create(&json_path)?;
     table.save_stats_json(&mut json_file)?;
