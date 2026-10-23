@@ -8,6 +8,7 @@
 //! Run with: `cargo test --test tiny_sshash_parity -- --nocapture`
 
 use piscem_rs::index::contig_table::{ContigTableLike, TinyContigTable};
+use piscem_rs::index::paths::{DICT_EXT, index_artifact_path};
 use piscem_rs::index::reference_index::ReferenceIndex;
 use sshash_lib::{KmerDictionary, KmerStreamingQuery, LookupResult, dispatch_on_k};
 use tiny_dict::TinyDictionary;
@@ -61,7 +62,7 @@ impl From<&LookupResult> for CompareFields {
 #[test]
 fn tiny_sshash_lookup_parity_on_test_reads() {
     let index_prefix = index_prefix();
-    if !index_prefix.with_extension("ssi").exists() {
+    if !index_artifact_path(&index_prefix, DICT_EXT).exists() {
         eprintln!(
             "Skipping: sshash index not found at {}",
             index_prefix.display()
@@ -139,7 +140,7 @@ fn tiny_sshash_lookup_parity_on_test_reads() {
 #[test]
 fn tiny_sshash_contig_entries_parity() {
     let index_prefix = index_prefix();
-    if !index_prefix.with_extension("ssi").exists() {
+    if !index_artifact_path(&index_prefix, DICT_EXT).exists() {
         eprintln!(
             "Skipping: sshash index not found at {}",
             index_prefix.display()

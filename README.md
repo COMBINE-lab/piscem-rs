@@ -25,6 +25,12 @@ piscem-rs build -i cuttlefish_prefix -o index_prefix -k 31 -m 19
 piscem-rs build -i cuttlefish_prefix -o index_prefix -k 31 -m 19 --build-ec-table
 ```
 
+The index is a set of files named `index_prefix` plus an extension (`.ssi`,
+`.ssi.mphf`, `.ctab`, `.refinfo`, and when enabled `.ectab`, `.tdct`/`.tct`,
+`.poison`). Dots in the prefix are kept: `-o idx/gencode.v49` writes
+`idx/gencode.v49.ssi`, `idx/gencode.v49.ctab`, ... . The prefix must end in a
+file name; to build inside a directory, pass `dir/index`, not `dir/`.
+
 ### Mapping reads
 
 ```bash

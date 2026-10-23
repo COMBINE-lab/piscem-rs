@@ -27,7 +27,10 @@ use super::refinfo::RefInfo;
 pub struct BuildConfig {
     /// Basename for cuttlefish output files (.cf_seg, .cf_seq, .json).
     pub input_prefix: PathBuf,
-    /// Output prefix for index files (.ssi, .ctab, .refinfo, .ectab).
+    /// Output prefix for index files: each file is the prefix plus an
+    /// extension (`<prefix>.ssi`, `<prefix>.ctab`, ...; see
+    /// [`crate::index::paths`]). It must end in a file name
+    /// ([`crate::index::paths::validate_index_prefix`]).
     pub output_prefix: PathBuf,
     /// K-mer length.
     pub k: usize,
@@ -135,6 +138,9 @@ struct ReferenceMetadata {
 /// 4. Optionally builds the equivalence class table
 /// 5. Assembles and saves the complete index
 pub fn build_index(config: &BuildConfig) -> Result<()> {
+    // Before any work: a prefix naming a directory would otherwise surface
+    // only when the files are written, beside that directory.
+    crate::index::paths::validate_index_prefix(&config.output_prefix)?;
     let k = config.k;
     let input = config.input_prefix.display().to_string();
 

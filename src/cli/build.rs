@@ -11,7 +11,8 @@ pub struct BuildArgs {
     /// Input prefix (cuttlefish basename, e.g. path/to/index_cfish)
     #[arg(short = 'i', long)]
     pub input: PathBuf,
-    /// Output prefix for index files
+    /// Output prefix for index files, e.g. `idx/gencode.v49` writes
+    /// `idx/gencode.v49.ssi`, `idx/gencode.v49.ctab`, ... (not a directory)
     #[arg(short = 'o', long)]
     pub output: PathBuf,
     /// K-mer length
@@ -62,8 +63,11 @@ pub struct BuildArgs {
     /// Unset keeps sshash's default (`sshash_tmp` in the current directory).
     #[arg(long)]
     pub tmp_dir: Option<PathBuf>,
-    /// RAM ceiling, in GiB, for sshash's external minimizer sort. Unset keeps
-    /// sshash's default (8 GiB); a smaller value spills to disk sooner.
+    /// RAM ceiling, in GiB, for sshash's external minimizer sort; a smaller
+    /// value spills to disk sooner, 0 means unlimited (always sort in memory).
+    /// Unset: half the memory this process may use (the least of physical RAM,
+    /// RLIMIT_AS and the cgroup limit), at least 8 GiB or all of it if less is
+    /// usable; 8 GiB if it cannot be detected.
     #[arg(long)]
     pub ram_limit_gib: Option<usize>,
 }

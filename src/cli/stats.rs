@@ -3,6 +3,10 @@ use clap::Args;
 use serde_json::{Value, json};
 use std::path::Path;
 
+use crate::index::paths::{
+    CTAB_EXT, DICT_EXT, DICT_MPHF_EXT, ECTAB_EXT, IndexPaths, POISON_EXT, POISON_JSON_EXT,
+    REFINFO_EXT, SIGS_EXT,
+};
 use crate::index::reference_index::ReferenceIndex;
 
 #[derive(Args, Debug)]
@@ -15,20 +19,18 @@ pub struct StatsArgs {
 
 /// File extensions that make up the index on disk.
 const INDEX_EXTENSIONS: &[(&str, &str)] = &[
-    ("ssi", "dictionary"),
-    ("ssi.mphf", "mphf"),
-    ("ctab", "contig_table"),
-    ("refinfo", "ref_info"),
-    ("ectab", "eq_class_table"),
-    ("poison", "poison_table"),
-    ("poison.json", "poison_stats"),
-    ("sigs.json", "signatures"),
+    (DICT_EXT, "dictionary"),
+    (DICT_MPHF_EXT, "mphf"),
+    (CTAB_EXT, "contig_table"),
+    (REFINFO_EXT, "ref_info"),
+    (ECTAB_EXT, "eq_class_table"),
+    (POISON_EXT, "poison_table"),
+    (POISON_JSON_EXT, "poison_stats"),
+    (SIGS_EXT, "signatures"),
 ];
 
-fn file_size_bytes(prefix: &Path, ext: &str) -> Option<u64> {
-    let mut p = prefix.to_path_buf();
-    p.set_extension(ext);
-    std::fs::metadata(&p).ok().map(|m| m.len())
+fn file_size_bytes(paths: &IndexPaths, ext: &str) -> Option<u64> {
+    std::fs::metadata(paths.file(ext)).ok().map(|m| m.len())
 }
 
 pub fn run(args: StatsArgs) -> Result<()> {
@@ -67,11 +69,12 @@ pub fn run(args: StatsArgs) -> Result<()> {
         }
     }
 
-    // On-disk file sizes.
+    // On-disk file sizes, from the same files `load` read.
+    let paths = IndexPaths::resolve(prefix);
     let mut file_sizes = serde_json::Map::new();
     let mut total_disk_bytes: u64 = 0;
     for &(ext, label) in INDEX_EXTENSIONS {
-        if let Some(size) = file_size_bytes(prefix, ext) {
+        if let Some(size) = file_size_bytes(&paths, ext) {
             file_sizes.insert(label.to_string(), json!(size));
             total_disk_bytes += size;
         }

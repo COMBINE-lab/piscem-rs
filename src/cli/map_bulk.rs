@@ -15,7 +15,8 @@ use sshash_lib::{Kmer, KmerBits, KmerDictionary, dispatch_on_k};
 use crate::index::contig_table::ContigTableLike;
 
 use super::DictKind;
-use crate::index::reference_index::{ReferenceIndex, tiny_artifacts_exist};
+use crate::index::paths::{IndexPaths, TCT_EXT, TDCT_EXT};
+use crate::index::reference_index::ReferenceIndex;
 use crate::io::fastx::{Collection, CollectionType, reader_with_batch_size};
 use crate::io::map_info::{MapInfoParams, write_map_info};
 use crate::io::rad::write_rad_header_bulk;
@@ -149,10 +150,12 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
     // sshash and optionally convert to Tiny in memory.
     let effective_dict = args.dict.resolve_for_map(&args.index);
     let load_start = Instant::now();
-    if matches!(effective_dict, super::DictKind::Tiny) && tiny_artifacts_exist(&args.index) {
+    let index_paths = IndexPaths::resolve(&args.index);
+    if matches!(effective_dict, super::DictKind::Tiny) && index_paths.tiny_artifacts_exist() {
         info!(
-            "Loading prebuilt Tiny index artifacts from {}.{{tdct,tct}}",
-            args.index.display()
+            "Loading prebuilt Tiny index artifacts {} and {}",
+            index_paths.file(TDCT_EXT).display(),
+            index_paths.file(TCT_EXT).display()
         );
         let index = crate::index::reference_index::ReferenceIndex::<
             tiny_dict::TinyDictionary,

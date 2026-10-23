@@ -16,6 +16,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use piscem_rs::index::build::BuildConfig;
+use piscem_rs::index::paths::{DICT_EXT, index_artifact_path};
 use piscem_rs::verify::rad_compare::compare_bulk_rad_full;
 
 // ---------------------------------------------------------------------------
@@ -77,7 +78,7 @@ fn ensure_cpp_index() -> Result<()> {
 
 /// Build the Rust-format index if it doesn't already exist.
 fn ensure_rust_index() -> Result<()> {
-    let marker = PathBuf::from(RUST_INDEX_PREFIX).with_extension("ssi");
+    let marker = index_artifact_path(Path::new(RUST_INDEX_PREFIX), DICT_EXT);
     if marker.exists() {
         eprintln!("Rust index already exists at {}", marker.display());
         return Ok(());
@@ -522,7 +523,7 @@ fn kmer_dump_rust() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(100);
 
-    if !Path::new(RUST_INDEX_PREFIX).with_extension("ssi").exists() {
+    if !index_artifact_path(Path::new(RUST_INDEX_PREFIX), DICT_EXT).exists() {
         ensure_rust_index().expect("failed to build Rust index");
     }
 
@@ -700,7 +701,7 @@ fn hit_dump_rust() {
 
     let strat_str = std::env::var("HIT_DUMP_STRAT").unwrap_or_else(|_| "permissive".into());
 
-    if !Path::new(RUST_INDEX_PREFIX).with_extension("ssi").exists() {
+    if !index_artifact_path(Path::new(RUST_INDEX_PREFIX), DICT_EXT).exists() {
         ensure_rust_index().expect("failed to build Rust index");
     }
 
