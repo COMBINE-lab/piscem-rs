@@ -747,7 +747,10 @@ mod tests {
     fn test_old_format_asks_for_rebuild() {
         let data = b"PECTB03\0";
         let err = format!("{:#}", EqClassMap::load(&mut &data[..]).unwrap_err());
-        assert!(err.contains("PECTB03") && err.contains("PECTB04") && err.contains("rebuilt"), "{err}");
+        assert!(
+            err.contains("PECTB03") && err.contains("PECTB04") && err.contains("rebuilt"),
+            "{err}"
+        );
     }
 
     #[test]

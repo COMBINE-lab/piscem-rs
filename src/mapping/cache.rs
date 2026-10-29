@@ -7,7 +7,8 @@
 //! borrow the index and are created as separate per-thread locals alongside
 //! the cache.
 
-use crate::hash::{FixedMap, FixedSet, fixed_map_with_capacity, fixed_set};
+use crate::hash::{FixedSet, fixed_set};
+use crate::mapping::hit_map::HitMap;
 
 use crate::mapping::hits::{MappingType, SimpleHit, SketchHitInfo};
 
@@ -21,9 +22,12 @@ use crate::mapping::hits::{MappingType, SimpleHit, SketchHitInfo};
 pub struct MappingCache<S: SketchHitInfo> {
     /// How the read mapped.
     pub map_type: MappingType,
-    /// Map from reference target ID → per-target hit accumulator.
-    /// Uses AHashMap (fast hash) matching C++ ankerl::unordered_dense::map performance.
-    pub hit_map: FixedMap<u32, S>,
+    /// Map from reference target ID → per-target hit accumulator, with slots
+    /// that stay valid for the whole read (see [`HitMap`]).
+    pub hit_map: HitMap<S>,
+    /// Scratch for hit collection: the `(slot, contig-table entry)` of each
+    /// occurrence of the contig the previous raw hit landed on.
+    pub run_slots: Vec<(u32, u64)>,
     /// Final accepted hit list (after filtering).
     pub accepted_hits: Vec<SimpleHit>,
     /// Maximum number of reference occurrences before a k-mer is considered
@@ -67,10 +71,11 @@ impl<S: SketchHitInfo> MappingCache<S> {
         let max_hit_occ = 256;
         let max_hit_occ_recover = 1024;
         // Pre-reserve capacity matching C++ (utils.hpp line 932, 966)
-        let hit_map = fixed_map_with_capacity(max_hit_occ);
+        let hit_map = HitMap::with_capacity(max_hit_occ);
         Self {
             map_type: MappingType::Unmapped,
             hit_map,
+            run_slots: Vec::with_capacity(max_hit_occ),
             accepted_hits: Vec::with_capacity(64),
             max_hit_occ,
             max_hit_occ_recover,

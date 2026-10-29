@@ -18,6 +18,7 @@ use crate::index::reference_index::ReferenceIndex;
 use crate::mapping::binning::BinPos;
 use crate::mapping::cache::MappingCache;
 use crate::mapping::filters::PoisonState;
+use crate::mapping::hit_map::HitMap;
 use crate::mapping::hit_searcher::{HitSearcher, SkippingStrategy};
 use crate::mapping::hits::{HitDirection, MappingType, SketchHitInfo};
 use crate::mapping::projected_hits::ProjectedHits;
@@ -87,6 +88,7 @@ where
             max_stretch,
             perform_ambig_filtering,
             &mut cache.ambiguous_hit_indices,
+            &mut cache.run_slots,
             index,
         );
 
@@ -111,6 +113,7 @@ where
                 max_stretch,
                 perform_ambig_filtering,
                 &mut cache.ambiguous_hit_indices,
+                &mut cache.run_slots,
                 index,
             );
         }
@@ -127,7 +130,7 @@ where
             let mut min_cardinality_index: u32 = 0;
             let mut visited: usize = 0;
 
-            let visit_ec = |hit_map: &mut FixedMap<u32, S>, ent: u64, fw_on_contig: bool| {
+            let visit_ec = |hit_map: &mut HitMap<S>, ent: u64, fw_on_contig: bool| {
                 let tid = ec_entry_transcript_id(ent);
                 if let Some(target) = hit_map.get_mut(&tid) {
                     let ori = ent & 0x3;
@@ -582,11 +585,20 @@ fn collect_mappings_from_hits_binned<S: SketchHitInfo, D: KmerDictionary, C: Con
 /// Inner loop: iterate over raw hits, decode reference positions, accumulate
 /// into the hit map.
 ///
+/// Consecutive raw hits often land on the same contig, and every one of them
+/// visits that contig's whole occurrence list. The first hit of such a run
+/// resolves each occurrence to its `hit_map` slot (inserting targets in list
+/// order, exactly as a per-occurrence `entry()` would) and records the slots in
+/// `run_slots`; later hits on the same contig reuse them instead of hashing
+/// every occurrence again. Hits are still applied one at a time, each to all
+/// occurrences in list order, so every accumulator sees the same sequence of
+/// updates and the early stop fires at the same hit as before.
+///
 /// Returns `true` for early stop (no valid targets remaining).
 #[allow(clippy::too_many_arguments)]
 fn collect_mappings_from_hits<S: SketchHitInfo, D: KmerDictionary, C: ContigTableLike>(
     raw_hits: &[(i32, ProjectedHits<'_>)],
-    hit_map: &mut FixedMap<u32, S>,
+    hit_map: &mut HitMap<S>,
     num_valid_hits: &mut u32,
     min_occ: &mut u64,
     max_allowed_occ: u64,
@@ -595,11 +607,15 @@ fn collect_mappings_from_hits<S: SketchHitInfo, D: KmerDictionary, C: ContigTabl
     max_stretch: i32,
     perform_ambig_filtering: bool,
     ambiguous_hit_indices: &mut Vec<u32>,
+    run_slots: &mut Vec<(u32, u64)>,
     index: &ReferenceIndex<D, C>,
 ) -> bool {
     hit_map.clear();
     let encoding = index.encoding();
     let score_inc: f32 = 1.0;
+    // Contig whose occurrence slots `run_slots` holds; slots stay valid until
+    // `hit_map` is cleared, which only happens above.
+    let mut run_contig: Option<u32> = None;
 
     for (hit_idx, (read_pos, proj_hits)) in raw_hits.iter().enumerate() {
         let ref_range = proj_hits.ref_range();
@@ -607,15 +623,24 @@ fn collect_mappings_from_hits<S: SketchHitInfo, D: KmerDictionary, C: ContigTabl
         *min_occ = (*min_occ).min(num_occ);
 
         if num_occ <= max_allowed_occ {
+            let contig_id = proj_hits.contig_id();
+            if run_contig != Some(contig_id) {
+                run_slots.clear();
+                for entry in ref_range.iter() {
+                    let slot = hit_map.slot_or_insert(encoding.transcript_id(entry));
+                    run_slots.push((slot, entry));
+                }
+                run_contig = Some(contig_id);
+            }
+
             let mut still_have_valid_target = false;
 
-            for entry in ref_range.iter() {
+            for &(slot, entry) in run_slots.iter() {
                 let ref_pos_ori = proj_hits.decode_hit(entry, &encoding);
-                let tid = encoding.transcript_id(entry);
                 let pos = ref_pos_ori.pos as i32;
                 let ori = ref_pos_ori.is_fw;
 
-                let target = hit_map.entry(tid).or_default();
+                let target = hit_map.slot_mut(slot);
 
                 if target.max_hits_for_target() >= *num_valid_hits {
                     if ori {
@@ -655,7 +680,7 @@ mod tests {
     #[test]
     fn test_collect_empty_hits() {
         let raw_hits: Vec<(i32, ProjectedHits<'_>)> = Vec::new();
-        let mut hit_map: FixedMap<u32, SketchHitInfoSimple> = fixed_map();
+        let mut hit_map: HitMap<SketchHitInfoSimple> = HitMap::with_capacity(0);
         let num_valid = 0u32;
         let mut min_occ = u64::MAX;
         let mut ambig: Vec<u32> = Vec::new();
