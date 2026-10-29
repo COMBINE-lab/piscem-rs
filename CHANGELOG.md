@@ -15,7 +15,25 @@ pre-1.0, a minor bump may carry breaking changes.
   field. Iteration order is unchanged (see below), so mapping output is
   byte-identical.
 
+### Changed
+
+- **Mappings within a record are reported in transcript-id order** (forward
+  before reverse when a read maps to a transcript in both orientations),
+  instead of hash-map order. The set of mappings and every mapping's content
+  are unchanged; paired-end records were already in this order (pairing sorts
+  both mates), so only single-end and orphan records change, and only in the
+  order of their mappings. Output remains deterministic.
+
 ### Performance
+
+- **Hit collection tracks only targets still in contention.** A target can be
+  accepted only if every valid hit lands on it, so once one is missed it can
+  never qualify; `map_read` now keeps just the contenders, ascending by
+  transcript id, walking each hit's (ascending) occurrence list against them
+  instead of updating a hash map for every occurrence. Accepted mappings are
+  the same as before. salmon `--sketch` mapping is ~12% faster on 170 bp reads
+  against GENCODE v50 and ~20% on 75 bp reads against Ensembl cDNA.
+- `SketchHitInfoSimple` drops five fields nothing read (32 bytes, was 52).
 
 - **Faster hit collection on multi-isoform references.** Consecutive raw
   hits on one contig share its occurrence list; `collect_mappings_from_hits`

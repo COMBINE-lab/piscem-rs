@@ -28,6 +28,9 @@ pub struct MappingCache<S: SketchHitInfo> {
     /// Scratch for hit collection: the `(slot, contig-table entry)` of each
     /// occurrence of the contig the previous raw hit landed on.
     pub run_slots: Vec<(u32, u64)>,
+    /// Targets still in contention for the current read, ascending by
+    /// transcript id (see `engine::collect_live_targets`).
+    pub live: Vec<(u32, S)>,
     /// Final accepted hit list (after filtering).
     pub accepted_hits: Vec<SimpleHit>,
     /// Maximum number of reference occurrences before a k-mer is considered
@@ -76,6 +79,7 @@ impl<S: SketchHitInfo> MappingCache<S> {
             map_type: MappingType::Unmapped,
             hit_map,
             run_slots: Vec::with_capacity(max_hit_occ),
+            live: Vec::with_capacity(max_hit_occ),
             accepted_hits: Vec::with_capacity(64),
             max_hit_occ,
             max_hit_occ_recover,
@@ -95,6 +99,7 @@ impl<S: SketchHitInfo> MappingCache<S> {
     pub fn clear(&mut self) {
         self.map_type = MappingType::Unmapped;
         self.hit_map.clear();
+        self.live.clear();
         self.accepted_hits.clear();
         self.has_matching_kmers = false;
         self.ambiguous_hit_indices.clear();

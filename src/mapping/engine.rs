@@ -20,7 +20,7 @@ use crate::mapping::cache::MappingCache;
 use crate::mapping::filters::PoisonState;
 use crate::mapping::hit_map::HitMap;
 use crate::mapping::hit_searcher::{HitSearcher, SkippingStrategy};
-use crate::mapping::hits::{HitDirection, MappingType, SketchHitInfo};
+use crate::mapping::hits::{HitDirection, MappingType, SimpleHit, SketchHitInfo};
 use crate::mapping::projected_hits::ProjectedHits;
 use crate::mapping::streaming_query::PiscemStreamingQuery;
 
@@ -77,9 +77,9 @@ where
         let mao_first_pass = (cache.max_hit_occ - 1) as u64;
         let mut min_occ: u64 = u64::MAX;
 
-        early_stop = collect_mappings_from_hits(
+        let mut lean = collect_live_targets(
             raw_hits,
-            &mut cache.hit_map,
+            &mut cache.live,
             &mut num_valid_hits,
             &mut min_occ,
             mao_first_pass,
@@ -88,23 +88,21 @@ where
             max_stretch,
             perform_ambig_filtering,
             &mut cache.ambiguous_hit_indices,
-            &mut cache.run_slots,
             index,
         );
 
         // Recovery: if all k-mers exceeded threshold, retry with min_occ
-        if cache.attempt_occ_recover
+        if lean.is_some()
+            && cache.attempt_occ_recover
             && min_occ >= cache.max_hit_occ as u64
             && min_occ < cache.max_hit_occ_recover as u64
         {
             num_valid_hits = 0;
             cache.ambiguous_hit_indices.clear();
-            cache.hit_map.clear();
             let max_allowed_occ = min_occ;
-
-            early_stop = collect_mappings_from_hits(
+            lean = collect_live_targets(
                 raw_hits,
-                &mut cache.hit_map,
+                &mut cache.live,
                 &mut num_valid_hits,
                 &mut min_occ,
                 max_allowed_occ,
@@ -113,115 +111,113 @@ where
                 max_stretch,
                 perform_ambig_filtering,
                 &mut cache.ambiguous_hit_indices,
-                &mut cache.run_slots,
                 index,
             );
         }
 
-        // EC-based ambiguous hit filtering
-        if perform_ambig_filtering
-            && !cache.hit_map.is_empty()
-            && !cache.ambiguous_hit_indices.is_empty()
-        {
-            let ec_table = index.ec_table().unwrap();
-            cache.observed_ecs.clear();
-            let mut min_cardinality_ec_size = usize::MAX;
-            let mut min_cardinality_ec: u64 = u64::MAX;
-            let mut min_cardinality_index: u32 = 0;
-            let mut visited: usize = 0;
-
-            let visit_ec = |hit_map: &mut HitMap<S>, ent: u64, fw_on_contig: bool| {
-                let tid = ec_entry_transcript_id(ent);
-                if let Some(target) = hit_map.get_mut(&tid) {
-                    let ori = ent & 0x3;
-                    match ori {
-                        0 => {
-                            // FW
-                            if fw_on_contig {
-                                target.inc_fw_hits();
-                            } else {
-                                target.inc_rc_hits();
-                            }
-                        }
-                        1 => {
-                            // RC
-                            if fw_on_contig {
-                                target.inc_rc_hits();
-                            } else {
-                                target.inc_fw_hits();
-                            }
-                        }
-                        _ => {
-                            // Both
-                            target.inc_fw_hits();
-                            target.inc_rc_hits();
-                        }
+        if let Some(stopped) = lean {
+            early_stop = stopped;
+            if perform_ambig_filtering
+                && !cache.live.is_empty()
+                && !cache.ambiguous_hit_indices.is_empty()
+            {
+                let live = &mut cache.live;
+                let visit = |ent: u64, fw_on_contig: bool| {
+                    let tid = ec_entry_transcript_id(ent);
+                    if let Ok(i) = live.binary_search_by_key(&tid, |&(t, _)| t) {
+                        apply_ec_entry(&mut live[i].1, ent, fw_on_contig);
                     }
-                }
-            };
+                };
+                num_valid_hits += visit_ambiguous_ecs(
+                    raw_hits,
+                    &cache.ambiguous_hit_indices,
+                    index,
+                    max_ec_ambig,
+                    &mut cache.observed_ecs,
+                    visit,
+                );
+            }
+            for (tid, target) in cache.live.iter() {
+                push_if_accepted(*tid, target, num_valid_hits, &mut cache.accepted_hits);
+            }
+        } else {
+            // An occurrence list that is not ascending by transcript id (never
+            // the case for indexes piscem builds): the hash-map path handles
+            // any order.
+            num_valid_hits = 0;
+            min_occ = u64::MAX;
+            cache.ambiguous_hit_indices.clear();
+            cache.live.clear();
+            early_stop = collect_mappings_from_hits(
+                raw_hits,
+                &mut cache.hit_map,
+                &mut num_valid_hits,
+                &mut min_occ,
+                mao_first_pass,
+                signed_rl,
+                k,
+                max_stretch,
+                perform_ambig_filtering,
+                &mut cache.ambiguous_hit_indices,
+                &mut cache.run_slots,
+                index,
+            );
 
-            for &hit_idx in &cache.ambiguous_hit_indices {
-                let proj_hit = &raw_hits[hit_idx as usize].1;
-                let contig_id = proj_hit.contig_id();
-                let fw_on_contig = proj_hit.hit_fw_on_contig();
+            // Recovery: if all k-mers exceeded threshold, retry with min_occ
+            if cache.attempt_occ_recover
+                && min_occ >= cache.max_hit_occ as u64
+                && min_occ < cache.max_hit_occ_recover as u64
+            {
+                num_valid_hits = 0;
+                cache.ambiguous_hit_indices.clear();
+                cache.hit_map.clear();
+                let max_allowed_occ = min_occ;
 
-                let ec = ec_table.ec_for_tile(contig_id as u64);
-                let ec_key = ec | if fw_on_contig { 0 } else { 0x8000000000000000 };
-
-                if cache.observed_ecs.contains(&ec_key) {
-                    continue;
-                }
-                cache.observed_ecs.insert(ec_key);
-
-                let ec_entries = ec_table.entries_for_ec(ec);
-                if ec_entries.len() < min_cardinality_ec_size {
-                    min_cardinality_ec_size = ec_entries.len();
-                    min_cardinality_ec = ec;
-                    min_cardinality_index = hit_idx;
-                }
-                if ec_entries.len() > max_ec_ambig {
-                    continue;
-                }
-                visited += 1;
-                for ent in ec_entries.iter() {
-                    visit_ec(&mut cache.hit_map, ent, fw_on_contig);
-                }
-                num_valid_hits += 1;
+                early_stop = collect_mappings_from_hits(
+                    raw_hits,
+                    &mut cache.hit_map,
+                    &mut num_valid_hits,
+                    &mut min_occ,
+                    max_allowed_occ,
+                    signed_rl,
+                    k,
+                    max_stretch,
+                    perform_ambig_filtering,
+                    &mut cache.ambiguous_hit_indices,
+                    &mut cache.run_slots,
+                    index,
+                );
             }
 
-            // Last-ditch: visit the smallest EC if we didn't visit any.
-            if visited == 0 && min_cardinality_ec != u64::MAX {
-                let proj_hit = &raw_hits[min_cardinality_index as usize].1;
-                let fw_on_contig = proj_hit.hit_fw_on_contig();
-                let ec_entries = ec_table.entries_for_ec(min_cardinality_ec);
-                for ent in ec_entries.iter() {
-                    visit_ec(&mut cache.hit_map, ent, fw_on_contig);
-                }
-                num_valid_hits += 1;
+            // EC-based ambiguous hit filtering
+            if perform_ambig_filtering
+                && !cache.hit_map.is_empty()
+                && !cache.ambiguous_hit_indices.is_empty()
+            {
+                let hit_map = &mut cache.hit_map;
+                let visit = |ent: u64, fw_on_contig: bool| {
+                    if let Some(target) = hit_map.get_mut(&ec_entry_transcript_id(ent)) {
+                        apply_ec_entry(target, ent, fw_on_contig);
+                    }
+                };
+                num_valid_hits += visit_ambiguous_ecs(
+                    raw_hits,
+                    &cache.ambiguous_hit_indices,
+                    index,
+                    max_ec_ambig,
+                    &mut cache.observed_ecs,
+                    visit,
+                );
             }
-        }
 
-        // Final selection: keep targets with enough hits.
-        for (&tid, target) in &cache.hit_map {
-            let best_dir = target.best_hit_direction();
-            let simple_hit = if best_dir != HitDirection::Rc {
-                target.get_fw_hit()
-            } else {
-                target.get_rc_hit()
-            };
-
-            if simple_hit.num_hits >= num_valid_hits {
-                let mut h = simple_hit;
-                h.tid = tid;
-                cache.accepted_hits.push(h);
-
-                // If both directions are equally good, also add the RC hit.
-                if best_dir == HitDirection::Both {
-                    let mut rc_hit = target.get_rc_hit();
-                    rc_hit.tid = tid;
-                    cache.accepted_hits.push(rc_hit);
-                }
+            // Final selection: keep targets with enough hits, reported in
+            // the same transcript-id order as the live-target path.
+            for (&tid, target) in &cache.hit_map {
+                push_if_accepted(tid, target, num_valid_hits, &mut cache.accepted_hits);
             }
+            cache
+                .accepted_hits
+                .sort_unstable_by(|a, b| a.tid.cmp(&b.tid).then(b.is_fw.cmp(&a.is_fw)));
         }
     }
 
@@ -576,6 +572,239 @@ fn collect_mappings_from_hits_binned<S: SketchHitInfo, D: KmerDictionary, C: Con
             ambiguous_hit_indices.push(hit_idx as u32);
         }
     }
+}
+
+/// Credit one equivalence-class entry to `target`, as the EC-based ambiguous
+/// hit filter does: the entry's orientation relative to the transcript, read
+/// through the hit's orientation on the contig.
+#[inline]
+fn apply_ec_entry<S: SketchHitInfo>(target: &mut S, ent: u64, fw_on_contig: bool) {
+    match ent & 0x3 {
+        // FW
+        0 => {
+            if fw_on_contig {
+                target.inc_fw_hits();
+            } else {
+                target.inc_rc_hits();
+            }
+        }
+        // RC
+        1 => {
+            if fw_on_contig {
+                target.inc_rc_hits();
+            } else {
+                target.inc_fw_hits();
+            }
+        }
+        // Both
+        _ => {
+            target.inc_fw_hits();
+            target.inc_rc_hits();
+        }
+    }
+}
+
+/// EC-based ambiguous hit filtering: visit the equivalence class of each
+/// too-ambiguous raw hit (once per class and orientation, skipping classes
+/// larger than `max_ec_ambig`, or else the smallest class as a last resort),
+/// calling `visit` for every entry. Returns how many classes were visited,
+/// each of which counts as a valid hit.
+fn visit_ambiguous_ecs<D: KmerDictionary, C: ContigTableLike>(
+    raw_hits: &[(i32, ProjectedHits<'_>)],
+    ambiguous_hit_indices: &[u32],
+    index: &ReferenceIndex<D, C>,
+    max_ec_ambig: usize,
+    observed_ecs: &mut crate::hash::FixedSet<u64>,
+    mut visit: impl FnMut(u64, bool),
+) -> u32 {
+    let ec_table = index.ec_table().unwrap();
+    observed_ecs.clear();
+    let mut min_cardinality_ec_size = usize::MAX;
+    let mut min_cardinality_ec: u64 = u64::MAX;
+    let mut min_cardinality_index: u32 = 0;
+    let mut visited: u32 = 0;
+
+    for &hit_idx in ambiguous_hit_indices {
+        let proj_hit = &raw_hits[hit_idx as usize].1;
+        let contig_id = proj_hit.contig_id();
+        let fw_on_contig = proj_hit.hit_fw_on_contig();
+
+        let ec = ec_table.ec_for_tile(contig_id as u64);
+        let ec_key = ec | if fw_on_contig { 0 } else { 0x8000000000000000 };
+
+        if !observed_ecs.insert(ec_key) {
+            continue;
+        }
+
+        let ec_entries = ec_table.entries_for_ec(ec);
+        if ec_entries.len() < min_cardinality_ec_size {
+            min_cardinality_ec_size = ec_entries.len();
+            min_cardinality_ec = ec;
+            min_cardinality_index = hit_idx;
+        }
+        if ec_entries.len() > max_ec_ambig {
+            continue;
+        }
+        visited += 1;
+        for ent in ec_entries.iter() {
+            visit(ent, fw_on_contig);
+        }
+    }
+
+    // Last-ditch: visit the smallest EC if we didn't visit any.
+    if visited == 0 && min_cardinality_ec != u64::MAX {
+        let proj_hit = &raw_hits[min_cardinality_index as usize].1;
+        let fw_on_contig = proj_hit.hit_fw_on_contig();
+        for ent in ec_table.entries_for_ec(min_cardinality_ec).iter() {
+            visit(ent, fw_on_contig);
+        }
+        visited = 1;
+    }
+    visited
+}
+
+/// Final selection for one target: keep it if its better direction has
+/// `num_valid_hits` hits, adding the reverse hit too when both tie.
+#[inline]
+fn push_if_accepted<S: SketchHitInfo>(
+    tid: u32,
+    target: &S,
+    num_valid_hits: u32,
+    accepted_hits: &mut Vec<SimpleHit>,
+) {
+    let best_dir = target.best_hit_direction();
+    let simple_hit = if best_dir != HitDirection::Rc {
+        target.get_fw_hit()
+    } else {
+        target.get_rc_hit()
+    };
+
+    if simple_hit.num_hits >= num_valid_hits {
+        let mut h = simple_hit;
+        h.tid = tid;
+        accepted_hits.push(h);
+
+        // If both directions are equally good, also add the RC hit.
+        if best_dir == HitDirection::Both {
+            let mut rc_hit = target.get_rc_hit();
+            rc_hit.tid = tid;
+            accepted_hits.push(rc_hit);
+        }
+    }
+}
+
+/// Hit collection that tracks only the targets still in contention.
+///
+/// A target can be accepted only if it is *ahead* — `max_hits_for_target() >
+/// num_valid_hits` — after every valid hit: one that misses a hit, or is first
+/// seen after hit 0, can never pass the `num_valid_hits` gate again, and so
+/// cannot reach the acceptance threshold either (the ambiguous-EC credits that
+/// follow raise that threshold by as much as they can add). The plain
+/// collector still creates and updates such targets because they shape the
+/// hash map's iteration order. This one keeps just the contenders, in `live`,
+/// ascending by transcript id: the first valid hit seeds it from the contig's
+/// occurrence list, each later hit walks its occurrence list against `live`,
+/// applying the same gate and `add_fw`/`add_rc` calls in the same order, and
+/// then drops every target that is not ahead. The early stop — no touched
+/// target ahead — is exactly `live` becoming empty.
+///
+/// Accepted targets are the same, with the same accumulator state, as the
+/// plain collector's; they come out in transcript-id order (forward before
+/// reverse for a tie) rather than hash order, and `map_read` reports that
+/// order on both paths. Occurrence lists are ascending by transcript id in every index
+/// piscem builds; if one is not, this returns `None` and the caller falls
+/// back to [`collect_mappings_from_hits`].
+///
+/// Returns `Some(true)` for early stop.
+#[allow(clippy::too_many_arguments)]
+fn collect_live_targets<S: SketchHitInfo, D: KmerDictionary, C: ContigTableLike>(
+    raw_hits: &[(i32, ProjectedHits<'_>)],
+    live: &mut Vec<(u32, S)>,
+    num_valid_hits: &mut u32,
+    min_occ: &mut u64,
+    max_allowed_occ: u64,
+    signed_rl: i32,
+    k: i32,
+    max_stretch: i32,
+    perform_ambig_filtering: bool,
+    ambiguous_hit_indices: &mut Vec<u32>,
+    index: &ReferenceIndex<D, C>,
+) -> Option<bool> {
+    live.clear();
+    let encoding = index.encoding();
+    let score_inc: f32 = 1.0;
+
+    let apply = |target: &mut S, read_pos: i32, hit: &ProjectedHits<'_>, entry: u64, nvh: u32| {
+        if target.max_hits_for_target() >= nvh {
+            let ref_pos_ori = hit.decode_hit(entry, &encoding);
+            let pos = ref_pos_ori.pos as i32;
+            if ref_pos_ori.is_fw {
+                target.add_fw(pos, read_pos, signed_rl, k, max_stretch, score_inc);
+            } else {
+                target.add_rc(pos, read_pos, signed_rl, k, max_stretch, score_inc);
+            }
+        }
+    };
+
+    for (hit_idx, (read_pos, hit)) in raw_hits.iter().enumerate() {
+        let ref_range = hit.ref_range();
+        let num_occ = ref_range.len() as u64;
+        *min_occ = (*min_occ).min(num_occ);
+
+        if num_occ > max_allowed_occ {
+            if perform_ambig_filtering {
+                ambiguous_hit_indices.push(hit_idx as u32);
+            }
+            continue;
+        }
+
+        let nvh = *num_valid_hits;
+        let mut prev_tid: Option<u32> = None;
+        if nvh == 0 {
+            // Every occurrence enters; a transcript listed twice shares its
+            // accumulator, updated in list order.
+            for entry in ref_range.iter() {
+                let tid = encoding.transcript_id(entry);
+                match prev_tid {
+                    Some(p) if tid < p => return None,
+                    Some(p) if tid == p => {}
+                    _ => live.push((tid, S::default())),
+                }
+                prev_tid = Some(tid);
+                let target = &mut live.last_mut().unwrap().1;
+                apply(target, *read_pos, hit, entry, nvh);
+            }
+        } else {
+            let mut i = 0;
+            for entry in ref_range.iter() {
+                let tid = encoding.transcript_id(entry);
+                if prev_tid.is_some_and(|p| tid < p) {
+                    return None;
+                }
+                prev_tid = Some(tid);
+                while i < live.len() && live[i].0 < tid {
+                    i += 1;
+                }
+                if i == live.len() {
+                    // No contender remains at or beyond `tid`; the rest of
+                    // the list can only hold new (hopeless) targets, but it
+                    // must still be checked for order.
+                    continue;
+                }
+                if live[i].0 == tid {
+                    apply(&mut live[i].1, *read_pos, hit, entry, nvh);
+                }
+            }
+        }
+
+        live.retain(|(_, t)| t.max_hits_for_target() > nvh);
+        *num_valid_hits += 1;
+        if live.is_empty() {
+            return Some(true);
+        }
+    }
+
+    Some(false)
 }
 
 // ---------------------------------------------------------------------------
