@@ -16,20 +16,23 @@ use crate::mapping::hits::{HitDirection, SimpleHit, SketchHitInfo};
 /// orientation (FW / RC), along with approximate mapping positions.
 ///
 /// Corresponds to C++ `sketch_hit_info_no_struct_constraint`.
+/// Per-target hit accumulator for sketch mapping.
+///
+/// Only the state the mapping decision and the reported hits read is kept —
+/// per orientation: the last read position (to accept only advancing hits),
+/// the approximate mapping position, and the hit count and score — so the
+/// struct is 32 bytes and a read's targets pack densely. (The C++ original also
+/// tracked reference-side bounds that nothing reads; the chained variant in
+/// `chain_state` keeps those.)
 #[derive(Debug)]
 pub struct SketchHitInfoSimple {
     last_read_pos_fw: i32,
-    last_read_pos_rc: i32,
-    last_ref_pos_fw: i32,
-    last_ref_pos_rc: i32,
     approx_pos_fw: i32,
-    approx_pos_rc: i32,
-    approx_end_pos_rc: i32,
-    first_read_pos_rc: i32,
-    rightmost_bound_rc: i32,
     fw_hits: u32,
-    rc_hits: u32,
     fw_score: f32,
+    last_read_pos_rc: i32,
+    approx_pos_rc: i32,
+    rc_hits: u32,
     rc_score: f32,
 }
 
@@ -37,17 +40,12 @@ impl Default for SketchHitInfoSimple {
     fn default() -> Self {
         Self {
             last_read_pos_fw: -1,
-            last_read_pos_rc: -1,
-            last_ref_pos_fw: -1,
-            last_ref_pos_rc: i32::MAX,
             approx_pos_fw: -1,
-            approx_pos_rc: -1,
-            approx_end_pos_rc: -1,
-            first_read_pos_rc: -1,
-            rightmost_bound_rc: i32::MAX,
             fw_hits: 0,
-            rc_hits: 0,
             fw_score: 0.0,
+            last_read_pos_rc: -1,
+            approx_pos_rc: -1,
+            rc_hits: 0,
             rc_score: 0.0,
         }
     }
@@ -63,12 +61,10 @@ impl SketchHitInfo for SketchHitInfoSimple {
         _max_stretch: i32,
         score_inc: f32,
     ) -> bool {
-        let approx_map_pos = ref_pos - read_pos;
         if read_pos > self.last_read_pos_fw {
             if self.last_read_pos_fw == -1 {
-                self.approx_pos_fw = approx_map_pos;
+                self.approx_pos_fw = ref_pos - read_pos;
             }
-            self.last_ref_pos_fw = ref_pos;
             self.last_read_pos_fw = read_pos;
             self.fw_score += score_inc;
             self.fw_hits += 1;
@@ -86,17 +82,10 @@ impl SketchHitInfo for SketchHitInfoSimple {
         _max_stretch: i32,
         score_inc: f32,
     ) -> bool {
-        let approx_map_pos = ref_pos - (rl - (read_pos + k));
         if read_pos > self.last_read_pos_rc {
-            self.approx_pos_rc = approx_map_pos;
-            if self.last_read_pos_rc == -1 {
-                self.approx_end_pos_rc = ref_pos + read_pos;
-                self.first_read_pos_rc = read_pos;
-            }
+            self.approx_pos_rc = ref_pos - (rl - (read_pos + k));
             self.rc_score += score_inc;
             self.rc_hits += 1;
-            self.rightmost_bound_rc = self.last_ref_pos_rc;
-            self.last_ref_pos_rc = ref_pos;
             self.last_read_pos_rc = read_pos;
             return true;
         }
@@ -170,6 +159,11 @@ impl SketchHitInfo for SketchHitInfoSimple {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn accumulator_is_32_bytes() {
+        assert_eq!(std::mem::size_of::<super::SketchHitInfoSimple>(), 32);
+    }
+
     use super::*;
 
     #[test]
@@ -204,7 +198,8 @@ mod tests {
         let mut info = SketchHitInfoSimple::default();
         assert!(info.add_rc(200, 0, 100, 31, 100, 1.0));
         assert_eq!(info.rc_hits, 1);
-        assert_eq!(info.first_read_pos_rc, 0);
+        // ref_pos - (rl - (read_pos + k)) = 200 - (100 - 31)
+        assert_eq!(info.approx_pos_rc, 131);
     }
 
     #[test]
@@ -213,10 +208,11 @@ mod tests {
         assert!(info.add_rc(200, 0, 100, 31, 100, 1.0));
         assert!(info.add_rc(210, 5, 100, 31, 100, 1.0));
         assert_eq!(info.rc_hits, 2);
-        // first_read_pos_rc should stay as 0 (only set on first hit)
-        assert_eq!(info.first_read_pos_rc, 0);
-        // rightmost_bound_rc should be updated to previous last_ref_pos_rc
-        assert_eq!(info.rightmost_bound_rc, 200);
+        // The reverse position follows the latest hit: 210 - (100 - (5 + 31)).
+        assert_eq!(info.approx_pos_rc, 146);
+        // A non-advancing read position is rejected.
+        assert!(!info.add_rc(220, 5, 100, 31, 100, 1.0));
+        assert_eq!(info.rc_hits, 2);
     }
 
     #[test]
