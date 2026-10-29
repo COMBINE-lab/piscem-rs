@@ -379,7 +379,10 @@ impl EqClassMapBuilder {
             num_tiles,
             tile_to_ec: vec![0; num_tiles],
             labels: Vec::new(),
-            label_to_ec: HashTable::new(),
+            // A tile adds at most one EC, so this never grows: growing would
+            // rehash every label interned so far, a pass of random reads
+            // through `labels` each time the table doubles.
+            label_to_ec: HashTable::with_capacity(num_tiles),
             hasher: crate::hash::fixed_state(),
             max_transcript_id: 0,
         }
@@ -391,6 +394,27 @@ impl EqClassMapBuilder {
     pub fn add_tile(&mut self, tile_id: usize, mut label: Vec<(u32, Orientation)>) {
         // Sort for consistent hashing/comparison
         label.sort();
+        let hash = self.label_hash(&label);
+        self.add_sorted_tile(tile_id, label, hash);
+    }
+
+    /// The hash [`add_sorted_tile`](Self::add_sorted_tile) expects for a sorted
+    /// label. Depends only on the label, so it can be computed for many labels
+    /// in parallel (`&self` is `Sync`) ahead of their sequential insertion.
+    pub fn label_hash(&self, sorted_label: &[(u32, Orientation)]) -> u64 {
+        self.hasher.hash_one(sorted_label)
+    }
+
+    /// Add a tile whose label is already sorted, with its
+    /// [`label_hash`](Self::label_hash). EC ids are assigned in order of first
+    /// insertion, exactly as [`add_tile`](Self::add_tile) assigns them.
+    pub fn add_sorted_tile(&mut self, tile_id: usize, label: Vec<(u32, Orientation)>, hash: u64) {
+        debug_assert!(label.is_sorted(), "label must be sorted");
+        debug_assert_eq!(
+            hash,
+            self.label_hash(&label),
+            "hash must be label_hash(label)"
+        );
 
         let Self {
             tile_to_ec,
@@ -405,8 +429,6 @@ impl EqClassMapBuilder {
         for &(tid, _) in &label {
             *max_transcript_id = (*max_transcript_id).max(tid);
         }
-
-        let hash = hasher.hash_one(label.as_slice());
 
         // Existing EC. The table stores ids, so equality compares against the
         // single copy already in `labels` — no second copy is ever made.

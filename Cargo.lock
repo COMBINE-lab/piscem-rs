@@ -1745,6 +1745,7 @@ dependencies = [
  "niffler",
  "paraseq-temp",
  "rapidgzip-core",
+ "rayon",
  "seq_geom_parser",
  "serde",
  "serde_json",
