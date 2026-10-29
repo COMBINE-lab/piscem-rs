@@ -3,6 +3,35 @@
 Notable changes to `piscem-rs`. Versions follow [Semantic Versioning](https://semver.org);
 pre-1.0, a minor bump may carry breaking changes.
 
+## [Unreleased]
+
+### Breaking
+
+- `MappingCache::hit_map` is now a `HitMap<S>` (new module
+  `mapping::hit_map`) instead of a `FixedMap<u32, S>`. It keeps the methods
+  callers used (`get`, `get_mut`, `insert`, `iter`, `values`, `len`,
+  `is_empty`, `clear`, `&map` iteration) and adds slot access
+  (`slot_or_insert`, `slot_mut`). `MappingCache` gains a `run_slots` scratch
+  field. Iteration order is unchanged (see below), so mapping output is
+  byte-identical.
+
+### Performance
+
+- **Faster hit collection on multi-isoform references.** Consecutive raw
+  hits on one contig share its occurrence list; `collect_mappings_from_hits`
+  now resolves that list to accumulator slots once per run and applies the
+  run target by target, and `HitMap` answers lookups from a
+  generation-stamped direct index instead of hashing. The hash table is
+  touched once per distinct target (to insert it), and since a SwissTable's
+  layout depends only on its insertion sequence, iteration order — which
+  reaches the RAD output — is unchanged. Every accumulator sees the same
+  update sequence, and the early stop fires at the same hit. Verified
+  byte-identical `map-bulk` RAD (PE, SE, `--ignore-ambig-hits`; 75 bp
+  GEUVADIS reads on Ensembl cDNA and 170 bp reads on GENCODE v50) and
+  byte-identical salmon RAD/quant. Single-threaded mapping on 170 bp reads
+  against GENCODE v50 (48 occurrences per hit on average) is ~20% faster;
+  short reads on less redundant references gain less.
+
 ## [0.11.1] — 2026-10-22
 
 ### Fixed
