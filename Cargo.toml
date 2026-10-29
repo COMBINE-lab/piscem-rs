@@ -85,6 +85,10 @@ libc = "0.2"
 # Fast hashing with deterministic seeding (same version as sshash-rs)
 ahash = "0.8"
 
+# Data-parallel index-build steps (parsing tilings); already in the tree via
+# sshash-lib.
+rayon = "1.11"
+
 # `HashTable`: a raw table keyed by hash with caller-supplied equality, which
 # `std` cannot express (`raw_entry` is still unstable). Used by
 # `index::eq_classes` to intern EC labels by id rather than storing a second
