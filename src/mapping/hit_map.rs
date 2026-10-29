@@ -9,11 +9,16 @@
 //!
 //! Iteration visits targets in the hash table's order, which depends only on
 //! the hasher, the capacity and the sequence of inserted keys — never on the
-//! value type. Callers that insert the same keys in the same order therefore
-//! see exactly the order the old `FixedMap<u32, S>` produced, which matters
-//! because that order reaches the RAD output (see [`crate::hash`]).
-
-use std::collections::hash_map::Entry;
+//! value type, and never on lookups. Callers that insert the same keys in the
+//! same order therefore see exactly the order the old `FixedMap<u32, S>`
+//! produced, which matters because that order reaches the RAD output (see
+//! [`crate::hash`]).
+//!
+//! Lookups do not go through the hash table at all: a direct-indexed array,
+//! stamped with a per-read generation, answers "is `tid` present, and in which
+//! slot" with one load. The table is touched once per distinct target, to
+//! insert it, and is otherwise only iterated. Clearing bumps the generation
+//! instead of wiping the array.
 
 use crate::hash::{FixedMap, fixed_map_with_capacity};
 
@@ -21,8 +26,13 @@ use crate::hash::{FixedMap, fixed_map_with_capacity};
 /// [`clear`](Self::clear).
 #[derive(Debug)]
 pub struct HitMap<S> {
+    /// Insertion record whose iteration order callers observe.
     slots: FixedMap<u32, u32>,
     targets: Vec<S>,
+    /// `(generation << 32) | slot` per target id, grown on demand; an entry
+    /// is live only when its generation is the current one.
+    index: Vec<u64>,
+    generation: u32,
 }
 
 impl<S: Default> HitMap<S> {
@@ -31,6 +41,8 @@ impl<S: Default> HitMap<S> {
         Self {
             slots: fixed_map_with_capacity(capacity),
             targets: Vec::with_capacity(capacity),
+            index: Vec::new(),
+            generation: 1,
         }
     }
 
@@ -38,15 +50,27 @@ impl<S: Default> HitMap<S> {
     /// `tid` is absent.
     #[inline]
     pub fn slot_or_insert(&mut self, tid: u32) -> u32 {
-        match self.slots.entry(tid) {
-            Entry::Occupied(e) => *e.get(),
-            Entry::Vacant(e) => {
-                let slot = self.targets.len() as u32;
-                self.targets.push(S::default());
-                e.insert(slot);
-                slot
-            }
+        if let Some(slot) = self.lookup(tid) {
+            return slot;
         }
+        self.insert_new(tid)
+    }
+
+    #[cold]
+    fn grow_index(&mut self, tid: u32) {
+        let len = (tid as usize + 1).next_power_of_two();
+        self.index.resize(len, 0);
+    }
+
+    fn insert_new(&mut self, tid: u32) -> u32 {
+        let slot = self.targets.len() as u32;
+        self.targets.push(S::default());
+        self.slots.insert(tid, slot);
+        if tid as usize >= self.index.len() {
+            self.grow_index(tid);
+        }
+        self.index[tid as usize] = (u64::from(self.generation) << 32) | u64::from(slot);
+        slot
     }
 
     /// `tid`'s accumulator, inserting a default one first if absent.
@@ -64,6 +88,13 @@ impl<S: Default> HitMap<S> {
 }
 
 impl<S> HitMap<S> {
+    /// `tid`'s slot, if present.
+    #[inline]
+    fn lookup(&self, tid: u32) -> Option<u32> {
+        let v = *self.index.get(tid as usize)?;
+        ((v >> 32) as u32 == self.generation).then_some(v as u32)
+    }
+
     /// The accumulator in `slot`, as returned by
     /// [`slot_or_insert`](HitMap::slot_or_insert) since the last clear.
     #[inline]
@@ -74,13 +105,13 @@ impl<S> HitMap<S> {
     /// `tid`'s accumulator, if present.
     #[inline]
     pub fn get(&self, tid: &u32) -> Option<&S> {
-        self.slots.get(tid).map(|&s| &self.targets[s as usize])
+        self.lookup(*tid).map(|s| &self.targets[s as usize])
     }
 
     /// `tid`'s accumulator, if present.
     #[inline]
     pub fn get_mut(&mut self, tid: &u32) -> Option<&mut S> {
-        self.slots.get(tid).map(|&s| &mut self.targets[s as usize])
+        self.lookup(*tid).map(|s| &mut self.targets[s as usize])
     }
 
     /// Remove every target; previously returned slots become invalid.
@@ -88,6 +119,11 @@ impl<S> HitMap<S> {
     pub fn clear(&mut self) {
         self.slots.clear();
         self.targets.clear();
+        if self.generation == u32::MAX {
+            self.index.fill(0);
+            self.generation = 0;
+        }
+        self.generation += 1;
     }
 
     /// Number of targets.
@@ -164,6 +200,17 @@ mod tests {
         m.clear();
         assert!(m.is_empty());
         assert_eq!(m.get(&7), None);
+    }
+
+    #[test]
+    fn generation_wrap_forgets_every_target() {
+        let mut m: HitMap<u32> = HitMap::with_capacity(4);
+        m.generation = u32::MAX;
+        m.slot_or_insert(3);
+        m.clear();
+        assert_eq!(m.generation, 1);
+        assert_eq!(m.get(&3), None);
+        assert_eq!(m.slot_or_insert(3), 0);
     }
 
     #[test]
