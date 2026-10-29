@@ -585,14 +585,24 @@ fn collect_mappings_from_hits_binned<S: SketchHitInfo, D: KmerDictionary, C: Con
 /// Inner loop: iterate over raw hits, decode reference positions, accumulate
 /// into the hit map.
 ///
-/// Consecutive raw hits often land on the same contig, and every one of them
-/// visits that contig's whole occurrence list. The first hit of such a run
-/// resolves each occurrence to its `hit_map` slot (inserting targets in list
-/// order, exactly as a per-occurrence `entry()` would) and records the slots in
-/// `run_slots`; later hits on the same contig reuse them instead of hashing
-/// every occurrence again. Hits are still applied one at a time, each to all
-/// occurrences in list order, so every accumulator sees the same sequence of
-/// updates and the early stop fires at the same hit as before.
+/// Raw hits are processed in *runs*: maximal stretches of consecutive hits on
+/// the same contig, which therefore share one occurrence list. The run's first
+/// hit resolves every occurrence to its `hit_map` slot, inserting targets in
+/// list order exactly as a per-occurrence `entry()` would, so the map's
+/// contents and iteration order are those of the plain hit-by-hit loop.
+///
+/// A run is then applied target by target rather than hit by hit. That is the
+/// same computation: targets are independent, and each still receives the
+/// run's hits in order with the same `num_valid_hits` gate, so it ends in the
+/// same state. The one coupling between targets — the early stop after the
+/// first hit that leaves no target ahead of `num_valid_hits` — is recovered from
+/// a per-hit bitmask; the hits a target-major pass applies past that point are
+/// no-ops, because a target that is not ahead after hit `j` fails the gate for
+/// every later hit. The only case where order *within* a target could differ
+/// is a transcript listed twice for one contig (its forward and reverse hits
+/// interleave differently), so runs whose occurrence list is not strictly
+/// ascending in transcript id — never the case for lists piscem builds, which
+/// are in reference order — take the hit-by-hit path.
 ///
 /// Returns `true` for early stop (no valid targets remaining).
 #[allow(clippy::too_many_arguments)]
@@ -610,57 +620,99 @@ fn collect_mappings_from_hits<S: SketchHitInfo, D: KmerDictionary, C: ContigTabl
     run_slots: &mut Vec<(u32, u64)>,
     index: &ReferenceIndex<D, C>,
 ) -> bool {
+    /// Longest run handled target-major; bounded by the bitmask width.
+    const MAX_RUN: usize = u64::BITS as usize;
+
     hit_map.clear();
     let encoding = index.encoding();
     let score_inc: f32 = 1.0;
-    // Contig whose occurrence slots `run_slots` holds; slots stay valid until
-    // `hit_map` is cleared, which only happens above.
-    let mut run_contig: Option<u32> = None;
 
-    for (hit_idx, (read_pos, proj_hits)) in raw_hits.iter().enumerate() {
+    // Apply one hit to one target; `None` if the target fails the gate,
+    // otherwise whether it is now ahead of `nvh`.
+    let apply = |target: &mut S, read_pos: i32, hit: &ProjectedHits<'_>, entry: u64, nvh: u32| {
+        if target.max_hits_for_target() < nvh {
+            return None;
+        }
+        let ref_pos_ori = hit.decode_hit(entry, &encoding);
+        let pos = ref_pos_ori.pos as i32;
+        if ref_pos_ori.is_fw {
+            target.add_fw(pos, read_pos, signed_rl, k, max_stretch, score_inc);
+        } else {
+            target.add_rc(pos, read_pos, signed_rl, k, max_stretch, score_inc);
+        }
+        Some(target.max_hits_for_target() > nvh)
+    };
+
+    let mut i = 0;
+    while i < raw_hits.len() {
+        let proj_hits = &raw_hits[i].1;
         let ref_range = proj_hits.ref_range();
         let num_occ = ref_range.len() as u64;
         *min_occ = (*min_occ).min(num_occ);
 
-        if num_occ <= max_allowed_occ {
-            let contig_id = proj_hits.contig_id();
-            if run_contig != Some(contig_id) {
-                run_slots.clear();
-                for entry in ref_range.iter() {
-                    let slot = hit_map.slot_or_insert(encoding.transcript_id(entry));
-                    run_slots.push((slot, entry));
-                }
-                run_contig = Some(contig_id);
+        if num_occ > max_allowed_occ {
+            if perform_ambig_filtering {
+                ambiguous_hit_indices.push(i as u32);
             }
+            i += 1;
+            continue;
+        }
 
-            let mut still_have_valid_target = false;
+        // Every hit in the run shares this occurrence list, so all are valid
+        // and leave `min_occ` where it is.
+        let contig_id = proj_hits.contig_id();
+        let mut end = i + 1;
+        while end < raw_hits.len() && end - i < MAX_RUN && raw_hits[end].1.contig_id() == contig_id
+        {
+            end += 1;
+        }
+        let run = &raw_hits[i..end];
 
+        run_slots.clear();
+        let mut ascending = true;
+        let mut prev_tid: Option<u32> = None;
+        for entry in ref_range.iter() {
+            let tid = encoding.transcript_id(entry);
+            ascending &= prev_tid.is_none_or(|p| tid > p);
+            prev_tid = Some(tid);
+            run_slots.push((hit_map.slot_or_insert(tid), entry));
+        }
+
+        let nvh0 = *num_valid_hits;
+        if run.len() > 1 && ascending {
+            // Bit `j` set: some target is ahead of `num_valid_hits` after hit `j`.
+            let mut ahead: u64 = 0;
             for &(slot, entry) in run_slots.iter() {
-                let ref_pos_ori = proj_hits.decode_hit(entry, &encoding);
-                let pos = ref_pos_ori.pos as i32;
-                let ori = ref_pos_ori.is_fw;
-
                 let target = hit_map.slot_mut(slot);
-
-                if target.max_hits_for_target() >= *num_valid_hits {
-                    if ori {
-                        target.add_fw(pos, *read_pos, signed_rl, k, max_stretch, score_inc);
-                    } else {
-                        target.add_rc(pos, *read_pos, signed_rl, k, max_stretch, score_inc);
+                for (j, (read_pos, hit)) in run.iter().enumerate() {
+                    match apply(target, *read_pos, hit, entry, nvh0 + j as u32) {
+                        None => break,
+                        Some(true) => ahead |= 1 << j,
+                        Some(false) => {}
                     }
-
-                    still_have_valid_target |= target.max_hits_for_target() > *num_valid_hits;
                 }
             }
-
-            *num_valid_hits += 1;
-
-            if !still_have_valid_target {
+            let survived = ahead.trailing_ones() as usize;
+            if survived < run.len() {
+                *num_valid_hits = nvh0 + survived as u32 + 1;
                 return true;
             }
-        } else if perform_ambig_filtering {
-            ambiguous_hit_indices.push(hit_idx as u32);
+            *num_valid_hits = nvh0 + run.len() as u32;
+        } else {
+            for (read_pos, hit) in run {
+                let mut still_have_valid_target = false;
+                for &(slot, entry) in run_slots.iter() {
+                    let target = hit_map.slot_mut(slot);
+                    still_have_valid_target |=
+                        apply(target, *read_pos, hit, entry, *num_valid_hits) == Some(true);
+                }
+                *num_valid_hits += 1;
+                if !still_have_valid_target {
+                    return true;
+                }
+            }
         }
+        i = end;
     }
 
     false
