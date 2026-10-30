@@ -3,6 +3,34 @@
 Notable changes to `piscem-rs`. Versions follow [Semantic Versioning](https://semver.org);
 pre-1.0, a minor bump may carry breaking changes.
 
+## [0.12.1] — 2026-10-30
+
+### Performance
+
+Mapping output is byte-identical to 0.12.0 (salmon `quant.sf` and RAD files at
+`-p 1` and `-p 8`, SRR13638690 / GENCODE v50 and GEUVADIS / Ensembl), and
+indexes are unchanged. Together with sshash-lib 0.8.1, salmon `--sketch`
+maps ~7–9% faster on x86-64 (1–16 threads) and ~13% faster on Apple M5 at one
+thread; selective alignment ~2% faster.
+
+- `ContigTable::contig_entries` reads a contig's span bounds with one
+  Elias–Fano select instead of two.
+- Packed contig-table entries are decoded straight from the backing words,
+  without sux's branch on whether an entry straddles two words (unpredictable
+  for 40-bit entries).
+- `is_homopolymer` compares eight bytes at a time and tests once, instead of
+  an early-exit byte loop that mispredicted on nearly every k-mer.
+- **Serial gzip input is decoded with [sirocco](https://crates.io/crates/sirocco)**
+  instead of flate2/zlib-rs: ~45% faster decoding on x86-64 and ~40% on
+  Apple M5, which matters when a single mapping thread decodes inline.
+  Multi-member streams are read in full; non-gzip input still goes through
+  niffler; multi-threaded decoding (rapidgzip) is unchanged.
+
+### Dependencies
+
+- sshash-lib 0.8.0 → 0.8.1.
+- New: sirocco 0.3 (serial gzip decoding).
+
 ## [0.12.0] — 2026-10-30
 
 ### Breaking
