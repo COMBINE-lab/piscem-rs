@@ -3,6 +3,7 @@ pub mod cache;
 pub mod chain_state;
 pub mod engine;
 pub mod filters;
+pub mod hit_map;
 pub mod hit_searcher;
 pub mod hits;
 pub mod kmer_value;

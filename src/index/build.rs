@@ -10,7 +10,8 @@
 use anyhow::{Context, Result, bail};
 use sshash_lib::{BuildConfiguration, DictionaryBuilder, parse_cf_seg};
 use std::collections::HashMap;
-use std::io::BufRead;
+
+use crate::hash::FixedMap;
 use std::path::PathBuf;
 use tracing::info;
 
@@ -69,56 +70,6 @@ pub struct BuildConfig {
 // Internal types
 // ---------------------------------------------------------------------------
 
-/// Segment metadata collected from .cf_seg parsing.
-struct SegmentInfo {
-    /// Index in file order (0-based rank).
-    rank: u32,
-    /// Sequence length in bases.
-    len: u32,
-    /// Number of occurrences across all references (counted in first pass).
-    count: u32,
-}
-
-/// Parsed tile from a .cf_seq tiling line.
-enum Tile {
-    /// A normal segment tile with ID and orientation.
-    Segment { id: u64, is_fw: bool },
-    /// A gap (N-tile) with the number of N's.
-    Gap { count: u64 },
-}
-
-/// Parse a single tile token from a .cf_seq tiling line.
-///
-/// Formats: `<id>+` (forward), `<id>-` (reverse), `N<count>` (gap).
-fn parse_tile(tok: &str) -> Result<Tile> {
-    let last = tok.as_bytes().last().context("empty tile token")?;
-
-    match *last {
-        b'+' => {
-            let id: u64 = tok[..tok.len() - 1]
-                .parse()
-                .with_context(|| format!("invalid segment id in '{tok}'"))?;
-            Ok(Tile::Segment { id, is_fw: true })
-        }
-        b'-' => {
-            let id: u64 = tok[..tok.len() - 1]
-                .parse()
-                .with_context(|| format!("invalid segment id in '{tok}'"))?;
-            Ok(Tile::Segment { id, is_fw: false })
-        }
-        _ => {
-            if let Some(rest) = tok.strip_prefix('N') {
-                let count: u64 = rest
-                    .parse()
-                    .with_context(|| format!("invalid N-tile count in '{tok}'"))?;
-                Ok(Tile::Gap { count })
-            } else {
-                bail!("invalid tile token: '{tok}' (must end with +/- or start with N)")
-            }
-        }
-    }
-}
-
 #[derive(Default)]
 struct ReferenceMetadata {
     short_refs: Vec<(String, u64)>,
@@ -156,13 +107,49 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
     let num_segments = cf_data.len();
     info!("  {num_segments} segments");
 
-    // Extract segment IDs and lengths before moving sequences to dictionary builder.
-    // We defer building the full id_to_info HashMap (~2-4 GB for 50M segments) until
-    // AFTER dictionary build to reduce peak RSS during the memory-intensive MPHF phase.
-    let segment_lens: Vec<u32> = cf_data.sequences.iter().map(|s| s.len() as u32).collect();
-    let segment_ids = std::mem::take(&mut cf_data.segment_ids);
+    // The build's own data-parallel steps run on `num_threads` workers, like
+    // the dictionary build (0 = all cores).
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(config.num_threads)
+        .build()
+        .context("failed to create the index-build thread pool")?;
 
-    // Step 2: Build SSHash dictionary from unitig sequences
+    // Step 2: Parse .cf_seq — reference names and lengths, each reference's
+    //         tiles, and per-unitig occurrence counts for the direct-write
+    //         builder — with segments provisionally ranked in file order.
+    info!("Parsing tilings in {cf_seq_path}");
+    let mut tilings = {
+        let mut id_to_rank: FixedMap<u64, u32> =
+            FixedMap::with_capacity_and_hasher(num_segments, crate::hash::fixed_state());
+        for (rank, &seg_id) in cf_data.segment_ids.iter().enumerate() {
+            id_to_rank.insert(seg_id, rank as u32);
+        }
+        let file_lens: Vec<u32> = cf_data.sequences.iter().map(|s| s.len() as u32).collect();
+        pool.install(|| parse_cf_seq(&cf_seq_path, &json_path, k, &id_to_rank, &file_lens))?
+    };
+    let num_refs = tilings.names.len();
+    let max_ref_len = tilings.max_ref_len;
+    info!("  {num_refs} references, max_ref_len={max_ref_len}");
+
+    // Number the contigs in order of first appearance in the tilings, rather
+    // than in .cf_seg file order: cDBG builders write segments in whatever
+    // order their threads finish them (cf1-rs does), so file order made every
+    // index file differ from build to build of the same reference. Order of
+    // first appearance is reproducible and keeps the contigs of a reference
+    // close together.
+    let order = first_appearance_order(&tilings, &cf_data.segment_ids);
+    pool.install(|| tilings.renumber(&order));
+    let sequences: Vec<String> = {
+        let mut by_file_rank = std::mem::take(&mut cf_data.sequences);
+        order
+            .iter()
+            .map(|&old| std::mem::take(&mut by_file_rank[old as usize]))
+            .collect()
+    };
+    drop(cf_data);
+    let segment_lens: Vec<u32> = sequences.iter().map(|s| s.len() as u32).collect();
+
+    // Step 3: Build SSHash dictionary from unitig sequences
     info!(
         "Building SSHash dictionary (k={}, m={})",
         config.k, config.m
@@ -179,45 +166,18 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
 
     let dict_builder = DictionaryBuilder::new(build_cfg)
         .map_err(|e| anyhow::anyhow!("failed to create dictionary builder: {e}"))?;
-    // Moves sequences into the builder — cf_data.sequences consumed here
+    // Moves sequences into the builder
     let dict = dict_builder
-        .build_from_sequences(cf_data.sequences)
+        .build_from_sequences(sequences)
         .map_err(|e| anyhow::anyhow!("failed to build dictionary: {e}"))?;
     info!("  Dictionary built: {} strings", dict.num_strings());
 
-    // Now build id_to_info from the lightweight arrays (after peak RSS has passed)
-    let mut id_to_info: HashMap<u64, SegmentInfo> = HashMap::with_capacity(num_segments);
-    for (rank, (&seg_id, &len)) in segment_ids.iter().zip(segment_lens.iter()).enumerate() {
-        id_to_info.insert(
-            seg_id,
-            SegmentInfo {
-                rank: rank as u32,
-                len,
-                count: 0,
-            },
-        );
-    }
-    drop(segment_ids);
-    drop(segment_lens);
-
-    // Step 3: First pass over .cf_seq — collect reference names, lengths,
-    //         and count per-unitig occurrences for the direct-write builder.
-    info!("First pass over {cf_seq_path}");
-    let (ref_names, ref_lens, max_ref_len) =
-        first_pass_cf_seq(&cf_seq_path, &json_path, k, &mut id_to_info)?;
-    let num_refs = ref_names.len();
-    info!("  {num_refs} references, max_ref_len={max_ref_len}");
-
-    // Step 4: Second pass over .cf_seq — build ContigTable using direct-write builder
-    info!("Second pass over {cf_seq_path} to fill contig entries");
+    // Step 4: Fill the ContigTable from the parsed tiles.
+    info!("Filling contig entries");
     let contig_table = {
-        // Extract per-rank counts from id_to_info
-        let mut counts = vec![0u32; num_segments];
-        for info in id_to_info.values() {
-            counts[info.rank as usize] = info.count;
-        }
-        let mut ctab_builder = ContigTableDirectBuilder::new(&counts, max_ref_len, num_refs as u64);
-        second_pass_cf_seq(&cf_seq_path, k, &id_to_info, &mut ctab_builder)?;
+        let mut ctab_builder =
+            ContigTableDirectBuilder::new(&tilings.counts, max_ref_len, num_refs as u64);
+        fill_contig_table(&tilings, k, &segment_lens, &mut ctab_builder);
         ctab_builder.build()
     };
     info!(
@@ -225,16 +185,25 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
         contig_table.num_contigs(),
         contig_table.num_entries()
     );
-    // Free segment metadata — no longer needed after both passes
-    drop(id_to_info);
+    drop(segment_lens);
+    let Tilings {
+        names: ref_names,
+        ref_lens,
+        ..
+    } = tilings;
 
     // Step 5: Build EqClassMap (optional)
     let ec_table = if config.build_ec_table {
         info!("Building equivalence class table");
+        use rayon::prelude::*;
+
         let encoding = contig_table.encoding();
         let mut ec_builder = EqClassMapBuilder::new(num_segments);
 
-        for tile_idx in 0..num_segments {
+        // A tile's sorted label (and its hash) depends only on its contig
+        // entries, so blocks of labels are computed in parallel; they are then
+        // interned in tile order, which keeps EC ids in first-occurrence order.
+        let tile_label = |tile_idx: usize| {
             let span = contig_table.contig_entries(tile_idx as u64);
             let mut label: Vec<(u32, Orientation)> = Vec::new();
             let mut prev_tid: u32 = 0;
@@ -260,8 +229,26 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
                 prev_dir = dir;
                 first = false;
             }
-
-            ec_builder.add_tile(tile_idx, label);
+            label.sort();
+            label
+        };
+        const LABEL_BLOCK: usize = 1 << 18;
+        for block_start in (0..num_segments).step_by(LABEL_BLOCK) {
+            let block = block_start..(block_start + LABEL_BLOCK).min(num_segments);
+            let labelled: Vec<_> = pool.install(|| {
+                block
+                    .clone()
+                    .into_par_iter()
+                    .map(|tile_idx| {
+                        let label = tile_label(tile_idx);
+                        let hash = ec_builder.label_hash(&label);
+                        (label, hash)
+                    })
+                    .collect()
+            });
+            for (tile_idx, (label, hash)) in block.zip(labelled) {
+                ec_builder.add_sorted_tile(tile_idx, label, hash);
+            }
         }
 
         let ec = ec_builder.build();
@@ -323,157 +310,265 @@ pub fn build_index(config: &BuildConfig) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// First pass: reference info collection
+// Reference tilings (.cf_seq)
 // ---------------------------------------------------------------------------
 
-/// First pass over the .cf_seq file: collects reference names and lengths.
+/// Marks a gap (N-run) in a packed tile code; the low bits hold its length.
+const GAP_TILE: u64 = 1 << 63;
+
+/// The reference tilings of a `.cf_seq` file, parsed once.
 ///
-/// Each line has format: `Reference:N_Sequence:<name>\t<tiles...>`
+/// Tiles are packed one per `u64` and the per-reference lists concatenated
+/// per parse chunk, so filling the contig table afterwards re-reads neither the
+/// text nor the segment-id map.
+struct Tilings {
+    /// Reference names in file order, then the short references from the JSON.
+    names: Vec<String>,
+    /// Reference lengths, parallel to `names`.
+    ref_lens: Vec<u64>,
+    max_ref_len: u64,
+    /// Occurrences of each unitig (by rank) across all tilings.
+    counts: Vec<u32>,
+    /// The tilings, in reference order, split into the chunks they were
+    /// parsed in.
+    chunks: Vec<TileChunk>,
+}
+
+/// The packed tiles of a run of consecutive references.
+#[derive(Default)]
+struct TileChunk {
+    /// Segment tiles are `rank << 1 | is_fw`; gaps are `GAP_TILE | count`.
+    tiles: Vec<u64>,
+    /// `tiles[starts[i]..starts[i + 1]]` belong to the chunk's `i`-th reference.
+    starts: Vec<usize>,
+    names: Vec<String>,
+    ref_lens: Vec<u64>,
+}
+
+/// Parse a decimal `u64` from ASCII digits, rejecting anything else.
+fn parse_u64(digits: &[u8]) -> Option<u64> {
+    if digits.is_empty() {
+        return None;
+    }
+    digits.iter().try_fold(0u64, |acc, &b| {
+        let d = b.wrapping_sub(b'0');
+        (d < 10)
+            .then_some(())
+            .and_then(|()| acc.checked_mul(10)?.checked_add(d as u64))
+    })
+}
+
+/// Parse the `.cf_seq` file: reference names and lengths, the packed tiles of
+/// every reference, and how often each unitig occurs.
 ///
-/// After processing .cf_seq, parses the .json file for short references
-/// (sequences shorter than k that don't appear in the tiling).
-fn first_pass_cf_seq(
+/// Each line has format: `Reference:N_Sequence:<name>\t<tiles...>`. Lines are
+/// parsed in parallel in chunks; references keep their file order. Short
+/// references (sequences shorter than `k`, absent from the tiling) are appended
+/// from the `.json` metadata, and references with an empty tile list take their
+/// length from it.
+fn parse_cf_seq(
     cf_seq_path: &str,
     json_path: &str,
     k: usize,
-    id_to_info: &mut HashMap<u64, SegmentInfo>,
-) -> Result<(Vec<String>, Vec<u64>, u64)> {
+    id_to_rank: &FixedMap<u64, u32>,
+    segment_lens: &[u32],
+) -> Result<Tilings> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     let metadata = parse_reference_metadata(json_path)?;
-    let file = std::fs::File::open(cf_seq_path)
-        .with_context(|| format!("failed to open {cf_seq_path}"))?;
-    let reader = std::io::BufReader::new(file);
+    let text =
+        std::fs::read(cf_seq_path).with_context(|| format!("failed to read {cf_seq_path}"))?;
 
-    let k_minus_1 = k as u64 - 1;
-    let mut ref_names: Vec<String> = Vec::new();
-    let mut ref_lens: Vec<u64> = Vec::new();
-    let mut max_ref_len: u64 = 0;
-
-    for (line_num, line_result) in reader.lines().enumerate() {
-        let line = line_result
-            .with_context(|| format!("failed to read line {} of {cf_seq_path}", line_num + 1))?;
-        let line = line.trim_end_matches(['\n', '\r']);
-        if line.is_empty() {
-            continue;
+    // Chunk boundaries at line starts, a few chunks per thread for balance.
+    let target = text.len() / (rayon::current_num_threads() * 8).max(1) + 1;
+    let mut bounds = vec![0usize];
+    while let Some(&last) = bounds.last() {
+        if last >= text.len() {
+            break;
         }
-
-        // Split on tab: header \t tiles
-        let (header, tiles_str) = line
-            .split_once('\t')
-            .with_context(|| format!("line {} missing tab separator", line_num + 1))?;
-
-        // Extract reference name: everything after "Sequence:"
-        let name = header
-            .find("Sequence:")
-            .map(|pos| &header[pos + 9..])
-            .with_context(|| format!("line {} header missing 'Sequence:'", line_num + 1))?;
-
-        // Parse tiles to compute reference length and count per-unitig occurrences
-        let mut current_offset: u64 = 0;
-        let mut saw_tile = false;
-        for tok in tiles_str.split_whitespace() {
-            saw_tile = true;
-            match parse_tile(tok)? {
-                Tile::Segment { id, .. } => {
-                    let info = id_to_info.get_mut(&id).with_context(|| {
-                        format!("unknown segment id {id} on line {}", line_num + 1)
-                    })?;
-                    info.count += 1;
-                    current_offset += info.len as u64 - k_minus_1;
-                }
-                Tile::Gap { count } => {
-                    if current_offset > 0 {
-                        current_offset += k_minus_1;
-                    }
-                    current_offset += count;
-                }
-            }
-        }
-
-        let ref_len = if saw_tile {
-            current_offset + k_minus_1
-        } else {
-            metadata.untiled_refs.get(name).copied().with_context(|| {
-                format!(
-                    "line {} has no tiles; expected '{}'-length entry in JSON metadata key 'untiled seqs'",
-                    line_num + 1,
-                    name
-                )
-            })?
-        };
-        max_ref_len = max_ref_len.max(ref_len);
-        ref_names.push(name.to_string());
-        ref_lens.push(ref_len);
-
-        if ref_names.len().is_multiple_of(10000) {
-            info!("  processed {} references", ref_names.len());
-        }
+        let probe = (last + target).min(text.len());
+        let next = text[probe..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(text.len(), |p| probe + p + 1);
+        bounds.push(next);
     }
+
+    let counts: Vec<AtomicU32> = (0..segment_lens.len()).map(|_| AtomicU32::new(0)).collect();
+    let k_minus_1 = k as u64 - 1;
+    let chunks: Vec<TileChunk> = bounds
+        .par_windows(2)
+        .map(|w| {
+            let mut chunk = TileChunk::default();
+            for line in text[w[0]..w[1]].split(|&b| b == b'\n') {
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                if line.is_empty() {
+                    continue;
+                }
+                let line = std::str::from_utf8(line).context(".cf_seq line is not UTF-8")?;
+                // Split on tab: header \t tiles
+                let (header, tiles_str) = line
+                    .split_once('\t')
+                    .with_context(|| format!("line missing tab separator: '{line}'"))?;
+                // Extract reference name: everything after "Sequence:"
+                let name = header
+                    .find("Sequence:")
+                    .map(|pos| &header[pos + 9..])
+                    .with_context(|| format!("header missing 'Sequence:': '{header}'"))?;
+
+                chunk.starts.push(chunk.tiles.len());
+                let mut current_offset: u64 = 0;
+                let mut saw_tile = false;
+                for tok in tiles_str.as_bytes().split(|&b| b == b' ') {
+                    let Some(&last) = tok.last() else { continue };
+                    saw_tile = true;
+                    let code = match last {
+                        b'+' | b'-' => {
+                            let id = parse_u64(&tok[..tok.len() - 1]).with_context(|| {
+                                format!("invalid segment id in '{}'", String::from_utf8_lossy(tok))
+                            })?;
+                            let rank = *id_to_rank.get(&id).with_context(|| {
+                                format!("unknown segment id {id} in the tiling of '{name}'")
+                            })?;
+                            counts[rank as usize].fetch_add(1, Ordering::Relaxed);
+                            current_offset += segment_lens[rank as usize] as u64 - k_minus_1;
+                            (rank as u64) << 1 | (last == b'+') as u64
+                        }
+                        b'0'..=b'9' if tok[0] == b'N' => {
+                            let count = parse_u64(&tok[1..]).with_context(|| {
+                                format!(
+                                    "invalid N-tile count in '{}'",
+                                    String::from_utf8_lossy(tok)
+                                )
+                            })?;
+                            if current_offset > 0 {
+                                current_offset += k_minus_1;
+                            }
+                            current_offset += count;
+                            GAP_TILE | count
+                        }
+                        _ => bail!(
+                            "invalid tile token: '{}' (must end with +/- or start with N)",
+                            String::from_utf8_lossy(tok)
+                        ),
+                    };
+                    chunk.tiles.push(code);
+                }
+
+                let ref_len = if saw_tile {
+                    current_offset + k_minus_1
+                } else {
+                    metadata.untiled_refs.get(name).copied().with_context(|| {
+                        format!(
+                            "reference '{name}' has no tiles; expected its length in JSON \
+                             metadata key 'untiled seqs'"
+                        )
+                    })?
+                };
+                chunk.names.push(name.to_string());
+                chunk.ref_lens.push(ref_len);
+            }
+            chunk.starts.push(chunk.tiles.len());
+            Ok(chunk)
+        })
+        .collect::<Result<_>>()?;
+    drop(text);
+
+    let num_refs: usize = chunks.iter().map(|c| c.names.len()).sum();
+    let mut names = Vec::with_capacity(num_refs + metadata.short_refs.len());
+    let mut ref_lens = Vec::with_capacity(names.capacity());
+    for chunk in &chunks {
+        names.extend_from_slice(&chunk.names);
+        ref_lens.extend_from_slice(&chunk.ref_lens);
+    }
+    let mut max_ref_len = ref_lens.iter().copied().max().unwrap_or(0);
 
     // Append short references from JSON metadata.
-    append_short_refs(&metadata, &mut ref_names, &mut ref_lens, &mut max_ref_len);
+    append_short_refs(&metadata, &mut names, &mut ref_lens, &mut max_ref_len);
 
-    Ok((ref_names, ref_lens, max_ref_len))
+    Ok(Tilings {
+        names,
+        ref_lens,
+        max_ref_len,
+        counts: counts.into_iter().map(AtomicU32::into_inner).collect(),
+        chunks,
+    })
 }
 
-// ---------------------------------------------------------------------------
-// Second pass: contig table population
-// ---------------------------------------------------------------------------
+/// The order in which segments first appear in `tilings` (reference order,
+/// then position), as a list of their current ranks. Segments that appear in
+/// no tiling follow, by segment id, so the order never depends on the order
+/// segments were listed in.
+fn first_appearance_order(tilings: &Tilings, segment_ids: &[u64]) -> Vec<u32> {
+    let mut seen = vec![false; segment_ids.len()];
+    let mut order = Vec::with_capacity(segment_ids.len());
+    for code in tilings.chunks.iter().flat_map(|c| &c.tiles) {
+        if code & GAP_TILE == 0 {
+            let rank = (code >> 1) as u32;
+            if !std::mem::replace(&mut seen[rank as usize], true) {
+                order.push(rank);
+            }
+        }
+    }
+    if order.len() < segment_ids.len() {
+        let mut unseen: Vec<u32> = (0..segment_ids.len() as u32)
+            .filter(|&r| !seen[r as usize])
+            .collect();
+        unseen.sort_unstable_by_key(|&r| segment_ids[r as usize]);
+        order.extend(unseen);
+    }
+    order
+}
 
-/// Second pass over the .cf_seq file: populates the ContigTableBuilder with
-/// occurrence records for each segment tile.
-fn second_pass_cf_seq(
-    cf_seq_path: &str,
+impl Tilings {
+    /// Re-rank the segments: `order[new_rank]` is the segment's current rank.
+    fn renumber(&mut self, order: &[u32]) {
+        use rayon::prelude::*;
+
+        let mut new_rank = vec![0u32; order.len()];
+        for (new, &old) in order.iter().enumerate() {
+            new_rank[old as usize] = new as u32;
+        }
+        self.counts = order.iter().map(|&old| self.counts[old as usize]).collect();
+        self.chunks.par_iter_mut().for_each(|chunk| {
+            for code in &mut chunk.tiles {
+                if *code & GAP_TILE == 0 {
+                    *code = (new_rank[(*code >> 1) as usize] as u64) << 1 | (*code & 1);
+                }
+            }
+        });
+    }
+}
+
+/// Populate the ContigTableBuilder with one occurrence record per segment tile,
+/// in reference order.
+fn fill_contig_table(
+    tilings: &Tilings,
     k: usize,
-    id_to_info: &HashMap<u64, SegmentInfo>,
+    segment_lens: &[u32],
     builder: &mut ContigTableDirectBuilder,
-) -> Result<()> {
-    let file = std::fs::File::open(cf_seq_path)
-        .with_context(|| format!("failed to open {cf_seq_path}"))?;
-    let reader = std::io::BufReader::new(file);
-
+) {
     let k_minus_1 = k as u64 - 1;
     let mut ref_id: u32 = 0;
-
-    for line_result in reader.lines() {
-        let line = line_result?;
-        let line = line.trim_end_matches(['\n', '\r']);
-        if line.is_empty() {
-            continue;
-        }
-
-        // Split on tab — skip lines without tiles
-        let tiles_str = match line.split_once('\t') {
-            Some((_header, tiles)) => tiles,
-            None => continue,
-        };
-
-        let mut current_offset: u64 = 0;
-        for tok in tiles_str.split_whitespace() {
-            match parse_tile(tok)? {
-                Tile::Segment { id, is_fw } => {
-                    let info = id_to_info
-                        .get(&id)
-                        .ok_or_else(|| anyhow::anyhow!("unknown segment id {id}"))?;
-                    builder.add_occurrence(info.rank, ref_id, current_offset as u32, is_fw);
-                    current_offset += info.len as u64 - k_minus_1;
-                }
-                Tile::Gap { count } => {
+    for chunk in &tilings.chunks {
+        for w in chunk.starts.windows(2) {
+            let mut current_offset: u64 = 0;
+            for &code in &chunk.tiles[w[0]..w[1]] {
+                if code & GAP_TILE != 0 {
                     if current_offset > 0 {
                         current_offset += k_minus_1;
                     }
-                    current_offset += count;
+                    current_offset += code & !GAP_TILE;
+                } else {
+                    let rank = (code >> 1) as u32;
+                    builder.add_occurrence(rank, ref_id, current_offset as u32, code & 1 == 1);
+                    current_offset += segment_lens[rank as usize] as u64 - k_minus_1;
                 }
             }
+            ref_id += 1;
         }
-
-        if ref_id.is_multiple_of(10000) {
-            info!("  processing reference #{ref_id}");
-        }
-
-        ref_id += 1;
     }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -562,53 +657,6 @@ fn append_short_refs(
 mod tests {
     use super::*;
     use tempfile::tempdir;
-
-    #[test]
-    fn test_parse_tile_forward() {
-        match parse_tile("42+").unwrap() {
-            Tile::Segment { id, is_fw } => {
-                assert_eq!(id, 42);
-                assert!(is_fw);
-            }
-            _ => panic!("expected Segment"),
-        }
-    }
-
-    #[test]
-    fn test_parse_tile_reverse() {
-        match parse_tile("137-").unwrap() {
-            Tile::Segment { id, is_fw } => {
-                assert_eq!(id, 137);
-                assert!(!is_fw);
-            }
-            _ => panic!("expected Segment"),
-        }
-    }
-
-    #[test]
-    fn test_parse_tile_gap() {
-        match parse_tile("N100").unwrap() {
-            Tile::Gap { count } => assert_eq!(count, 100),
-            _ => panic!("expected Gap"),
-        }
-    }
-
-    #[test]
-    fn test_parse_tile_large_id() {
-        match parse_tile("93582850-").unwrap() {
-            Tile::Segment { id, is_fw } => {
-                assert_eq!(id, 93582850);
-                assert!(!is_fw);
-            }
-            _ => panic!("expected Segment"),
-        }
-    }
-
-    #[test]
-    fn test_parse_tile_invalid() {
-        assert!(parse_tile("xyz").is_err());
-        assert!(parse_tile("").is_err());
-    }
 
     #[test]
     fn test_offset_calculation() {
@@ -724,7 +772,17 @@ mod tests {
     }
 
     #[test]
-    fn test_first_pass_cf_seq_preserves_empty_tiles_field() {
+    fn test_parse_u64() {
+        assert_eq!(parse_u64(b"0"), Some(0));
+        assert_eq!(parse_u64(b"93582850"), Some(93582850));
+        assert_eq!(parse_u64(b"18446744073709551615"), Some(u64::MAX));
+        assert_eq!(parse_u64(b"18446744073709551616"), None);
+        assert_eq!(parse_u64(b""), None);
+        assert_eq!(parse_u64(b"12a"), None);
+    }
+
+    #[test]
+    fn test_parse_cf_seq_preserves_empty_tiles_field() {
         let dir = tempdir().unwrap();
         let cf_seq_path = dir.path().join("empty_tiles.cf_seq");
         let json_path = dir.path().join("empty_tiles.json");
@@ -732,22 +790,23 @@ mod tests {
         std::fs::write(&cf_seq_path, "Reference:N_Sequence:all_n\t\n").unwrap();
         std::fs::write(&json_path, r#"{"untiled seqs":[["all_n",337]]}"#).unwrap();
 
-        let mut id_to_info = HashMap::new();
-        let (names, lens, max_ref_len) = first_pass_cf_seq(
+        let id_to_rank = FixedMap::with_hasher(crate::hash::fixed_state());
+        let tilings = parse_cf_seq(
             cf_seq_path.to_str().unwrap(),
             json_path.to_str().unwrap(),
             31,
-            &mut id_to_info,
+            &id_to_rank,
+            &[],
         )
         .unwrap();
 
-        assert_eq!(names, vec!["all_n".to_string()]);
-        assert_eq!(lens, vec![337]);
-        assert_eq!(max_ref_len, 337);
+        assert_eq!(tilings.names, vec!["all_n".to_string()]);
+        assert_eq!(tilings.ref_lens, vec![337]);
+        assert_eq!(tilings.max_ref_len, 337);
     }
 
     #[test]
-    fn test_first_pass_cf_seq_rejects_empty_tiles_without_metadata() {
+    fn test_parse_cf_seq_rejects_empty_tiles_without_metadata() {
         let dir = tempdir().unwrap();
         let cf_seq_path = dir.path().join("missing_untiled_metadata.cf_seq");
         let json_path = dir.path().join("missing_untiled_metadata.json");
@@ -755,50 +814,138 @@ mod tests {
         std::fs::write(&cf_seq_path, "Reference:N_Sequence:all_n\t\n").unwrap();
         std::fs::write(&json_path, "{}").unwrap();
 
-        let mut id_to_info = HashMap::new();
-        let err = first_pass_cf_seq(
+        let id_to_rank = FixedMap::with_hasher(crate::hash::fixed_state());
+        let err = parse_cf_seq(
             cf_seq_path.to_str().unwrap(),
             json_path.to_str().unwrap(),
             31,
-            &mut id_to_info,
+            &id_to_rank,
+            &[],
         )
-        .unwrap_err();
+        .err()
+        .unwrap();
 
         let msg = format!("{err:#}");
         assert!(msg.contains("untiled seqs"));
     }
 
     #[test]
-    fn test_second_pass_cf_seq_counts_empty_tiles_reference() {
+    fn test_parse_cf_seq_rejects_bad_tiles() {
         let dir = tempdir().unwrap();
-        let cf_seq_path = dir.path().join("empty_tiles_then_segment.cf_seq");
+        let json_path = dir.path().join("none.json");
+        let mut id_to_rank = FixedMap::with_hasher(crate::hash::fixed_state());
+        id_to_rank.insert(7, 0);
+        for (case, line) in [
+            ("unknown", "Reference:1_Sequence:r\t8+\n"),
+            ("garbage", "Reference:1_Sequence:r\txyz\n"),
+            ("bad_gap", "Reference:1_Sequence:r\t7+ N1x\n"),
+            ("no_tab", "Reference:1_Sequence:r 7+\n"),
+        ] {
+            let cf_seq_path = dir.path().join(format!("{case}.cf_seq"));
+            std::fs::write(&cf_seq_path, line).unwrap();
+            let res = parse_cf_seq(
+                cf_seq_path.to_str().unwrap(),
+                json_path.to_str().unwrap(),
+                31,
+                &id_to_rank,
+                &[35],
+            );
+            assert!(res.is_err(), "{case} should be rejected");
+        }
+    }
 
+    #[test]
+    fn test_parse_and_fill_cf_seq_offsets_and_order() {
+        // k = 5: segment 7 (rank 0, len 10), segment 9 (rank 1, len 8).
+        let dir = tempdir().unwrap();
+        let cf_seq_path = dir.path().join("tiles.cf_seq");
+        let json_path = dir.path().join("tiles.json");
         std::fs::write(
             &cf_seq_path,
-            "Reference:N_Sequence:all_n\t\nReference:N_Sequence:segmented\t7+\n",
+            "Reference:1_Sequence:all_n\t\n\
+             Reference:1_Sequence:a\t7+ 9- N5 7-\r\n\
+             \n\
+             Reference:1_Sequence:b\tN3 9+\n",
         )
         .unwrap();
+        std::fs::write(
+            &json_path,
+            r#"{"untiled seqs":[["all_n",40]],"short seqs":[["s",3]]}"#,
+        )
+        .unwrap();
+        let mut id_to_rank = FixedMap::with_hasher(crate::hash::fixed_state());
+        id_to_rank.insert(7, 0);
+        id_to_rank.insert(9, 1);
+        let lens = [10u32, 8];
 
-        let mut id_to_info = HashMap::new();
-        id_to_info.insert(
-            7,
-            SegmentInfo {
-                rank: 0,
-                len: 35,
-                count: 1,
-            },
-        );
+        let tilings = parse_cf_seq(
+            cf_seq_path.to_str().unwrap(),
+            json_path.to_str().unwrap(),
+            5,
+            &id_to_rank,
+            &lens,
+        )
+        .unwrap();
+        assert_eq!(tilings.names, ["all_n", "a", "b", "s"]);
+        // a: 6 + 4, N5 -> +4 +5, then 7- -> +6 => 25, + k-1 = 29
+        // b: N3 -> 3, 9+ -> +4 => 7, + k-1 = 11
+        assert_eq!(tilings.ref_lens, [40, 29, 11, 3]);
+        assert_eq!(tilings.max_ref_len, 40);
+        assert_eq!(tilings.counts, [2, 2]);
 
-        let mut builder = ContigTableDirectBuilder::new(&[1], 64, 2);
-        second_pass_cf_seq(cf_seq_path.to_str().unwrap(), 31, &id_to_info, &mut builder).unwrap();
-        let contig_table = builder.build();
-        let encoding = contig_table.encoding();
-        let entries: Vec<u64> = contig_table.contig_entries(0).iter().collect();
+        let mut builder = ContigTableDirectBuilder::new(&tilings.counts, 40, 4);
+        fill_contig_table(&tilings, 5, &lens, &mut builder);
+        let table = builder.build();
+        let enc = table.encoding();
+        let decode = |rank: u64| -> Vec<(u32, u64, bool)> {
+            table
+                .contig_entries(rank)
+                .iter()
+                .map(|e| (enc.transcript_id(e), enc.pos(e) as u64, enc.orientation(e)))
+                .collect()
+        };
+        assert_eq!(decode(0), [(1, 0, true), (1, 19, false)]);
+        assert_eq!(decode(1), [(1, 6, false), (2, 3, true)]);
+    }
 
-        assert_eq!(entries.len(), 1);
-        assert_eq!(encoding.transcript_id(entries[0]), 1);
-        assert_eq!(encoding.pos(entries[0]), 0);
-        assert!(encoding.orientation(entries[0]));
+    #[test]
+    fn test_first_appearance_order_and_renumber() {
+        let dir = tempdir().unwrap();
+        let cf_seq_path = dir.path().join("order.cf_seq");
+        let json_path = dir.path().join("none.json");
+        // File order of segments: 30, 10, 20, 40 (40 appears in no tiling).
+        std::fs::write(
+            &cf_seq_path,
+            "Reference:1_Sequence:a\t20+ N4 10-\nReference:1_Sequence:b\t10+ 30+\n",
+        )
+        .unwrap();
+        let ids = [30u64, 10, 20, 40];
+        let mut id_to_rank = FixedMap::with_hasher(crate::hash::fixed_state());
+        for (rank, &id) in ids.iter().enumerate() {
+            id_to_rank.insert(id, rank as u32);
+        }
+        let mut tilings = parse_cf_seq(
+            cf_seq_path.to_str().unwrap(),
+            json_path.to_str().unwrap(),
+            5,
+            &id_to_rank,
+            &[10, 11, 12, 13],
+        )
+        .unwrap();
+        assert_eq!(tilings.counts, [1, 2, 1, 0]);
+
+        // First appearance: 20 (rank 2), 10 (1), 30 (0); then unseen 40 (3).
+        let order = first_appearance_order(&tilings, &ids);
+        assert_eq!(order, [2, 1, 0, 3]);
+        tilings.renumber(&order);
+        assert_eq!(tilings.counts, [1, 2, 1, 0]);
+        let tiles: Vec<u64> = tilings
+            .chunks
+            .iter()
+            .flat_map(|c| c.tiles.clone())
+            .collect();
+        // `rank << 1 | is_fw`: a = 20+ N4 10-, b = 10+ 30+.
+        assert_eq!(tiles, [1, GAP_TILE | 4, 2, 3, 5]);
     }
 
     #[test]

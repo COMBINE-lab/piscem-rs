@@ -1071,8 +1071,14 @@ mod tests {
     fn test_old_format_asks_for_rebuild() {
         let data = b"PCTAB03\0";
         let err = format!("{:#}", ContigTable::load(&mut &data[..]).unwrap_err());
-        assert!(err.contains("PCTAB03") && err.contains("PCTAB04") && err.contains("rebuilt"), "{err}");
-        let err = format!("{:#}", ContigTable::load(&mut &b"BADMAGIC"[..]).unwrap_err());
+        assert!(
+            err.contains("PCTAB03") && err.contains("PCTAB04") && err.contains("rebuilt"),
+            "{err}"
+        );
+        let err = format!(
+            "{:#}",
+            ContigTable::load(&mut &b"BADMAGIC"[..]).unwrap_err()
+        );
         assert!(err.contains("invalid contig table magic"), "{err}");
     }
 
