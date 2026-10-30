@@ -22,9 +22,8 @@ use epserde::deser::Deserialize;
 use epserde::ser::Serialize;
 use mem_dbg::{MemSize, SizeFlags};
 use std::io::{Read, Write};
-use sux::bits::bit_field_vec::{BitFieldVec, BitFieldVecUncheckedIter};
+use sux::bits::bit_field_vec::BitFieldVec;
 use sux::dict::elias_fano::{EfSeq, EliasFanoBuilder};
-use sux::traits::{IndexedSeq, IntoUncheckedIterator, UncheckedIterator};
 use value_traits::slices::SliceByValue;
 use value_traits::slices::SliceByValueMut;
 
@@ -200,10 +199,16 @@ impl<'a> ContigSpan<'a> {
                 entries,
                 start,
                 len,
-            } => ContigSpanIter::Packed {
-                iter: entries.into_unchecked_iter_from(start),
-                remaining: len,
-            },
+            } => {
+                let width = entries.bit_width();
+                ContigSpanIter::Packed {
+                    words: entries.as_slice(),
+                    bit: start * width,
+                    width,
+                    mask: if width >= 64 { u64::MAX } else { (1u64 << width) - 1 },
+                    remaining: len,
+                }
+            }
             ContigSpan::Inline(v) => ContigSpanIter::Inline(Some(v)),
             ContigSpan::Flat(s) => ContigSpanIter::Flat(s.iter()),
         }
@@ -222,11 +227,31 @@ impl<'a> IntoIterator for &'a ContigSpan<'a> {
 /// Iterator over packed entries in a contig span.
 pub enum ContigSpanIter<'a> {
     Packed {
-        iter: BitFieldVecUncheckedIter<'a, Vec<usize>>,
+        words: &'a [usize],
+        /// Bit position of the next entry.
+        bit: usize,
+        width: usize,
+        mask: u64,
         remaining: usize,
     },
     Inline(Option<u64>),
     Flat(std::slice::Iter<'a, u64>),
+}
+
+/// The packed value at bit `pos` (`BitFieldVec`'s layout: least significant
+/// bit first, a value may straddle two words). Both words are read and merged
+/// with shifts rather than branching on whether the value straddles: with
+/// entry widths that are not a power of two that branch is unpredictable.
+#[inline(always)]
+fn packed_entry_at(words: &[usize], pos: usize, mask: u64) -> u64 {
+    let w = pos / 64;
+    let off = (pos % 64) as u32;
+    let lo = (words[w] as u64) >> off;
+    // The next word holds the value's high bits when it straddles (`off > 0`
+    // and `off + width > 64`); otherwise the mask clears what it contributes.
+    // `(hi << 1) << (63 - off)` is `hi << (64 - off)` without a 64-bit shift.
+    let hi = words.get(w + 1).map_or(0, |&x| x as u64);
+    (lo | ((hi << 1) << (63 - off))) & mask
 }
 
 impl Iterator for ContigSpanIter<'_> {
@@ -235,10 +260,18 @@ impl Iterator for ContigSpanIter<'_> {
     #[inline]
     fn next(&mut self) -> Option<u64> {
         match self {
-            ContigSpanIter::Packed { iter, remaining } => {
+            ContigSpanIter::Packed {
+                words,
+                bit,
+                width,
+                mask,
+                remaining,
+            } => {
                 if *remaining > 0 {
                     *remaining -= 1;
-                    Some(unsafe { iter.next_unchecked() } as u64)
+                    let pos = *bit;
+                    *bit += *width;
+                    Some(packed_entry_at(words, pos, *mask))
                 } else {
                     None
                 }
@@ -316,8 +349,11 @@ impl ContigTable {
     /// Use `EntryEncoding` to decode each entry.
     #[inline]
     pub fn contig_entries(&self, contig_id: u64) -> ContigSpan<'_> {
-        let start = unsafe { self.ctg_offsets.get_unchecked(contig_id as usize) };
-        let end = unsafe { self.ctg_offsets.get_unchecked(contig_id as usize + 1) };
+        // Adjacent offsets: one select, then the next one of the high bits
+        // (two `get_unchecked` calls would each do a full select).
+        let mut it = self.ctg_offsets.iter_from(contig_id as usize);
+        let start = it.next().unwrap();
+        let end = it.next().unwrap();
         ContigSpan::packed(&self.ctg_entries, start, end - start)
     }
 
@@ -1139,5 +1175,38 @@ mod tests {
         assert_eq!(enc.transcript_id(e), 199_999);
         assert_eq!(enc.pos(e), 2_999_999_999);
         assert!(enc.orientation(e));
+    }
+}
+
+#[cfg(test)]
+mod packed_iter_tests {
+    use super::*;
+    use value_traits::slices::{SliceByValue, SliceByValueMut};
+
+    #[test]
+    fn span_iter_matches_index_value_for_all_widths_and_offsets() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for width in [1usize, 3, 7, 13, 31, 32, 33, 37, 41, 63] {
+            let n = 517;
+            let mut v = BitFieldVec::new(width, n);
+            let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+            for i in 0..n {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                v.set_value(i, (x & mask) as usize);
+            }
+            for start in [0usize, 1, 2, 63, 64, 100, n - 1, n] {
+                for len in [0usize, 1, 2, 5, n - start] {
+                    if start + len > n {
+                        continue;
+                    }
+                    let span = ContigSpan::packed(&v, start, len);
+                    let got: Vec<u64> = span.iter().collect();
+                    let want: Vec<u64> = (start..start + len).map(|i| v.index_value(i) as u64).collect();
+                    assert_eq!(got, want, "width {width} start {start} len {len}");
+                }
+            }
+        }
     }
 }

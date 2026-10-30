@@ -81,7 +81,22 @@ pub(crate) fn is_homopolymer(kmer: &[u8]) -> bool {
         return false;
     }
     let first = kmer[0];
-    kmer.iter().all(|&b| b == first)
+    let n = kmer.len();
+    if n < 8 {
+        return kmer.iter().all(|&b| b == first);
+    }
+    // Compare 8 bytes at a time against `first` broadcast, the last load
+    // overlapping, and test once at the end: an early-exit byte loop
+    // mispredicts its exit on nearly every (non-homopolymer) k-mer.
+    let pattern = u64::from(first) * 0x0101_0101_0101_0101;
+    let word = |i: usize| u64::from_le_bytes(kmer[i..i + 8].try_into().unwrap());
+    let mut diff = word(n - 8) ^ pattern;
+    let mut i = 0;
+    while i + 8 <= n {
+        diff |= word(i) ^ pattern;
+        i += 8;
+    }
+    diff == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -1186,6 +1201,23 @@ mod tests {
     }
 
     // ---- Logic tests ----
+
+    #[test]
+    fn is_homopolymer_matches_bytewise_definition() {
+        let reference = |k: &[u8]| !k.is_empty() && k.iter().all(|&b| b == k[0]);
+        for n in 0..40usize {
+            for base in *b"ACN" {
+                let mut k = vec![base; n];
+                assert_eq!(is_homopolymer(&k), reference(&k), "n {n}");
+                for j in 0..n {
+                    let old = k[j];
+                    k[j] = b'T';
+                    assert_eq!(is_homopolymer(&k), reference(&k), "n {n} j {j}");
+                    k[j] = old;
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_is_homopolymer() {

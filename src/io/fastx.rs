@@ -300,13 +300,130 @@ pub fn open_input(path: impl AsRef<Path>, ceiling: usize) -> Result<OpenedInput>
     #[cfg(not(feature = "rapidgzip"))]
     let _ = ceiling;
 
-    let (reader, _format) = niffler::send::from_path(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = open_serial(path)?;
     Ok(OpenedInput {
         reader,
         #[cfg(feature = "rapidgzip")]
         handle: None,
     })
+}
+
+/// Serial decoding: gzip through sirocco's inflate, which is ~40% faster than
+/// zlib-rs on Apple silicon and ~45% faster on x86-64 (single-threaded mapping
+/// decodes inline, so this is on the critical path); anything else through
+/// niffler as before. The magic is peeked through the same buffered reader, so the path
+/// is opened once (FIFOs and process substitution keep working).
+fn open_serial(path: &Path) -> Result<Box<dyn std::io::Read + Send>> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut buffered = std::io::BufReader::with_capacity(1 << 16, file);
+    let is_gzip = buffered
+        .fill_buf()
+        .with_context(|| format!("failed to read {}", path.display()))?
+        .starts_with(&[0x1f, 0x8b]);
+    if is_gzip {
+        return Ok(Box::new(MultiMemberGz::new(buffered)));
+    }
+    let (reader, _format) = niffler::send::get_reader(Box::new(buffered))
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    Ok(reader)
+}
+
+/// A gzip stream of one or more members (as `flate2::read::MultiGzDecoder`
+/// reads it), decoded with sirocco, which reads a single member at a time.
+pub(crate) struct MultiMemberGz<R: std::io::BufRead> {
+    member: Option<sirocco::inflate::Reader<R>>,
+}
+
+impl<R: std::io::BufRead> MultiMemberGz<R> {
+    pub(crate) fn new(inner: R) -> Self {
+        Self { member: Some(sirocco::inflate::Reader::new(sirocco::Format::Gzip, inner)) }
+    }
+}
+
+impl<R: std::io::BufRead> std::io::Read for MultiMemberGz<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let Some(member) = self.member.as_mut() else {
+                return Ok(0);
+            };
+            let n = member.read(buf)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            // End of a member: another follows if any input remains.
+            let mut inner = self.member.take().unwrap().into_inner();
+            if inner.fill_buf()?.is_empty() {
+                return Ok(0);
+            }
+            self.member = Some(sirocco::inflate::Reader::new(sirocco::Format::Gzip, inner));
+        }
+    }
+}
+
+#[cfg(test)]
+mod multi_member_gz_tests {
+    use super::MultiMemberGz;
+    use std::io::{Read, Write};
+
+    fn gz(data: &[u8], name: Option<&str>) -> Vec<u8> {
+        let mut b = flate2::GzBuilder::new();
+        if let Some(n) = name {
+            b = b.filename(n);
+        }
+        let mut e = b.write(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    fn decode(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        MultiMemberGz::new(std::io::BufReader::with_capacity(7, bytes)).read_to_end(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn matches_flate2_on_single_and_multi_member_streams() {
+        let a: Vec<u8> = (0..200_000u32).map(|i| b"ACGTN\n@+"[(i * 7 % 8) as usize]).collect();
+        let b = b"@r1\nACGT\n+\nIIII\n".repeat(1000);
+        let mut cat = gz(&a, Some("reads.fq"));
+        cat.extend(gz(&b, None));
+        cat.extend(gz(b"", None));
+        cat.extend(gz(&a, None));
+        for stream in [gz(&a, Some("x.fq")), gz(b"", None), cat] {
+            let mut want = Vec::new();
+            flate2::read::MultiGzDecoder::new(&stream[..]).read_to_end(&mut want).unwrap();
+            assert_eq!(decode(&stream), want);
+        }
+    }
+
+    #[test]
+    fn truncated_stream_is_an_error() {
+        let s = gz(&b"ACGT".repeat(10_000), None);
+        let mut out = Vec::new();
+        let r = MultiMemberGz::new(&s[..s.len() - 9]).read_to_end(&mut out);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn non_gzip_input_goes_through_niffler() {
+        let dir = std::env::temp_dir().join(format!("piscem-mmgz-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("plain.fq");
+        std::fs::write(&plain, b"@r\nACGT\n+\nIIII\n").unwrap();
+        let mut out = Vec::new();
+        super::open_serial(&plain).unwrap().read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"@r\nACGT\n+\nIIII\n");
+        let gzf = dir.join("x.fq.gz");
+        std::fs::write(&gzf, gz(b"@r\nACGT\n+\nIIII\n", Some("x.fq"))).unwrap();
+        out.clear();
+        super::open_serial(&gzf).unwrap().read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"@r\nACGT\n+\nIIII\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 /// Open a gzip file attached to a shared decode pool.
