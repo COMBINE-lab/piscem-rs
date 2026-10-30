@@ -3,7 +3,7 @@
 Notable changes to `piscem-rs`. Versions follow [Semantic Versioning](https://semver.org);
 pre-1.0, a minor bump may carry breaking changes.
 
-## [Unreleased]
+## [0.12.0] — 2026-10-30
 
 ### Breaking
 
@@ -12,8 +12,8 @@ pre-1.0, a minor bump may carry breaking changes.
   callers used (`get`, `get_mut`, `insert`, `iter`, `values`, `len`,
   `is_empty`, `clear`, `&map` iteration) and adds slot access
   (`slot_or_insert`, `slot_mut`). `MappingCache` gains a `run_slots` scratch
-  field. Iteration order is unchanged (see below), so mapping output is
-  byte-identical.
+  field. `HitMap` iterates in the same order the `FixedMap` did; the order in
+  which mappings are *reported* changes for another reason (see Changed).
 
 ### Changed
 
@@ -22,10 +22,34 @@ pre-1.0, a minor bump may carry breaking changes.
   instead of hash-map order. The set of mappings and every mapping's content
   are unchanged; paired-end records were already in this order (pairing sorts
   both mates), so only single-end and orphan records change, and only in the
-  order of their mappings. Output remains deterministic.
+  order of their mappings. Output remains deterministic, and salmon's
+  `quant.sf` is unchanged.
+- **Index builds are reproducible: contigs are numbered by first appearance
+  in the tilings** (reference order, then position; segments in no tiling
+  follow by id) instead of by their line in `.cf_seg`. cDBG builders,
+  cf1-rs included, write segments in thread-completion order, so two builds
+  of the same reference used to give different `.ssi`/`.ctab`/`.ectab`
+  files; they are now byte-identical. Contig ids therefore differ from an
+  index built by 0.11.x from the same `.cf_seg`. The on-disk format is
+  unchanged, so 0.11 indexes still load and need not be rebuilt. Peak RSS of the piscem stage of `build` grows by
+  ~0.5 GB (the parsed tilings now overlap the dictionary build).
+
+### Added
+
+- `EqClassMapBuilder::label_hash` and `EqClassMapBuilder::add_sorted_tile`,
+  for interning tile labels that were sorted and hashed elsewhere (in
+  parallel); EC ids keep their first-occurrence order.
 
 ### Performance
 
+- **Index build: `.cf_seq` is parsed once, in parallel**, into packed
+  per-reference tile codes (it was read twice, line by line, through a
+  SipHash map), and the contig table is filled from those without
+  re-parsing. The EC intern table is sized up front instead of growing by
+  doubling (each growth rehashed every label), and tile labels are computed,
+  sorted and hashed in parallel blocks. GENCODE v50, 16 threads: `.cf_seq`
+  passes 4.6 s → 0.6 s, EC table 1.5 s → 0.4 s; the piscem stage of `build`
+  8.3 s → 3.2 s.
 - **Hit collection tracks only targets still in contention.** A target can be
   accepted only if every valid hit lands on it, so once one is missed it can
   never qualify; `map_read` now keeps just the contenders, ascending by
@@ -33,22 +57,16 @@ pre-1.0, a minor bump may carry breaking changes.
   instead of updating a hash map for every occurrence. Accepted mappings are
   the same as before. salmon `--sketch` mapping is ~12% faster on 170 bp reads
   against GENCODE v50 and ~20% on 75 bp reads against Ensembl cDNA.
-- `SketchHitInfoSimple` drops five fields nothing read (32 bytes, was 52).
-
 - **Faster hit collection on multi-isoform references.** Consecutive raw
   hits on one contig share its occurrence list; `collect_mappings_from_hits`
   now resolves that list to accumulator slots once per run and applies the
   run target by target, and `HitMap` answers lookups from a
-  generation-stamped direct index instead of hashing. The hash table is
-  touched once per distinct target (to insert it), and since a SwissTable's
-  layout depends only on its insertion sequence, iteration order — which
-  reaches the RAD output — is unchanged. Every accumulator sees the same
-  update sequence, and the early stop fires at the same hit. Verified
-  byte-identical `map-bulk` RAD (PE, SE, `--ignore-ambig-hits`; 75 bp
-  GEUVADIS reads on Ensembl cDNA and 170 bp reads on GENCODE v50) and
-  byte-identical salmon RAD/quant. Single-threaded mapping on 170 bp reads
-  against GENCODE v50 (48 occurrences per hit on average) is ~20% faster;
-  short reads on less redundant references gain less.
+  generation-stamped direct index instead of hashing. Every accumulator sees
+  the same update sequence, and the early stop fires at the same hit.
+  Single-threaded mapping on 170 bp reads against GENCODE v50 (48
+  occurrences per hit on average) is ~20% faster; short reads on less
+  redundant references gain less.
+- `SketchHitInfoSimple` drops five fields nothing read (32 bytes, was 52).
 
 ## [0.11.1] — 2026-10-22
 
