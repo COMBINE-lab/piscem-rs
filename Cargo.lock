@@ -773,9 +773,9 @@ dependencies = [
 
 [[package]]
 name = "dsi-progress-logger"
-version = "0.8.9"
+version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc2f98e7418e41b0138729f1d1ca4f0ecc105e98639ca6ef736acf081e47db45"
+checksum = "4c3394f42d94af60fb7c43d94ca60e659b3da88dedb3af0489e52a24d381573f"
 dependencies = [
  "log",
  "num-format",
@@ -1733,7 +1733,7 @@ dependencies = [
 
 [[package]]
 name = "piscem-rs"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2257,9 +2257,9 @@ checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 
 [[package]]
 name = "sshash-lib"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9547b4612d43612c58c67185ee6596d4d8a9e9cb404d5cfbce7b16e8a70d97b3"
+checksum = "71ea4a34780f39a2a0ac04eb5d2f5c42a6f2ab69f6430f3c2d846df4fc744c36"
 dependencies = [
  "anyhow",
  "dsi-progress-logger",
@@ -2318,9 +2318,9 @@ dependencies = [
 
 [[package]]
 name = "sux"
-version = "0.15.2"
+version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b32377c1f8d599f2b6ef8bc7f44176d19b3b33c2909dd3a63152e25afa430bc"
+checksum = "1fd3e634d4362b016487aabb5f8451354ca61d3fad043c0b13b1036916c8b144"
 dependencies = [
  "ambassador",
  "anyhow",
@@ -2331,7 +2331,6 @@ dependencies = [
  "dsi-progress-logger",
  "epserde",
  "fallible-iterator",
- "flate2",
  "impl-tools",
  "lender",
  "log",
@@ -2347,7 +2346,6 @@ dependencies = [
  "value-traits",
  "xxhash-rust",
  "zerocopy",
- "zstd",
 ]
 
 [[package]]
@@ -2419,7 +2417,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys",
