@@ -24,7 +24,7 @@ use mem_dbg::{MemSize, SizeFlags};
 use std::io::{Read, Write};
 use sux::bits::bit_field_vec::{BitFieldVec, BitFieldVecUncheckedIter};
 use sux::dict::elias_fano::{EfSeq, EliasFanoBuilder};
-use sux::traits::{IndexedSeq, IntoUncheckedIterator, UncheckedIterator};
+use sux::traits::{IntoUncheckedIterator, UncheckedIterator};
 use value_traits::slices::SliceByValue;
 use value_traits::slices::SliceByValueMut;
 
@@ -316,8 +316,11 @@ impl ContigTable {
     /// Use `EntryEncoding` to decode each entry.
     #[inline]
     pub fn contig_entries(&self, contig_id: u64) -> ContigSpan<'_> {
-        let start = unsafe { self.ctg_offsets.get_unchecked(contig_id as usize) };
-        let end = unsafe { self.ctg_offsets.get_unchecked(contig_id as usize + 1) };
+        // Adjacent offsets: one select, then the next one of the high bits
+        // (two `get_unchecked` calls would each do a full select).
+        let mut it = self.ctg_offsets.iter_from(contig_id as usize);
+        let start = it.next().unwrap();
+        let end = it.next().unwrap();
         ContigSpan::packed(&self.ctg_entries, start, end - start)
     }
 
