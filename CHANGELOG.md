@@ -30,6 +30,9 @@ thread; selective alignment ~2% faster.
 
 - sshash-lib 0.8.0 → 0.8.1.
 - New: sirocco 0.3 (serial gzip decoding).
+- sux is used without its default features (`epserde` and `rayon` only),
+  dropping its unused flate2/zstd 0.13 line readers (zstd 0.13 carries the
+  RustSec advisories of 2026-10-16).
 
 ## [0.12.0] — 2026-10-30
 

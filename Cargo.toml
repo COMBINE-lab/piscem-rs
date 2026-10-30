@@ -13,7 +13,7 @@ repository = "https://github.com/COMBINE-lab/piscem-rs"
 [workspace.dependencies]
 sshash-lib = { version = "0.8.1" }
 tiny-dict = { version = "0.8.0" }
-sux = { version = "0.15.2", features = ["epserde"] }
+sux = { version = "0.15.2", default-features = false, features = ["epserde", "rayon"] }
 anyhow = "1.0"
 thiserror = "2.0"
 clap = { version = "4.5", features = ["derive"] }
@@ -131,7 +131,7 @@ flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 indicatif = "0.18"
 
 # Succinct data structures (same versions as sshash-rs)
-sux = { version = "0.15.2", features = ["epserde"] }
+sux = { version = "0.15.2", default-features = false, features = ["epserde", "rayon"] }
 epserde = "0.13.2"
 value-traits = "0.3"
 mem_dbg = "0.4.1"
