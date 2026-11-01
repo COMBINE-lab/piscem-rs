@@ -295,17 +295,59 @@ pub fn open_input(path: impl AsRef<Path>, ceiling: usize) -> Result<OpenedInput>
         && crate::io::calibrate::classify_input(path) == crate::io::calibrate::InputKind::Regular
         && let Some(opened) = open_gz_rapidgzip(path, ceiling)?
     {
-        return Ok(opened);
+        return Ok(OpenedInput {
+            reader: Box::new(NamedInput::new(path, opened.reader)),
+            handle: opened.handle,
+        });
     }
     #[cfg(not(feature = "rapidgzip"))]
     let _ = ceiling;
 
     let reader = open_serial(path)?;
     Ok(OpenedInput {
-        reader,
+        reader: Box::new(NamedInput::new(path, reader)),
         #[cfg(feature = "rapidgzip")]
         handle: None,
     })
+}
+
+/// A decoded input that names its file in any read error. The FASTX parser
+/// reads paired files in lockstep and reports a decoder error without saying
+/// which file it came from, so a truncated or corrupt `R2` read just
+/// "compressed data ended early". The path and a plain-language cause are
+/// prefixed here instead, keeping the error's kind.
+struct NamedInput {
+    path: std::path::PathBuf,
+    inner: Box<dyn std::io::Read + Send>,
+}
+
+impl NamedInput {
+    fn new(path: &Path, inner: Box<dyn std::io::Read + Send>) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            inner,
+        }
+    }
+}
+
+impl std::io::Read for NamedInput {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf).map_err(|e| {
+            use std::io::ErrorKind;
+            let hint = match e.kind() {
+                ErrorKind::Interrupted => return e,
+                ErrorKind::UnexpectedEof => {
+                    " (the file is probably truncated: an incomplete download or copy?)"
+                }
+                ErrorKind::InvalidData | ErrorKind::InvalidInput => {
+                    " (its compressed data is corrupt)"
+                }
+                _ => "",
+            };
+            std::io::Error::new(e.kind(), format!("{}: {e}{hint}", self.path.display()))
+        })
+    }
 }
 
 /// Serial decoding: gzip through sirocco's inflate, which is ~40% faster than
@@ -315,7 +357,8 @@ pub fn open_input(path: impl AsRef<Path>, ceiling: usize) -> Result<OpenedInput>
 /// is opened once (FIFOs and process substitution keep working).
 fn open_serial(path: &Path) -> Result<Box<dyn std::io::Read + Send>> {
     use std::io::BufRead;
-    let file = std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let file =
+        std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let mut buffered = std::io::BufReader::with_capacity(1 << 16, file);
     let is_gzip = buffered
         .fill_buf()
@@ -337,7 +380,9 @@ pub(crate) struct MultiMemberGz<R: std::io::BufRead> {
 
 impl<R: std::io::BufRead> MultiMemberGz<R> {
     pub(crate) fn new(inner: R) -> Self {
-        Self { member: Some(sirocco::inflate::Reader::new(sirocco::Format::Gzip, inner)) }
+        Self {
+            member: Some(sirocco::inflate::Reader::new(sirocco::Format::Gzip, inner)),
+        }
     }
 }
 
@@ -381,13 +426,17 @@ mod multi_member_gz_tests {
 
     fn decode(bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        MultiMemberGz::new(std::io::BufReader::with_capacity(7, bytes)).read_to_end(&mut out).unwrap();
+        MultiMemberGz::new(std::io::BufReader::with_capacity(7, bytes))
+            .read_to_end(&mut out)
+            .unwrap();
         out
     }
 
     #[test]
     fn matches_flate2_on_single_and_multi_member_streams() {
-        let a: Vec<u8> = (0..200_000u32).map(|i| b"ACGTN\n@+"[(i * 7 % 8) as usize]).collect();
+        let a: Vec<u8> = (0..200_000u32)
+            .map(|i| b"ACGTN\n@+"[(i * 7 % 8) as usize])
+            .collect();
         let b = b"@r1\nACGT\n+\nIIII\n".repeat(1000);
         let mut cat = gz(&a, Some("reads.fq"));
         cat.extend(gz(&b, None));
@@ -395,7 +444,9 @@ mod multi_member_gz_tests {
         cat.extend(gz(&a, None));
         for stream in [gz(&a, Some("x.fq")), gz(b"", None), cat] {
             let mut want = Vec::new();
-            flate2::read::MultiGzDecoder::new(&stream[..]).read_to_end(&mut want).unwrap();
+            flate2::read::MultiGzDecoder::new(&stream[..])
+                .read_to_end(&mut want)
+                .unwrap();
             assert_eq!(decode(&stream), want);
         }
     }
@@ -415,12 +466,18 @@ mod multi_member_gz_tests {
         let plain = dir.join("plain.fq");
         std::fs::write(&plain, b"@r\nACGT\n+\nIIII\n").unwrap();
         let mut out = Vec::new();
-        super::open_serial(&plain).unwrap().read_to_end(&mut out).unwrap();
+        super::open_serial(&plain)
+            .unwrap()
+            .read_to_end(&mut out)
+            .unwrap();
         assert_eq!(out, b"@r\nACGT\n+\nIIII\n");
         let gzf = dir.join("x.fq.gz");
         std::fs::write(&gzf, gz(b"@r\nACGT\n+\nIIII\n", Some("x.fq"))).unwrap();
         out.clear();
-        super::open_serial(&gzf).unwrap().read_to_end(&mut out).unwrap();
+        super::open_serial(&gzf)
+            .unwrap()
+            .read_to_end(&mut out)
+            .unwrap();
         assert_eq!(out, b"@r\nACGT\n+\nIIII\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -899,6 +956,45 @@ impl std::io::Read for MultiReader {
 
 #[cfg(test)]
 mod tests {
+
+    /// A truncated or corrupt gzip input names its file, on both decoders.
+    #[test]
+    fn unreadable_gzip_names_its_file() {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("piscem-named-input-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut gz = Vec::new();
+        {
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            for i in 0..20_000 {
+                writeln!(enc, "@r{i}\nACGTACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII").unwrap();
+            }
+            enc.finish().unwrap();
+        }
+        let truncated = dir.join("truncated_R2.fq.gz");
+        std::fs::write(&truncated, &gz[..gz.len() / 2]).unwrap();
+        let mut corrupt_bytes = gz.clone();
+        let mid = corrupt_bytes.len() / 2;
+        for b in &mut corrupt_bytes[mid..mid + 64] {
+            *b ^= 0x5a;
+        }
+        let corrupt = dir.join("corrupt_R1.fq.gz");
+        std::fs::write(&corrupt, &corrupt_bytes).unwrap();
+
+        for ceiling in [0usize, 4] {
+            for (path, cause) in [(&truncated, "truncated"), (&corrupt, "corrupt")] {
+                let mut r = crate::io::fastx::open_input(path, ceiling).unwrap().reader;
+                let mut sink = Vec::new();
+                let err = r
+                    .read_to_end(&mut sink)
+                    .expect_err("an unreadable input must fail");
+                let msg = err.to_string();
+                assert!(msg.contains(&path.display().to_string()), "{msg}");
+                assert!(msg.contains(cause), "{msg}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     use super::{
         DecodeAllocation, DecodePinSource, build_execution_plan, collection_share_floor,
         environment_allocation, parse_validation_lull_schedule,
