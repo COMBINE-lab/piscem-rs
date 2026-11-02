@@ -1733,7 +1733,7 @@ dependencies = [
 
 [[package]]
 name = "piscem-rs"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "ahash",
  "anyhow",
