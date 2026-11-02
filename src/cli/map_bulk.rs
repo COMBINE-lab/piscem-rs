@@ -462,10 +462,10 @@ where
             let o = crate::io::fastx::open_input(path, 0)?;
             #[cfg(feature = "rapidgzip")]
             handles.extend(o.handle.clone());
-            readers.push(
-                reader_with_batch_size(o.reader)
-                    .map_err(|e| anyhow::anyhow!("failed to open {}: {}", path.display(), e))?,
-            );
+            let mut reader = reader_with_batch_size(o.reader)
+                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", path.display(), e))?;
+            reader.set_source_name(path.display().to_string());
+            readers.push(reader);
         }
     }
 

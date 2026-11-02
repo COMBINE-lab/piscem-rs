@@ -1681,9 +1681,9 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "paraseq-temp"
-version = "0.6.2-pre.1"
+version = "0.6.3-pre.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b3557bbf59512a3e10d973bba6f26f6531bc3b7cf95381d07cdeb04cf65d4fd"
+checksum = "ea290fbfc62e5abfee846800eca397a837d1d817a3474c209c7fbf6fcd5f0ad3"
 dependencies = [
  "crossbeam-channel",
  "either",
@@ -2417,7 +2417,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys",
