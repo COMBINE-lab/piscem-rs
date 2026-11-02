@@ -559,10 +559,12 @@ where
         );
         #[cfg(feature = "rapidgzip")]
         handles.extend([o1.handle.clone(), o2.handle.clone()].into_iter().flatten());
-        let r1 = reader_with_batch_size(o1.reader)
+        let mut r1 = reader_with_batch_size(o1.reader)
             .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r1_path.display(), e))?;
-        let r2 = reader_with_batch_size(o2.reader)
+        let mut r2 = reader_with_batch_size(o2.reader)
             .map_err(|e| anyhow::anyhow!("failed to open {}: {}", r2_path.display(), e))?;
+        r1.set_source_name(r1_path.display().to_string());
+        r2.set_source_name(r2_path.display().to_string());
         pairs.push((r1, r2));
     }
 

@@ -100,13 +100,13 @@ hashbrown = "0.17"
 dashmap = "6"
 smallvec = "1.13"
 crossbeam = "0.8"
-# TEMPORARY: `paraseq-temp` 0.6.2-pre.1 is upstream paraseq 0.6.1 plus the
-# worker-pool admission fix offered upstream as noamteyssier/paraseq#100: a
-# worker could be counted live after a shrink had already been acknowledged,
-# briefly running past the thread budget (the `paraseq_resize_safety` flake).
-# Its library is still named `paraseq`, so code is unchanged; switch back to
+# TEMPORARY: `paraseq-temp` 0.6.3-pre.1 is upstream paraseq 0.6.2 plus two
+# fixes offered upstream: a FASTQ cut short one or two lines into its last
+# record is an error instead of reading as complete, and format errors can name
+# their input (the readers below are named after their paths). Its library is
+# still named `paraseq`, so code is unchanged; switch back to
 # `paraseq = { version = "0.6", default-features = false }` once a paraseq
-# release includes #100. `ThreadPool` (paraseq's resizable worker pool, from
+# release includes both. `ThreadPool` (paraseq's resizable worker pool, from
 # noamteyssier/paraseq#78) is what lets the mapping thread count change
 # mid-run, so a bad decode/map split can be corrected rather than merely
 # avoided.
@@ -117,7 +117,7 @@ crossbeam = "0.8"
 # on `niffler/default`, and with it niffler >= 3.0.1's `lzma` feature, which
 # links liblzma 0.4 -- unresolvable next to sshash-lib's needletail 0.7, which
 # links liblzma 0.3 (only one crate may link the native `lzma`).
-paraseq = { package = "paraseq-temp", version = "=0.6.2-pre.1", default-features = false }
+paraseq = { package = "paraseq-temp", version = "=0.6.3-pre.1", default-features = false }
 # niffler with its *default* features: exactly the set piscem has always been
 # built with, since paraseq-temp's defaults enabled `niffler/default` and
 # features unify. The old `default-features = false` list here was inert, and

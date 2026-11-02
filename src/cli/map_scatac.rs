@@ -607,8 +607,11 @@ where
     let readers = opened_inputs
         .into_iter()
         .map(|(path, opened)| {
-            crate::io::fastx::scatac_reader(opened.reader, tuning.reader_batch_size)
-                .map_err(|e| anyhow::anyhow!("failed to open {}: {}", path.display(), e))
+            let mut reader =
+                crate::io::fastx::scatac_reader(opened.reader, tuning.reader_batch_size)
+                    .map_err(|e| anyhow::anyhow!("failed to open {}: {}", path.display(), e))?;
+            reader.set_source_name(path.display().to_string());
+            Ok(reader)
         })
         .collect::<Result<Vec<_>>>()?;
 
