@@ -56,6 +56,11 @@ cargo build --release
 
 The binary will be at `target/release/piscem-rs`.
 
+An optional research build enables the SSHash minimizer fingerprint filter.
+It requires an unpublished upstream API and an explicit local dependency patch;
+see [build instructions and measured tradeoffs](notes/experimental-bucket-fingerprints.md).
+The experiment is off by default and adds memory and index-load time.
+
 ## Parity with C++ piscem
 
 piscem-rs is validated against C++ piscem using record-level RAD output comparison:
