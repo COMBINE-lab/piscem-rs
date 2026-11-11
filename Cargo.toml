@@ -52,6 +52,8 @@ exclude = [
 ]
 
 [features]
+# Opt-in, untimed single-worker lookup trace for query scheduler experiments.
+query-trace = []
 default = ["mimalloc"]
 parity-test = ["dep:libradicl"]
 # Parallel gzip decoding via the pure-Rust COMBINE-lab/rapidgzip-rust.
