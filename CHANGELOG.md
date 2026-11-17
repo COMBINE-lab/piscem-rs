@@ -3,6 +3,23 @@
 Notable changes to `piscem-rs`. Versions follow [Semantic Versioning](https://semver.org);
 pre-1.0, a minor bump may carry breaking changes.
 
+## [Unreleased]
+
+### Fixed
+
+- **Paired-end fragment lengths were one base too long.** `merge_se_mappings`
+  (bulk, scRNA) and `merge_se_mappings_binned` (scATAC) computed the template
+  length as `rc.pos + rc_len - fw.pos + 1`. Hit positions are exact 0-based
+  leftmost coordinates, so a pair covering `[50, 430)` is 380 bases, not 381.
+  The `+1` is inherited from piscem-cpp (`mapping/utils.hpp`, 2022), where it
+  came in with the comment "fragment length is (right_pos + right_len -
+  left_pos) + 1": the inclusive-end `end - start + 1` applied to an exclusive
+  end. Every mapped pair's `frag_len` in bulk and scATAC RAD output (and
+  `SimpleHit::frag_len()`, which salmon `--sketch` reads) is now one smaller;
+  positions, mapping decisions and orphans are unchanged. With the scATAC Tn5
+  shift, a pair's fragment now ends 5 bases before its reverse read's end, as
+  in Cell Ranger ATAC `fragments.tsv` (it ended 4 before).
+
 ## [0.12.1] — 2026-10-30
 
 ### Performance
