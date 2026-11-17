@@ -1437,19 +1437,15 @@ where
                             MappingType::Unmapped
                         };
 
-                        let (shorter_len, longer_len) = if r1.len() <= r2.len() {
-                            (r1.len() as i32, r2.len() as i32)
-                        } else {
-                            (r2.len() as i32, r1.len() as i32)
-                        };
+                        let longer_len = r1.len().max(r2.len()) as i32;
 
                         for hit in &mut s.cache_out.accepted_hits {
                             hit.fragment_length = mate_ov.frag_length as i32;
+                            hit.mate_is_fw = !hit.is_fw;
                             hit.mate_pos = merged_mate_pos(
                                 hit.pos,
                                 hit.is_fw,
                                 hit.fragment_length,
-                                shorter_len,
                                 longer_len,
                             );
                             let ref_len = index.ref_len(hit.tid as usize) as i32;

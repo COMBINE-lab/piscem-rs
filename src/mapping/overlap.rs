@@ -93,30 +93,29 @@ pub fn find_overlap(
     mate_ov
 }
 
-/// Start of the other read of an overlapping pair whose merged fragment
+/// Start of the longer read of an overlapping pair whose merged fragment
 /// (from [`find_overlap`]) mapped at `pos` in orientation `is_fw`.
 ///
-/// The merged fragment is the shorter read, as sequenced, followed by the rest
-/// of the reverse complement of the longer read, and it covers the half-open
-/// `[pos, pos + frag_len)`. Mapped forward, the shorter read starts at `pos`
-/// and the longer read covers the last `longer_len` bases; mapped reverse
-/// complement, the longer read starts at `pos` and the shorter read covers the
-/// last `shorter_len` bases. Either way the result is at least `pos`, so
-/// `min(pos, mate_pos)` is the fragment start.
+/// The merged fragment is in the shorter read's orientation and covers the
+/// half-open `[pos, pos + frag_len)`: from the forward mate's 5' end to the
+/// reverse-complement mate's 5' end. Mapped forward, the shorter read is the
+/// forward mate and the longer read is the reverse-complement mate, ending at
+/// `pos + frag_len`; mapped reverse complement, the longer read is the
+/// forward mate and starts at `pos`. Either way the forward mate starts at
+/// `pos`, so [`crate::mapping::hits::SimpleHit::pair_start`] is the fragment
+/// start.
 ///
 /// piscem-cpp computes `pos + frag_len - longer_len - 1` (forward) and
 /// `pos + shorter_len - frag_len - 1` (reverse complement); the second lies
 /// before the fragment, which moved every reverse-complement merged fragment's
 /// scATAC start `frag_len - shorter_len + 1` bases to the left.
 #[inline]
-pub fn merged_mate_pos(
-    pos: i32,
-    is_fw: bool,
-    frag_len: i32,
-    shorter_len: i32,
-    longer_len: i32,
-) -> i32 {
-    pos + frag_len - if is_fw { longer_len } else { shorter_len }
+pub fn merged_mate_pos(pos: i32, is_fw: bool, frag_len: i32, longer_len: i32) -> i32 {
+    if is_fw {
+        pos + frag_len - longer_len
+    } else {
+        pos
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -277,19 +276,15 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
-    /// Fragment [200, 380) from a 120-base shorter and a 120-base longer read:
-    /// forward, the longer read starts at 260; reverse complement, the shorter
-    /// read does. Either way `min(pos, mate_pos)` is the fragment start.
     #[test]
     fn test_merged_mate_pos() {
-        assert_eq!(merged_mate_pos(200, true, 180, 120, 120), 260);
-        assert_eq!(merged_mate_pos(200, false, 180, 120, 120), 260);
-        // 100 + 130 over [200, 400): forward, the 130 starts at 270;
-        // reverse complement, the 100 starts at 300.
-        assert_eq!(merged_mate_pos(200, true, 200, 100, 130), 270);
-        assert_eq!(merged_mate_pos(200, false, 200, 100, 130), 300);
-        // The longer read spans the whole fragment.
-        assert_eq!(merged_mate_pos(200, true, 130, 100, 130), 200);
+        // [200, 380) from 120 + 120: forward, the longer read starts at 260;
+        // reverse complement, it is the forward mate and starts at 200.
+        assert_eq!(merged_mate_pos(200, true, 180, 120), 260);
+        assert_eq!(merged_mate_pos(200, false, 180, 120), 200);
+        // A 130-base longer read reading 10 bases past the forward mate's 5'
+        // end of a 120-base fragment starts before it.
+        assert_eq!(merged_mate_pos(200, true, 120, 130), 190);
     }
 
     #[test]

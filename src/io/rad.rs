@@ -487,7 +487,8 @@ pub fn write_sc_record(
 ///
 /// Position computation:
 /// - Single/orphan: `max(0, pos)`
-/// - Pair: `min(pos, mate_pos)`, clamped to 0 (adjusting frag_len)
+/// - Pair: the forward mate's position ([`SimpleHit::pair_start`]), clamped to
+///   0, with `frag_len` shortened by the clipped amount
 pub fn write_bulk_record(
     map_type: MappingType,
     accepted_hits: &[SimpleHit],
@@ -508,7 +509,7 @@ pub fn write_bulk_record(
         // Position and fragment length
         let is_pair = map_type == MappingType::MappedPair;
         if is_pair {
-            let mut leftmost = hit.pos.min(hit.mate_pos);
+            let mut leftmost = hit.pair_start();
             let mut frag_len = hit.fragment_length;
             if leftmost < 0 {
                 frag_len += leftmost;
@@ -661,7 +662,7 @@ pub fn write_atac_record(
 
         match map_type {
             MappingType::MappedPair => {
-                leftmost_pos = hit.pos.min(hit.mate_pos);
+                leftmost_pos = hit.pair_start();
                 frag_len = hit.frag_len() as u16;
                 if leftmost_pos < 0 {
                     frag_len = (hit.frag_len() + leftmost_pos) as u16;

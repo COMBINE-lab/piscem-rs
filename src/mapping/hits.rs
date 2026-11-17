@@ -102,6 +102,20 @@ impl SimpleHit {
         self.mate_pos != INVALID_MATE_POS
     }
 
+    /// Start of a concordant pair's fragment: the forward-strand mate's
+    /// position.
+    ///
+    /// Mates face each other, so the fragment runs from the forward mate's 5'
+    /// end to the reverse-complement mate's 5' end, `[fw_start, rc_end)`, and
+    /// `frag_len()` is its length. Bases a read has past the other read's 5'
+    /// end are adapter read-through, not insert, so a dovetailed or contained
+    /// pair (whose reverse mate starts before its forward mate) still starts at
+    /// the forward mate, not at `min(pos, mate_pos)`.
+    #[inline]
+    pub fn pair_start(&self) -> i32 {
+        if self.is_fw { self.pos } else { self.mate_pos }
+    }
+
     /// Fragment length, or 0 if invalid.
     #[inline]
     pub fn frag_len(&self) -> i32 {

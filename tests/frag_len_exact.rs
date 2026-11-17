@@ -181,20 +181,11 @@ fn map_atac_overlap(index: &ReferenceIndex, r1: &[u8], r2: &[u8]) -> (OverlapTyp
     );
     out.accepted_hits.sort_by(simple_hit_cmp_bins);
     remove_duplicate_hits_pub(&mut out.accepted_hits);
-    let (shorter_len, longer_len) = if r1.len() <= r2.len() {
-        (r1.len() as i32, r2.len() as i32)
-    } else {
-        (r2.len() as i32, r1.len() as i32)
-    };
+    let longer_len = r1.len().max(r2.len()) as i32;
     for hit in &mut out.accepted_hits {
         hit.fragment_length = mate_ov.frag_length as i32;
-        hit.mate_pos = merged_mate_pos(
-            hit.pos,
-            hit.is_fw,
-            hit.fragment_length,
-            shorter_len,
-            longer_len,
-        );
+        hit.mate_is_fw = !hit.is_fw;
+        hit.mate_pos = merged_mate_pos(hit.pos, hit.is_fw, hit.fragment_length, longer_len);
         if mate_ov.ov_type == OverlapType::Dovetail {
             hit.mate_pos = hit.pos;
         }
@@ -337,4 +328,112 @@ fn overlapping_atac_pair_is_exact() {
     let (ov, hits) = map_atac_overlap(&fx.index, &a, &b);
     assert_eq!(ov, OverlapType::Dovetail);
     assert_eq!(atac_rad(&hits, false), [(200, 80)]);
+}
+
+/// Adapter-like bases that match nowhere in the transcript.
+fn adapter(n: usize, seed: u64) -> Vec<u8> {
+    gen_seq(n, seed ^ 0xADA9_7E55)
+}
+
+/// Dovetailed pairs: the 80-base insert [200, 280) read by 95-base mates that
+/// run 15 bases into adapter (the scATAC merge pairs mates whose starts differ
+/// by less than 20). The reverse mate's projected start (185) lies before the
+/// forward mate's (200); the fragment is still [200, 280), the span between
+/// the two 5' ends, in both read orders and on both merge paths.
+#[test]
+fn dovetailed_pair_starts_at_forward_mate() {
+    let fx = fixture();
+    let t = &fx.txp;
+    let mut fw = t[200..280].to_vec();
+    fw.extend(adapter(15, 1));
+    let mut rc = revcomp(&t[200..280]);
+    rc.extend(adapter(15, 2));
+    for (name, map) in [
+        ("bulk", map_bulk as fn(&ReferenceIndex, &[u8], &[u8]) -> _),
+        ("atac", map_atac),
+    ] {
+        for (order, r1, r2) in [("fw/rc", &fw, &rc), ("rc/fw", &rc, &fw)] {
+            let (mt, hits) = map(&fx.index, r1, r2);
+            assert_eq!(mt, MappingType::MappedPair, "{name} {order}");
+            assert_eq!(hits.len(), 1, "{name} {order}");
+            let h = &hits[0];
+            assert_eq!(h.pair_start(), 200, "{name} {order} {h:?}");
+            assert_eq!(h.fragment_length, 80, "{name} {order} {h:?}");
+            if name == "bulk" {
+                assert_eq!(bulk_rad(&hits), [(200, 80)], "{order} {h:?}");
+            } else {
+                assert_eq!(atac_rad(&hits, false), [(200, 80)], "{order} {h:?}");
+                assert_eq!(atac_rad(&hits, true), [(204, 71)], "{order} {h:?}");
+            }
+        }
+    }
+}
+
+/// Contained mates mapped separately. (a) A 145-base reverse mate whose 3'
+/// end runs 15 bases past a 100-base forward mate's 5' end: [200, 330), not
+/// [185, 315). (b) A 120-base forward mate running past a 70-base reverse
+/// mate's 5' end: [200, 300).
+#[test]
+fn contained_pair_spans_the_two_five_prime_ends() {
+    let fx = fixture();
+    let t = &fx.txp;
+    let cases = [
+        (
+            "rc reads past fw",
+            t[200..300].to_vec(),
+            revcomp(&t[185..330]),
+            200,
+            130,
+        ),
+        (
+            "fw reads past rc",
+            t[200..320].to_vec(),
+            revcomp(&t[230..300]),
+            200,
+            100,
+        ),
+    ];
+    for (name, fw, rc, start, len) in cases {
+        for (order, r1, r2) in [("fw/rc", &fw, &rc), ("rc/fw", &rc, &fw)] {
+            let (mt, hits) = map_bulk(&fx.index, r1, r2);
+            assert_eq!(mt, MappingType::MappedPair, "{name} {order}");
+            assert_eq!(bulk_rad(&hits), [(start, len)], "{name} {order} {hits:?}");
+            let (mt, hits) = map_atac(&fx.index, r1, r2);
+            assert_eq!(mt, MappingType::MappedPair, "{name} {order}");
+            assert_eq!(
+                atac_rad(&hits, false),
+                [(start, len)],
+                "{name} {order} {hits:?}"
+            );
+        }
+    }
+}
+
+/// A dovetailed pair at the transcript start: insert [0, 80) with 20 adapter
+/// bases on each mate. The forward mate is at 0, so nothing is clipped, and
+/// the reverse mate's projected start (-20) does not pull the start below 0.
+/// With a forward mate hanging 10 bases off the start instead (pos = -10),
+/// the clip shortens the fragment by those 10 bases, in both read orders.
+#[test]
+fn overhang_clip_uses_the_forward_mate() {
+    let fx = fixture();
+    let t = &fx.txp;
+    let mut fw = t[0..80].to_vec();
+    fw.extend(adapter(20, 3));
+    let mut rc = revcomp(&t[0..80]);
+    rc.extend(adapter(20, 4));
+    for (order, r1, r2) in [("fw/rc", &fw, &rc), ("rc/fw", &rc, &fw)] {
+        let (_, hits) = map_bulk(&fx.index, r1, r2);
+        assert_eq!(bulk_rad(&hits), [(0, 80)], "{order} {hits:?}");
+    }
+    let mut fw = adapter(10, 5);
+    fw.extend_from_slice(&t[0..70]);
+    let rc = revcomp(&t[300..380]);
+    for (order, r1, r2) in [("fw/rc", &fw, &rc), ("rc/fw", &rc, &fw)] {
+        let (_, hits) = map_bulk(&fx.index, r1, r2);
+        assert_eq!(hits[0].pair_start(), -10, "{order}");
+        assert_eq!(bulk_rad(&hits), [(0, 380)], "{order} {hits:?}");
+        let (_, hits) = map_atac(&fx.index, r1, r2);
+        assert_eq!(atac_rad(&hits, false), [(0, 380)], "{order} {hits:?}");
+    }
 }
