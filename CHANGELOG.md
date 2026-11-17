@@ -3,7 +3,7 @@
 Notable changes to `piscem-rs`. Versions follow [Semantic Versioning](https://semver.org);
 pre-1.0, a minor bump may carry breaking changes.
 
-## [Unreleased]
+## [0.12.4] — 2026-11-17
 
 ### Fixed
 
