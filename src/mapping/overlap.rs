@@ -93,6 +93,31 @@ pub fn find_overlap(
     mate_ov
 }
 
+/// Start of the longer read of an overlapping pair whose merged fragment
+/// (from [`find_overlap`]) mapped at `pos` in orientation `is_fw`.
+///
+/// The merged fragment is in the shorter read's orientation and covers the
+/// half-open `[pos, pos + frag_len)`: from the forward mate's 5' end to the
+/// reverse-complement mate's 5' end. Mapped forward, the shorter read is the
+/// forward mate and the longer read is the reverse-complement mate, ending at
+/// `pos + frag_len`; mapped reverse complement, the longer read is the
+/// forward mate and starts at `pos`. Either way the forward mate starts at
+/// `pos`, so [`crate::mapping::hits::SimpleHit::pair_start`] is the fragment
+/// start.
+///
+/// piscem-cpp computes `pos + frag_len - longer_len - 1` (forward) and
+/// `pos + shorter_len - frag_len - 1` (reverse complement); the second lies
+/// before the fragment, which moved every reverse-complement merged fragment's
+/// scATAC start `frag_len - shorter_len + 1` bases to the left.
+#[inline]
+pub fn merged_mate_pos(pos: i32, is_fw: bool, frag_len: i32, longer_len: i32) -> i32 {
+    if is_fw {
+        pos + frag_len - longer_len
+    } else {
+        pos
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
@@ -152,6 +177,9 @@ fn get_overlap(
     let pref_length = prefix_read.len();
 
     let mut overlap_length: usize = 0;
+    // Bases from where `prefix_read` starts in `suffix_read` to the end of
+    // `suffix_read`.
+    let mut merged_span: usize = 0;
     let mut is_merged = false;
 
     // Progressive seed search
@@ -209,7 +237,8 @@ fn get_overlap(
 
                 if can_merge {
                     is_merged = true;
-                    overlap_length = (suff_length - seed_start + seed_offset).min(pref_length);
+                    merged_span = suff_length - seed_start + seed_offset;
+                    overlap_length = merged_span.min(pref_length);
                     break;
                 }
             }
@@ -225,7 +254,19 @@ fn get_overlap(
     // Build merged fragment
     if overlap_length > 0 {
         if dovetail {
-            mate_ov.frag = prefix_read[..overlap_length].to_vec();
+            // The fragment runs from read1's 5' end to the longer read's 5'
+            // end (the end of `suffix_read`); bases either read has past the
+            // other's 5' end are adapter read-through. When read1 reads through
+            // (`merged_span <= pref_length`) that is read1 cut to the overlap;
+            // when read1 lies inside the longer read (`merged_span >
+            // pref_length`) it is read1 followed by the rest of the longer
+            // read, not read1 alone.
+            let mut frag = prefix_read[..overlap_length].to_vec();
+            if merged_span > pref_length {
+                let longer_start = suff_length - merged_span;
+                frag.extend_from_slice(&suffix_read[longer_start + pref_length..]);
+            }
+            mate_ov.frag = frag;
         } else {
             let mut frag = suffix_read.to_vec();
             if overlap_length < pref_length {
@@ -250,6 +291,17 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_merged_mate_pos() {
+        // [200, 380) from 120 + 120: forward, the longer read starts at 260;
+        // reverse complement, it is the forward mate and starts at 200.
+        assert_eq!(merged_mate_pos(200, true, 180, 120), 260);
+        assert_eq!(merged_mate_pos(200, false, 180, 120), 200);
+        // A 130-base longer read reading 10 bases past the forward mate's 5'
+        // end of a 120-base fragment starts before it.
+        assert_eq!(merged_mate_pos(200, true, 120, 130), 190);
+    }
 
     #[test]
     fn test_reverse_complement() {

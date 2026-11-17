@@ -316,11 +316,7 @@ fn merge_lists_binned(
 
                     if frag_len > -20 && frag_len < 1000 {
                         let right_is_rc = !list2.first().is_some_and(|h| h.is_fw);
-                        let tlen = if right_is_rc {
-                            (f2.pos + right_len - f1.pos) + 1
-                        } else {
-                            (f1.pos + left_len - f2.pos) + 1
-                        };
+                        let tlen = template_len(f1, f2, right_is_rc, left_len, right_len);
 
                         let nhits = f1.num_hits + f2.num_hits;
                         *max_num_hits = (*max_num_hits).max(nhits);
@@ -339,6 +335,30 @@ fn merge_lists_binned(
                 }
             }
         }
+    }
+}
+
+/// Fragment (template) length of a concordant pair: from the start of the
+/// forward mate to the end of the reverse-complement mate.
+///
+/// `left` is the left read's hit, `right` the right read's. Hit positions are
+/// 0-based leftmost reference coordinates, so the forward mate starts at
+/// `fw.pos` and the reverse-complement mate covers `[rc.pos, rc.pos + rc_len)`;
+/// the fragment is the half-open `[fw.pos, rc.pos + rc_len)` and its length is
+/// `rc.pos + rc_len - fw.pos`. (piscem-cpp adds 1 here, as piscem-rs once did,
+/// which made every pair one base longer than its fragment.)
+#[inline]
+fn template_len(
+    left: &SimpleHit,
+    right: &SimpleHit,
+    right_is_rc: bool,
+    left_len: i32,
+    right_len: i32,
+) -> i32 {
+    if right_is_rc {
+        right.pos + right_len - left.pos
+    } else {
+        left.pos + left_len - right.pos
     }
 }
 
@@ -385,11 +405,8 @@ fn merge_lists(
 
                 if frag_len > min_frag_len && frag_len < 2000 {
                     let right_is_rc = !list2[i2].is_fw;
-                    let tlen = if right_is_rc {
-                        (list2[i2].pos + right_len - list1[i1].pos) + 1
-                    } else {
-                        (list1[i1].pos + left_len - list2[i2].pos) + 1
-                    };
+                    let tlen =
+                        template_len(&list1[i1], &list2[i2], right_is_rc, left_len, right_len);
                     out.push(SimpleHit {
                         is_fw: list1[i1].is_fw,
                         mate_is_fw: list2[i2].is_fw,
@@ -488,6 +505,62 @@ mod tests {
         assert_eq!(out.accepted_hits[0].tid, 5);
         assert!(out.accepted_hits[0].is_fw);
         assert!(!out.accepted_hits[0].mate_is_fw);
+    }
+
+    /// Merge one left hit with one right hit through `merge_se_mappings` or
+    /// `merge_se_mappings_binned` and return the output hits.
+    fn merge_one(left_hit: SimpleHit, right_hit: SimpleHit, binned: bool) -> Vec<SimpleHit> {
+        let mut left = MappingCache::<SketchHitInfoSimple>::new(31);
+        let mut right = MappingCache::<SketchHitInfoSimple>::new(31);
+        let mut out = MappingCache::<SketchHitInfoSimple>::new(31);
+        left.accepted_hits.push(SimpleHit {
+            bin_id: 0,
+            ..left_hit
+        });
+        right.accepted_hits.push(SimpleHit {
+            bin_id: 0,
+            ..right_hit
+        });
+        if binned {
+            merge_se_mappings_binned(&mut left, &mut right, 80, 80, &mut out);
+        } else {
+            merge_se_mappings(&mut left, &mut right, 80, 80, &mut out);
+        }
+        assert_eq!(out.map_type, MappingType::MappedPair);
+        out.accepted_hits
+    }
+
+    /// A pair cut from `[50, 430)` of a transcript, 80-base mates: the forward
+    /// mate starts at 50 and the reverse-complement mate covers `[350, 430)`.
+    /// The fragment is 380 bases whichever read is forward and whichever merge
+    /// path pairs them (piscem-cpp reports 381).
+    #[test]
+    fn test_merge_frag_len_is_exact() {
+        for binned in [false, true] {
+            // left forward, right reverse complement
+            let hits = merge_one(make_hit(3, 50, true), make_hit(3, 350, false), binned);
+            assert_eq!(hits.len(), 1);
+            assert_eq!((hits[0].pos, hits[0].mate_pos), (50, 350));
+            assert_eq!(hits[0].fragment_length, 380, "binned={binned}");
+            // left reverse complement, right forward
+            let hits = merge_one(make_hit(3, 350, false), make_hit(3, 50, true), binned);
+            assert_eq!(hits.len(), 1);
+            assert_eq!((hits[0].pos, hits[0].mate_pos), (350, 50));
+            assert_eq!(hits[0].fragment_length, 380, "binned={binned}");
+        }
+    }
+
+    /// Mates that overlap completely (same start, same length) make a fragment
+    /// exactly one read long; a forward mate hanging 10 bases off the
+    /// transcript start (`pos = -10`) counts those bases too.
+    #[test]
+    fn test_merge_frag_len_edges() {
+        for binned in [false, true] {
+            let hits = merge_one(make_hit(0, 100, true), make_hit(0, 100, false), binned);
+            assert_eq!(hits[0].fragment_length, 80, "binned={binned}");
+            let hits = merge_one(make_hit(0, -10, true), make_hit(0, 300, false), binned);
+            assert_eq!(hits[0].fragment_length, 390, "binned={binned}");
+        }
     }
 
     #[test]
