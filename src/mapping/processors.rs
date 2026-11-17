@@ -36,7 +36,7 @@ use crate::mapping::map_fragment::{
     map_pe_fragment, map_pe_fragment_atac, map_se_fragment, map_se_fragment_atac,
 };
 use crate::mapping::merge_pairs::{remove_duplicate_hits_pub, simple_hit_cmp_bins};
-use crate::mapping::overlap::{OverlapType, find_overlap};
+use crate::mapping::overlap::{OverlapType, find_overlap, merged_mate_pos};
 use crate::mapping::protocols::Protocol;
 use crate::mapping::protocols::scrna::{barcode_has_n, count_ns, is_all_acgt, recover_barcode};
 use crate::mapping::sketch_hit_simple::SketchHitInfoSimple;
@@ -1437,7 +1437,7 @@ where
                             MappingType::Unmapped
                         };
 
-                        let (r1_len, r2_len) = if r1.len() <= r2.len() {
+                        let (shorter_len, longer_len) = if r1.len() <= r2.len() {
                             (r1.len() as i32, r2.len() as i32)
                         } else {
                             (r2.len() as i32, r1.len() as i32)
@@ -1445,11 +1445,13 @@ where
 
                         for hit in &mut s.cache_out.accepted_hits {
                             hit.fragment_length = mate_ov.frag_length as i32;
-                            hit.mate_pos = if hit.is_fw {
-                                hit.pos + hit.fragment_length - r2_len - 1
-                            } else {
-                                hit.pos + r1_len - hit.fragment_length - 1
-                            };
+                            hit.mate_pos = merged_mate_pos(
+                                hit.pos,
+                                hit.is_fw,
+                                hit.fragment_length,
+                                shorter_len,
+                                longer_len,
+                            );
                             let ref_len = index.ref_len(hit.tid as usize) as i32;
                             if hit.mate_pos > ref_len {
                                 hit.mate_pos = hit.pos;

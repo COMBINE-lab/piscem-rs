@@ -20,7 +20,11 @@ use piscem_rs::mapping::cache::MappingCache;
 use piscem_rs::mapping::filters::PoisonState;
 use piscem_rs::mapping::hit_searcher::{HitSearcher, SkippingStrategy};
 use piscem_rs::mapping::hits::{MappingType, SimpleHit};
-use piscem_rs::mapping::map_fragment::{map_pe_fragment, map_pe_fragment_atac};
+use piscem_rs::mapping::map_fragment::{
+    map_pe_fragment, map_pe_fragment_atac, map_se_fragment_atac,
+};
+use piscem_rs::mapping::merge_pairs::{remove_duplicate_hits_pub, simple_hit_cmp_bins};
+use piscem_rs::mapping::overlap::{OverlapType, find_overlap, merged_mate_pos};
 use piscem_rs::mapping::sketch_hit_simple::SketchHitInfoSimple;
 use piscem_rs::mapping::streaming_query::PiscemStreamingQuery;
 
@@ -154,6 +158,50 @@ fn map_atac(index: &ReferenceIndex, r1: &[u8], r2: &[u8]) -> (MappingType, Vec<S
     (out.map_type, out.accepted_hits.clone())
 }
 
+/// Map an overlapping pair the way `map-scatac` does: merge the mates, map
+/// the merged fragment as one read, then fill in the pair fields (this mirrors
+/// the overlap branch of the scATAC processor).
+fn map_atac_overlap(index: &ReferenceIndex, r1: &[u8], r2: &[u8]) -> (OverlapType, Vec<SimpleHit>) {
+    let binning = BinPos::new(index, 1000, 300, 0.7);
+    let mut hs = HitSearcher::new(index);
+    let mut query = PiscemStreamingQuery::<K, _>::new(index.dict());
+    let mut out = MappingCache::<SketchHitInfoSimple>::new(K);
+    let mut poison = PoisonState::new(index.poison_table());
+    let mate_ov = find_overlap(r1, r2, 30, 0);
+    assert_ne!(mate_ov.ov_type, OverlapType::NoOverlap);
+    poison.paired_for_mapping = false;
+    map_se_fragment_atac(
+        &mate_ov.frag,
+        &mut hs,
+        &mut query,
+        &mut out,
+        index,
+        &mut poison,
+        &binning,
+    );
+    out.accepted_hits.sort_by(simple_hit_cmp_bins);
+    remove_duplicate_hits_pub(&mut out.accepted_hits);
+    let (shorter_len, longer_len) = if r1.len() <= r2.len() {
+        (r1.len() as i32, r2.len() as i32)
+    } else {
+        (r2.len() as i32, r1.len() as i32)
+    };
+    for hit in &mut out.accepted_hits {
+        hit.fragment_length = mate_ov.frag_length as i32;
+        hit.mate_pos = merged_mate_pos(
+            hit.pos,
+            hit.is_fw,
+            hit.fragment_length,
+            shorter_len,
+            longer_len,
+        );
+        if mate_ov.ov_type == OverlapType::Dovetail {
+            hit.mate_pos = hit.pos;
+        }
+    }
+    (mate_ov.ov_type, out.accepted_hits)
+}
+
 /// (start, frag_len) of each alignment of a bulk RAD pair record.
 fn bulk_rad(hits: &[SimpleHit]) -> Vec<(u32, u16)> {
     let mut w = RadWriter::new();
@@ -250,4 +298,43 @@ fn overhanging_pair_is_clipped_exactly() {
     assert_eq!((hits[0].pos, hits[0].mate_pos), (-10, 300));
     assert_eq!(hits[0].fragment_length, 390);
     assert_eq!(bulk_rad(&hits), [(0, 380)]);
+}
+
+/// scATAC mates that overlap are merged into one fragment and mapped as one
+/// read. The fragment [200, 380) must be written as start 200, length 180,
+/// whichever strand it maps to (the reverse-complement case used to start at
+/// 139, `frag_len - shorter_len + 1` bases too far left).
+#[test]
+fn overlapping_atac_pair_is_exact() {
+    let fx = fixture();
+    let t = &fx.txp;
+    let a = t[200..320].to_vec();
+    let b = revcomp(&t[260..380]);
+    for (name, r1, r2) in [("fw", &a, &b), ("rc", &b, &a)] {
+        let (ov, hits) = map_atac_overlap(&fx.index, r1, r2);
+        assert_eq!(ov, OverlapType::Overlap, "{name}");
+        assert_eq!(hits.len(), 1, "{name}");
+        assert_eq!(hits[0].is_fw, name == "fw");
+        assert_eq!(hits[0].pos, 200, "{name}");
+        assert_eq!(hits[0].fragment_length, 180, "{name}");
+        assert_eq!(atac_rad(&hits, false), [(200, 180)], "{name} {hits:?}");
+        assert_eq!(atac_rad(&hits, true), [(204, 171)], "{name}");
+    }
+    // Unequal mates: a 100-base r1 and a 130-base r2 over [200, 400).
+    let a = t[200..300].to_vec();
+    let b = revcomp(&t[270..400]);
+    for (name, r1, r2) in [("fw", &a, &b), ("rc", &b, &a)] {
+        let (ov, hits) = map_atac_overlap(&fx.index, r1, r2);
+        assert_eq!(ov, OverlapType::Overlap, "{name}");
+        assert_eq!(atac_rad(&hits, false), [(200, 200)], "{name} {hits:?}");
+    }
+    // Read-through (dovetail): an 80-base fragment read past its ends by both
+    // 100-base mates is trimmed to [200, 280).
+    let mut a = t[200..280].to_vec();
+    a.extend(gen_seq(20, 3));
+    let mut b = revcomp(&t[200..280]);
+    b.extend(gen_seq(20, 4));
+    let (ov, hits) = map_atac_overlap(&fx.index, &a, &b);
+    assert_eq!(ov, OverlapType::Dovetail);
+    assert_eq!(atac_rad(&hits, false), [(200, 80)]);
 }

@@ -19,6 +19,16 @@ pre-1.0, a minor bump may carry breaking changes.
   positions, mapping decisions and orphans are unchanged. With the scATAC Tn5
   shift, a pair's fragment now ends 5 bases before its reverse read's end, as
   in Cell Ranger ATAC `fragments.tsv` (it ended 4 before).
+- **scATAC: overlapping mates whose merged fragment mapped to the reverse
+  strand were written too far left.** When `map-scatac` merges overlapping
+  mates and maps the merged fragment, the record start is
+  `min(pos, mate_pos)`, and `mate_pos` was `pos + shorter_len - frag_len - 1`
+  for a reverse-strand hit, which lies before the fragment. The fragment's
+  start (and end) moved `frag_len - shorter_len + 1` bases left: 3–21 bases
+  for 10x 50+49-base reads. `mate_pos` is now the other read's start, which
+  is never before `pos`. Inherited from piscem-cpp `pesc_sc_atac.cpp`. On 2M
+  PBMC read pairs (chr1+chr2), 34,138 of 371,521 pair records (281,857
+  alignments) move.
 
 ## [0.12.1] — 2026-10-30
 
