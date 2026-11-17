@@ -13,14 +13,14 @@
 //! - **reference_id** (bits ref_len_bits+1..): which reference transcript
 //!
 //! The posting lists are stored in a compact bit-packed vector (`BitFieldVec`)
-//! with boundaries encoded as a monotone Elias-Fano sequence (sux-rs `EfSeq`).
+//! with boundaries encoded as a monotone Elias-Fano sequence (sux-rs `EfSeq`)
+//! on disk, and as a fixed-width vector in memory.
 //!
 //! This corresponds to the C++ `basic_contig_table` class.
 
 use anyhow::{Context, Result, bail};
 use epserde::deser::Deserialize;
 use epserde::ser::Serialize;
-use mem_dbg::{MemSize, SizeFlags};
 use std::io::{Read, Write};
 use sux::bits::bit_field_vec::BitFieldVec;
 use sux::dict::elias_fano::{EfSeq, EliasFanoBuilder};
@@ -308,18 +308,59 @@ pub struct ContigTable {
     ref_len_bits: u64,
     /// Number of bits used to encode reference IDs.
     num_ref_bits: u64,
-    /// Elias-Fano encoded cumulative offsets into `ctg_entries`.
-    /// Length = num_contigs + 1. The entries for contig `i` span
-    /// `[ctg_offsets[i], ctg_offsets[i+1])`.
-    ctg_offsets: EfSeq,
     /// Bit-packed entry vector. Each entry is `ref_len_bits + num_ref_bits + 1` bits.
     ctg_entries: BitFieldVec,
+    /// Cumulative offsets into `ctg_entries`, `num_contigs + 1` of them, at
+    /// the fixed width of the largest: the entries of contig `i` span
+    /// `[bounds[i], bounds[i+1])`. On disk they are an Elias-Fano sequence
+    /// (~3 bits per contig); in memory they take `bits(num_entries)` bits
+    /// per contig, so that a contig's bounds cost one cache line rather than
+    /// an Elias-Fano select (inventory, upper and lower bits: three likely
+    /// misses on every k-mer hit).
+    bounds: BitFieldVec,
+}
+
+/// `offsets` as a fixed-width vector, as narrow as its last value allows.
+fn dense_bounds(offsets: &EfSeq) -> BitFieldVec {
+    let n = offsets.len();
+    let max = offsets.iter().last().unwrap_or(0);
+    let width = (usize::BITS - max.leading_zeros()).max(1) as usize;
+    let mut bounds = BitFieldVec::new(width, n);
+    for (i, v) in offsets.iter().enumerate() {
+        bounds.set_value(i, v);
+    }
+    bounds
 }
 
 impl ContigTable {
+    fn from_parts(
+        ref_len_bits: u64,
+        num_ref_bits: u64,
+        ctg_offsets: EfSeq,
+        ctg_entries: BitFieldVec,
+    ) -> Self {
+        Self {
+            ref_len_bits,
+            num_ref_bits,
+            ctg_entries,
+            bounds: dense_bounds(&ctg_offsets),
+        }
+    }
+
+    /// `bounds` back as the Elias-Fano sequence the file format stores.
+    fn offsets_ef(&self) -> EfSeq {
+        let n = self.bounds.len();
+        let u = if n == 0 { 1 } else { self.bounds.index_value(n - 1) + 1 };
+        let mut ef_builder = EliasFanoBuilder::new(n, u);
+        for i in 0..n {
+            ef_builder.push(self.bounds.index_value(i));
+        }
+        ef_builder.build_with_seq()
+    }
+
     /// Number of contigs (unitigs) in the table.
     pub fn num_contigs(&self) -> usize {
-        let n = self.ctg_offsets.len();
+        let n = self.bounds.len();
         if n == 0 { 0 } else { n - 1 }
     }
 
@@ -349,20 +390,22 @@ impl ContigTable {
     /// Use `EntryEncoding` to decode each entry.
     #[inline]
     pub fn contig_entries(&self, contig_id: u64) -> ContigSpan<'_> {
-        // Adjacent offsets: one select, then the next one of the high bits
-        // (two `get_unchecked` calls would each do a full select).
-        let mut it = self.ctg_offsets.iter_from(contig_id as usize);
-        let start = it.next().unwrap();
-        let end = it.next().unwrap();
+        let words = self.bounds.as_slice();
+        let width = self.bounds.bit_width();
+        let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+        let bit = contig_id as usize * width;
+        assert!(contig_id as usize + 1 < self.bounds.len(), "contig id out of range");
+        let start = packed_entry_at(words, bit, mask) as usize;
+        let end = packed_entry_at(words, bit + width, mask) as usize;
         ContigSpan::packed(&self.ctg_entries, start, end - start)
     }
 
     /// Approximate size in bytes of the in-memory representation.
     pub fn size_bytes(&self) -> usize {
-        let ef_bytes = self.ctg_offsets.mem_size(SizeFlags::default());
         let entries_bits = self.ctg_entries.len() * self.ctg_entries.bit_width();
         let entries_bytes = entries_bits.div_ceil(8);
-        ef_bytes + entries_bytes + std::mem::size_of::<Self>()
+        let bounds_bytes = (self.bounds.len() * self.bounds.bit_width()).div_ceil(8);
+        entries_bytes + bounds_bytes + std::mem::size_of::<Self>()
     }
 
     // -----------------------------------------------------------------------
@@ -384,7 +427,7 @@ impl ContigTable {
         writer.write_all(&self.ref_len_bits.to_le_bytes())?;
         writer.write_all(&self.num_ref_bits.to_le_bytes())?;
         unsafe {
-            self.ctg_offsets
+            self.offsets_ef()
                 .serialize(writer)
                 .map_err(std::io::Error::other)
                 .context("failed to serialize contig offsets")?;
@@ -421,12 +464,12 @@ impl ContigTable {
                 .context("failed to deserialize contig entries")?
         };
 
-        Ok(Self {
+        Ok(Self::from_parts(
             ref_len_bits,
             num_ref_bits,
             ctg_offsets,
             ctg_entries,
-        })
+        ))
     }
 }
 
@@ -610,12 +653,12 @@ impl ContigTableBuilder {
             }
         }
 
-        ContigTable {
-            ref_len_bits: self.encoding.ref_len_bits,
-            num_ref_bits: self.encoding.num_ref_bits,
+        ContigTable::from_parts(
+            self.encoding.ref_len_bits,
+            self.encoding.num_ref_bits,
             ctg_offsets,
             ctg_entries,
-        }
+        )
     }
 }
 
@@ -700,12 +743,12 @@ impl ContigTableDirectBuilder {
 
     /// Finalize into a `ContigTable`, consuming the builder.
     pub fn build(self) -> ContigTable {
-        ContigTable {
-            ref_len_bits: self.encoding.ref_len_bits,
-            num_ref_bits: self.encoding.num_ref_bits,
-            ctg_offsets: self.ctg_offsets,
-            ctg_entries: self.ctg_entries,
-        }
+        ContigTable::from_parts(
+            self.encoding.ref_len_bits,
+            self.encoding.num_ref_bits,
+            self.ctg_offsets,
+            self.ctg_entries,
+        )
     }
 }
 
@@ -1099,6 +1142,44 @@ mod tests {
                 assert_eq!(enc.transcript_id(a), enc.transcript_id(b));
                 assert_eq!(enc.pos(a), enc.pos(b));
                 assert_eq!(enc.orientation(a), enc.orientation(b));
+            }
+        }
+
+        // The in-memory bounds go back to the same Elias-Fano bytes.
+        let mut buf2 = Vec::new();
+        table2.save(&mut buf2).unwrap();
+        assert_eq!(buf, buf2);
+    }
+
+    /// The fixed-width bounds give every contig the span the Elias-Fano
+    /// offsets give, across widths (including a straddling word boundary).
+    #[test]
+    fn test_dense_bounds_match_elias_fano() {
+        let mut st = 0x2545_f491_4f6c_dd1du64;
+        for n in [0usize, 1, 2, 63, 64, 65, 1000] {
+            let mut offsets = vec![0usize];
+            for _ in 0..n {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                let step = (st % 9) as usize * if st % 5 == 0 { 1000 } else { 1 };
+                offsets.push(offsets.last().unwrap() + step);
+            }
+            let u = offsets.last().unwrap() + 1;
+            let mut b = EliasFanoBuilder::new(offsets.len(), u);
+            for &o in &offsets {
+                b.push(o);
+            }
+            let ef = b.build_with_seq();
+            let total = *offsets.last().unwrap();
+            let table = ContigTable::from_parts(4, 4, ef, BitFieldVec::new(9, total));
+            assert_eq!(table.num_contigs(), n);
+            for c in 0..n {
+                assert_eq!(table.contig_entries(c as u64).len(), offsets[c + 1] - offsets[c]);
+                match table.contig_entries(c as u64) {
+                    ContigSpan::Packed { start, .. } => assert_eq!(start, offsets[c]),
+                    _ => unreachable!(),
+                }
             }
         }
     }
