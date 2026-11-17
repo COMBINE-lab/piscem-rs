@@ -177,6 +177,9 @@ fn get_overlap(
     let pref_length = prefix_read.len();
 
     let mut overlap_length: usize = 0;
+    // Bases from where `prefix_read` starts in `suffix_read` to the end of
+    // `suffix_read`.
+    let mut merged_span: usize = 0;
     let mut is_merged = false;
 
     // Progressive seed search
@@ -234,7 +237,8 @@ fn get_overlap(
 
                 if can_merge {
                     is_merged = true;
-                    overlap_length = (suff_length - seed_start + seed_offset).min(pref_length);
+                    merged_span = suff_length - seed_start + seed_offset;
+                    overlap_length = merged_span.min(pref_length);
                     break;
                 }
             }
@@ -250,7 +254,19 @@ fn get_overlap(
     // Build merged fragment
     if overlap_length > 0 {
         if dovetail {
-            mate_ov.frag = prefix_read[..overlap_length].to_vec();
+            // The fragment runs from read1's 5' end to the longer read's 5'
+            // end (the end of `suffix_read`); bases either read has past the
+            // other's 5' end are adapter read-through. When read1 reads through
+            // (`merged_span <= pref_length`) that is read1 cut to the overlap;
+            // when read1 lies inside the longer read (`merged_span >
+            // pref_length`) it is read1 followed by the rest of the longer
+            // read, not read1 alone.
+            let mut frag = prefix_read[..overlap_length].to_vec();
+            if merged_span > pref_length {
+                let longer_start = suff_length - merged_span;
+                frag.extend_from_slice(&suffix_read[longer_start + pref_length..]);
+            }
+            mate_ov.frag = frag;
         } else {
             let mut frag = suffix_read.to_vec();
             if overlap_length < pref_length {

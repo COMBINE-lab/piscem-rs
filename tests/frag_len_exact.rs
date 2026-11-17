@@ -437,3 +437,45 @@ fn overhang_clip_uses_the_forward_mate() {
         assert_eq!(atac_rad(&hits, false), [(0, 380)], "{order} {hits:?}");
     }
 }
+
+/// scATAC mates merged by `find_overlap` when the shorter read lies inside the
+/// longer one. The merged fragment runs from the forward mate's 5' end to the
+/// reverse mate's 5' end and is not cut to the shorter read: a 100-base read
+/// inside a 130-base read over [200, 330) is [200, 330), and with the longer
+/// read running 10 bases past the shorter read's 5' end (a 140-base read over
+/// [190, 330)) it is still [200, 330). Both strands, both read orders.
+#[test]
+fn contained_overlap_merge_keeps_the_whole_fragment() {
+    let fx = fixture();
+    let t = &fx.txp;
+    let cases = [
+        // (shorter forward, longer reverse): fragment on the forward strand
+        ("short fw", t[200..300].to_vec(), revcomp(&t[200..330])),
+        (
+            "short fw, long reads through",
+            t[200..300].to_vec(),
+            revcomp(&t[190..330]),
+        ),
+        // (shorter reverse, longer forward): fragment on the reverse strand
+        ("short rc", revcomp(&t[230..330]), t[200..330].to_vec()),
+        ("short rc, long reads through", revcomp(&t[230..330]), {
+            let mut v = t[200..330].to_vec();
+            v.extend(adapter(10, 6));
+            v
+        }),
+    ];
+    for (name, short, long) in cases {
+        for (order, r1, r2) in [("short/long", &short, &long), ("long/short", &long, &short)] {
+            let (ov, hits) = map_atac_overlap(&fx.index, r1, r2);
+            assert_ne!(ov, OverlapType::NoOverlap, "{name} {order}");
+            assert_eq!(hits.len(), 1, "{name} {order} {hits:?}");
+            assert_eq!(hits[0].fragment_length, 130, "{name} {order} {hits:?}");
+            assert_eq!(
+                atac_rad(&hits, false),
+                [(200, 130)],
+                "{name} {order} {hits:?}"
+            );
+            assert_eq!(atac_rad(&hits, true), [(204, 121)], "{name} {order}");
+        }
+    }
+}

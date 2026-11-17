@@ -29,22 +29,33 @@ pre-1.0, a minor bump may carry breaking changes.
   2M PBMC read pairs (chr1+chr2), 34,138 of 371,521 pair records (281,857
   alignments) move.
 - **A pair's RAD start is its forward mate's position**
-  (`SimpleHit::pair_start`), not `min(pos, mate_pos)`. Mates face each
-  other, so the fragment is `[forward mate's 5' end, reverse mate's 5' end)`
-  and `frag_len` already measured exactly that; bases a read has past the
-  other read's 5' end are adapter read-through. When the reverse mate's
-  projected start fell before the forward mate's (dovetailed pairs, or a
-  reverse mate reading through past the forward mate's 5' end), the bulk and
-  scATAC writers placed the fragment that many bases too far left, and the
-  clip at the transcript start shortened it by the same wrong amount. The
-  scATAC overlap path now sets `mate_pos` to the longer read's start and
-  `mate_is_fw` to the opposite of `is_fw`, so its start is the merged
-  fragment's start as before. On map-bulk (-t 1), 342 of 171,770 pair records (sub200k GEUVADIS) and
-  4,389 of 474,498 (m500k muscle) move: 2,632 and 83,779 alignments start
-  1–31 bases further right, 9 and 305 of them also get longer (they were
-  clipped at 0 from the wrong start); FLD means move by under 0.001. On 2M
-  scATAC read triplets, 1,288 of 371,521 pair records (2,286 alignments)
-  start 1–19 bases further right.
+  (`SimpleHit::pair_start`), not `min(pos, mate_pos)`. Mates face each other,
+  so the fragment is `[forward mate's 5' end, reverse mate's 5' end)` and
+  `frag_len` already measured exactly that; bases a read has past the other
+  read's 5' end are adapter read-through. When the reverse mate's projected
+  start fell before the forward mate's (dovetailed pairs, or a reverse mate
+  reading through past the forward mate's 5' end), the bulk and scATAC writers
+  placed the fragment that many bases too far left, and the clip at the
+  transcript start shortened it by the same wrong amount. The scATAC overlap
+  path now sets `mate_pos` to the longer read's start and `mate_is_fw` to the
+  opposite of `is_fw`, so its start is the merged fragment's start as before.
+  On map-bulk (-t 1), 342 of 171,770 pair records (sub200k GEUVADIS) and 4,389
+  of 474,498 (m500k muscle) move: 2,632 and 83,779 alignments start 1–31 bases
+  further right, 9 and 305 of them also get longer (they were clipped at 0
+  from the wrong start); FLD means move by under 0.001. On 2M scATAC read
+  triplets, 1,288 of 371,521 pair records (2,286 alignments) start 1–19 bases
+  further right.
+- **scATAC: a mate merge where the shorter read lies inside the longer one
+  kept only the shorter read.** `find_overlap` tries the read-through
+  (dovetail) merge first and cut the merged fragment to the shorter read. That
+  is right when the shorter read runs past the longer read's 5' end (adapter
+  read-through), but when the shorter read lies inside the longer one the
+  fragment runs on to the longer read's 5' end. The merged fragment is now the
+  shorter read followed by the rest of the longer read, so it spans the two
+  reads' 5' ends. On 2M 10x PBMC read triplets (R1 50, R3 49 bases), 2,939
+  merged pair records change: the 49-base read inside the 50-base one now
+  gives a 50-base fragment, not 49 (Tn5-shifted length 41, was 40); 5 of them
+  no longer map.
 
 ## [0.12.1] — 2026-10-30
 
