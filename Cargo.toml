@@ -202,3 +202,9 @@ required-features = ["rapidgzip"]
 [[test]]
 name = "decode_parallelism"
 required-features = ["rapidgzip"]
+
+[patch.crates-io]
+# Keep direct, tiny-dict and Python dependencies on the same reviewed SSHash
+# commit until these merged changes have a crate release. Downstream workspace
+# builds must apply this patch at their own workspace root as well.
+sshash-lib = { git = "https://github.com/COMBINE-lab/sshash-rs", rev = "186f9f4ed36995e34bc24e2bbf9ea6460ef68e08" }
