@@ -17,8 +17,11 @@ const REFINFO_MAGIC: &[u8; 8] = b"PRFINF01";
 /// describe reference `i`).
 #[derive(Debug, Clone)]
 pub struct RefInfo {
-    /// Reference sequence names, one per reference.
-    ref_names: Vec<String>,
+    /// Every reference name, back to back: one allocation instead of one
+    /// `String` (24 bytes plus a heap block) per reference.
+    names: String,
+    /// End of each name in `names`; name `i` starts where name `i - 1` ends.
+    name_ends: Vec<usize>,
     /// Reference sequence lengths (in bases), one per reference.
     ref_lens: Vec<u64>,
 }
@@ -36,22 +39,33 @@ impl RefInfo {
             names.len(),
             lens.len()
         );
-        Self {
-            ref_names: names,
+        let mut info = Self {
+            names: String::with_capacity(names.iter().map(String::len).sum()),
+            name_ends: Vec::with_capacity(names.len()),
             ref_lens: lens,
+        };
+        for name in &names {
+            info.push_name(name);
         }
+        info
+    }
+
+    fn push_name(&mut self, name: &str) {
+        self.names.push_str(name);
+        self.name_ends.push(self.names.len());
     }
 
     /// Number of reference sequences.
     #[inline]
     pub fn num_refs(&self) -> usize {
-        self.ref_names.len()
+        self.name_ends.len()
     }
 
     /// Get the name of reference `i`.
     #[inline]
     pub fn name(&self, i: usize) -> &str {
-        &self.ref_names[i]
+        let start = if i == 0 { 0 } else { self.name_ends[i - 1] };
+        &self.names[start..self.name_ends[i]]
     }
 
     /// Get the length of reference `i`.
@@ -60,10 +74,9 @@ impl RefInfo {
         self.ref_lens[i]
     }
 
-    /// Slice of all reference names.
-    #[inline]
-    pub fn names(&self) -> &[String] {
-        &self.ref_names
+    /// All reference names, in reference-ID order.
+    pub fn names(&self) -> impl ExactSizeIterator<Item = &str> + '_ {
+        (0..self.num_refs()).map(|i| self.name(i))
     }
 
     /// Slice of all reference lengths.
@@ -100,11 +113,11 @@ impl RefInfo {
         let mut w = BufWriter::new(writer);
         w.write_all(REFINFO_MAGIC)?;
 
-        let n = self.ref_names.len() as u64;
+        let n = self.num_refs() as u64;
         w.write_all(&n.to_le_bytes())?;
 
         // Write names: length-prefixed UTF-8 strings
-        for name in &self.ref_names {
+        for name in self.names() {
             let name_bytes = name.as_bytes();
             let name_len = name_bytes.len() as u32;
             w.write_all(&name_len.to_le_bytes())?;
@@ -138,31 +151,33 @@ impl RefInfo {
         let num_refs = read_u64_le(&mut r).context("failed to read num_refs")? as usize;
 
         // Read names
-        let mut ref_names = Vec::with_capacity(num_refs);
+        let mut info = Self {
+            names: String::new(),
+            name_ends: Vec::with_capacity(num_refs),
+            ref_lens: Vec::with_capacity(num_refs),
+        };
+        let mut name_buf = Vec::new();
         for i in 0..num_refs {
             let name_len = read_u32_le(&mut r)
                 .with_context(|| format!("failed to read name length for ref {i}"))?
                 as usize;
-            let mut name_buf = vec![0u8; name_len];
+            name_buf.resize(name_len, 0);
             r.read_exact(&mut name_buf)
                 .with_context(|| format!("failed to read name bytes for ref {i}"))?;
-            let name = String::from_utf8(name_buf)
+            let name = std::str::from_utf8(&name_buf)
                 .with_context(|| format!("invalid UTF-8 in name for ref {i}"))?;
-            ref_names.push(name);
+            info.push_name(name);
         }
 
         // Read lengths
-        let mut ref_lens = Vec::with_capacity(num_refs);
         for i in 0..num_refs {
             let l = read_u64_le(&mut r)
                 .with_context(|| format!("failed to read length for ref {i}"))?;
-            ref_lens.push(l);
+            info.ref_lens.push(l);
         }
+        info.names.shrink_to_fit();
 
-        Ok(Self {
-            ref_names,
-            ref_lens,
-        })
+        Ok(info)
     }
 }
 
@@ -265,5 +280,19 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("invalid refinfo magic"));
+    }
+
+    #[test]
+    fn test_names_empty_and_multibyte() {
+        let names = ["", "é-tx", "tx3", ""];
+        let ri = RefInfo::new(names.iter().map(|s| s.to_string()).collect(), vec![1, 2, 3, 4]);
+        assert!(ri.names().eq(names));
+        let mut buf = Vec::new();
+        ri.save(&mut buf).unwrap();
+        let back = RefInfo::load(&mut &buf[..]).unwrap();
+        assert!(back.names().eq(names));
+        assert_eq!(back.names().len(), 4);
+        assert_eq!(back.name(1), "é-tx");
+        assert_eq!(back.lens(), &[1, 2, 3, 4]);
     }
 }
