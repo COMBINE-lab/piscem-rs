@@ -72,6 +72,8 @@ where
     /// engine doesn't try to extend from a previous sequence's unitig.
     #[inline]
     pub fn reset(&mut self) {
+        #[cfg(feature = "query-trace")]
+        trace::reset();
         self.engine.reset();
         self.cache_end = false;
         self.prev_query_pos = i32::MIN;
@@ -116,6 +118,8 @@ where
                 self.cache_end = false;
                 // Reset engine state since we bypassed it
                 self.engine.reset();
+                #[cfg(feature = "query-trace")]
+                trace::query(read_pos, kmer_bytes, &result);
                 return result;
             }
         }
@@ -125,6 +129,8 @@ where
 
         // Full lookup via streaming query engine
         let result = self.engine.lookup(kmer_bytes);
+        #[cfg(feature = "query-trace")]
+        trace::query(read_pos, kmer_bytes, &result);
 
         // If the lookup succeeded and we were at a unitig boundary, cache it
         if was_cache_end
@@ -266,5 +272,56 @@ where
         } else {
             false
         }
+    }
+}
+
+/// Untimed capture of actual mapper requests, including nonconsecutive/backward
+/// jumps. Enable only for trace generation, never performance measurements.
+/// Each worker writes PREFIX.N.trace; R delimits resets and Q stores position,
+/// ASCII window and all eight lookup fields. Trace replay must retain order and
+/// reset on position discontinuities just as lookup_at does. The bits-oriented
+/// lookup path is not captured; this experiment uses --dict sshash and -t 1.
+#[cfg(feature = "query-trace")]
+mod trace {
+    use sshash_lib::LookupResult;
+    use std::{
+        cell::RefCell,
+        fs::File,
+        io::{BufWriter, Write},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static OUT:RefCell<Option<BufWriter<File>>>=RefCell::new(std::env::var("PISCEM_QUERY_TRACE").ok().map(|p| {
+            let id=NEXT.fetch_add(1,Ordering::Relaxed);
+            BufWriter::new(File::create(format!("{p}.{id}.trace")).expect("trace file"))
+        }));
+    }
+    pub(super) fn reset() {
+        OUT.with(|o| {
+            if let Some(f) = o.borrow_mut().as_mut() {
+                writeln!(f, "R").unwrap();
+            }
+        });
+    }
+    pub(super) fn query(pos: i32, bytes: &[u8], r: &LookupResult) {
+        OUT.with(|o| {
+            if let Some(f) = o.borrow_mut().as_mut() {
+                writeln!(
+                    f,
+                    "Q,{pos},{},{},{},{},{},{},{},{},{}",
+                    std::str::from_utf8(bytes).unwrap(),
+                    r.kmer_id,
+                    r.kmer_id_in_string,
+                    r.kmer_offset,
+                    r.kmer_orientation,
+                    r.string_id,
+                    r.string_begin,
+                    r.string_end,
+                    u8::from(r.minimizer_found)
+                )
+                .unwrap();
+            }
+        });
     }
 }
