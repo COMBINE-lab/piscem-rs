@@ -54,6 +54,11 @@ exclude = [
 [features]
 default = ["mimalloc"]
 parity-test = ["dep:libradicl"]
+# Research build: patch sshash-lib to the local checkout and explicitly enable
+# BOTH experimental-bucket-fingerprints and sshash-lib/experimental-query.
+# Do not forward the dependency feature here until it is published: Cargo also
+# resolves inactive feature edges, which would break ordinary registry builds.
+experimental-bucket-fingerprints = []
 # Parallel gzip decoding via the pure-Rust COMBINE-lab/rapidgzip-rust.
 # No C++ toolchain required. See RESULTS.md.
 rapidgzip = ["dep:rapidgzip-core", "rapidgzip-core/busy-time-accounting"]

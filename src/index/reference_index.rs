@@ -211,6 +211,19 @@ impl ReferenceIndex<Dictionary, ContigTable> {
                 format!("failed to load dictionary {}: {e}", dict_path.display()),
             )
         })?;
+        // Research-only load policy: eagerly derive the optional table before
+        // sharing the dictionary. All SSHash lookups use it thereafter; the
+        // on-disk index and mapping algorithms are unchanged. Requires the
+        // matching sshash-lib feature and local patch documented in
+        // notes/experimental-bucket-fingerprints.md. Use --dict sshash when
+        // measuring: auto selection may later replace this dictionary with Tiny.
+        #[cfg(feature = "experimental-bucket-fingerprints")]
+        let dict = {
+            let mut dict = dict;
+            let bytes = dict.enable_bucket_fingerprints();
+            info!("  Experimental minimizer fingerprints: {} bytes", bytes);
+            dict
+        };
         info!("  k={}, {} strings", dict.k(), dict.num_strings());
 
         // 2. Load contig table
