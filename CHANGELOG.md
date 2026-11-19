@@ -3,6 +3,21 @@
 Notable changes to `piscem-rs`. Versions follow [Semantic Versioning](https://semver.org);
 pre-1.0, a minor bump may carry breaking changes.
 
+## [Unreleased]
+
+### Changed
+
+- **Breaking API change, targeted for 0.13.0:** `RefInfo::names()` returns
+  an `ExactSizeIterator<Item = &str>` instead of `&[String]`. Reference names
+  share one string arena with an end offset per name, reducing retained
+  metadata memory. Use the iterator directly where callers previously used
+  `names().iter()`; `name(i)` still provides indexed access. The index file
+  format is unchanged.
+- `RefInfo::load_file` reserves name storage from the file size before
+  reading, avoiding temporary arena growth and shrinking allocations. Both
+  SSHash and Tiny index loaders use it. `RefInfo::load` remains available for
+  generic readers, where the total size need not be known.
+
 ## [0.12.4] — 2026-11-17
 
 ### Fixed
