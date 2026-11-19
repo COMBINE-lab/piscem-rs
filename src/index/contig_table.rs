@@ -14,13 +14,16 @@
 //!
 //! The posting lists are stored in a compact bit-packed vector (`BitFieldVec`)
 //! with boundaries encoded as a monotone Elias-Fano sequence (sux-rs `EfSeq`)
-//! on disk, and as a fixed-width vector in memory.
+//! on disk. In memory, a fixed-width vector is used when it fits a bounded
+//! memory budget; otherwise the Elias-Fano sequence is retained.
 //!
 //! This corresponds to the C++ `basic_contig_table` class.
 
 use anyhow::{Context, Result, bail};
 use epserde::deser::Deserialize;
 use epserde::ser::Serialize;
+use mem_dbg::{MemSize, SizeFlags};
+use std::borrow::Cow;
 use std::io::{Read, Write};
 use sux::bits::bit_field_vec::BitFieldVec;
 use sux::dict::elias_fano::{EfSeq, EliasFanoBuilder};
@@ -310,15 +313,61 @@ pub struct ContigTable {
     num_ref_bits: u64,
     /// Bit-packed entry vector. Each entry is `ref_len_bits + num_ref_bits + 1` bits.
     ctg_entries: BitFieldVec,
-    /// Cumulative offsets into `ctg_entries`, `num_contigs + 1` of them, at
-    /// the fixed width of the largest: the entries of contig `i` span
-    /// `[bounds[i], bounds[i+1])`. On disk they are an Elias-Fano sequence;
-    /// in memory each bound takes `max(1, bits(num_entries))` bits. Elias-Fano
-    /// space depends on the entries-per-contig ratio and select metadata.
-    /// Fixed-width bounds use more memory but replace an Elias-Fano select
-    /// and next-value step with reads from adjacent packed words. Those words
-    /// may span cache lines; neither representation has a fixed miss count.
-    bounds: BitFieldVec,
+    /// Cumulative offsets: contig `i` spans `[bounds[i], bounds[i+1])`.
+    /// Choose the representation once at construction/load time. Both share
+    /// the same Elias-Fano file representation.
+    bounds: ContigBounds,
+}
+
+#[derive(MemSize)]
+enum ContigBounds {
+    Dense(BitFieldVec),
+    EliasFano(EfSeq),
+}
+
+impl ContigBounds {
+    fn len(&self) -> usize {
+        match self {
+            Self::Dense(v) => v.len(),
+            Self::EliasFano(v) => v.len(),
+        }
+    }
+}
+
+// Bound the new allocation as well as retained overhead: the EF input is
+// still live during conversion. The 5% limit is relative to the original
+// contig-table heap (occurrence entries plus EF offsets), not to EF alone.
+const MAX_DENSE_BOUNDS_BYTES: usize = 64 * 1024 * 1024;
+const DENSE_OVERHEAD_DENOMINATOR: usize = 20;
+
+fn heap_bytes<T: MemSize>(value: &T) -> usize {
+    value.mem_size(SizeFlags::CAPACITY) - std::mem::size_of::<T>()
+}
+
+fn dense_bounds_fit_budget(dense_bytes: usize, ef_bytes: usize, entries_bytes: usize) -> bool {
+    let extra = dense_bytes.saturating_sub(ef_bytes) as u128;
+    dense_bytes <= MAX_DENSE_BOUNDS_BYTES
+        && extra * DENSE_OVERHEAD_DENOMINATOR as u128
+            <= ef_bytes as u128 + entries_bytes as u128
+}
+
+fn choose_bounds(offsets: EfSeq, entries: &BitFieldVec) -> ContigBounds {
+    let max = offsets.iter().last().unwrap_or(0);
+    let width = (usize::BITS - max.leading_zeros()).max(1) as usize;
+    // Match BitFieldVec::new's word rounding and minimum one-word buffer.
+    // Check before allocating or walking the offsets.
+    let dense_bytes = offsets.len().checked_mul(width).and_then(|bits| {
+        bits.div_ceil(usize::BITS as usize)
+            .max(1)
+            .checked_mul(std::mem::size_of::<usize>())
+    });
+    let ef_bytes = heap_bytes(&offsets);
+    let entries_bytes = heap_bytes(entries);
+    if dense_bytes.is_some_and(|bytes| dense_bounds_fit_budget(bytes, ef_bytes, entries_bytes)) {
+        ContigBounds::Dense(dense_bounds(&offsets))
+    } else {
+        ContigBounds::EliasFano(offsets)
+    }
 }
 
 /// `offsets` as a fixed-width vector, as narrow as its last value allows.
@@ -340,23 +389,28 @@ impl ContigTable {
         ctg_offsets: EfSeq,
         ctg_entries: BitFieldVec,
     ) -> Self {
+        let bounds = choose_bounds(ctg_offsets, &ctg_entries);
         Self {
             ref_len_bits,
             num_ref_bits,
             ctg_entries,
-            bounds: dense_bounds(&ctg_offsets),
+            bounds,
         }
     }
 
     /// `bounds` back as the Elias-Fano sequence the file format stores.
-    fn offsets_ef(&self) -> EfSeq {
-        let n = self.bounds.len();
-        let u = if n == 0 { 1 } else { self.bounds.index_value(n - 1) + 1 };
+    fn offsets_ef(&self) -> Cow<'_, EfSeq> {
+        let bounds = match &self.bounds {
+            ContigBounds::EliasFano(offsets) => return Cow::Borrowed(offsets),
+            ContigBounds::Dense(bounds) => bounds,
+        };
+        let n = bounds.len();
+        let u = if n == 0 { 1 } else { bounds.index_value(n - 1) + 1 };
         let mut ef_builder = EliasFanoBuilder::new(n, u);
         for i in 0..n {
-            ef_builder.push(self.bounds.index_value(i));
+            ef_builder.push(bounds.index_value(i));
         }
-        ef_builder.build_with_seq()
+        Cow::Owned(ef_builder.build_with_seq())
     }
 
     /// Number of contigs (unitigs) in the table.
@@ -391,11 +445,21 @@ impl ContigTable {
     /// Use `EntryEncoding` to decode each entry.
     #[inline]
     pub fn contig_entries(&self, contig_id: u64) -> ContigSpan<'_> {
-        let words = self.bounds.as_slice();
-        let width = self.bounds.bit_width();
+        let bounds = match &self.bounds {
+            ContigBounds::Dense(bounds) => bounds,
+            ContigBounds::EliasFano(offsets) => {
+                // Retain the baseline's one-select, adjacent-value path.
+                let mut it = offsets.iter_from(contig_id as usize);
+                let start = it.next().unwrap();
+                let end = it.next().unwrap();
+                return ContigSpan::packed(&self.ctg_entries, start, end - start);
+            }
+        };
+        let words = bounds.as_slice();
+        let width = bounds.bit_width();
         let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
         let bit = contig_id as usize * width;
-        assert!(contig_id as usize + 1 < self.bounds.len(), "contig id out of range");
+        assert!(contig_id as usize + 1 < bounds.len(), "contig id out of range");
         let start = packed_entry_at(words, bit, mask) as usize;
         let end = packed_entry_at(words, bit + width, mask) as usize;
         ContigSpan::packed(&self.ctg_entries, start, end - start)
@@ -403,10 +467,7 @@ impl ContigTable {
 
     /// Approximate size in bytes of the in-memory representation.
     pub fn size_bytes(&self) -> usize {
-        let entries_bits = self.ctg_entries.len() * self.ctg_entries.bit_width();
-        let entries_bytes = entries_bits.div_ceil(8);
-        let bounds_bytes = (self.bounds.len() * self.bounds.bit_width()).div_ceil(8);
-        entries_bytes + bounds_bytes + std::mem::size_of::<Self>()
+        heap_bytes(&self.ctg_entries) + heap_bytes(&self.bounds) + std::mem::size_of::<Self>()
     }
 
     // -----------------------------------------------------------------------
@@ -429,6 +490,7 @@ impl ContigTable {
         writer.write_all(&self.num_ref_bits.to_le_bytes())?;
         unsafe {
             self.offsets_ef()
+                .as_ref()
                 .serialize(writer)
                 .map_err(std::io::Error::other)
                 .context("failed to serialize contig offsets")?;
@@ -1182,6 +1244,45 @@ mod tests {
                     _ => unreachable!(),
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_dense_memory_budget_limits() {
+        // Exactly 5% extra retained heap is allowed; anything above is not.
+        assert!(dense_bounds_fit_budget(10, 5, 95));
+        assert!(!dense_bounds_fit_budget(11, 5, 95));
+        // The absolute limit also bounds the allocation during conversion.
+        assert!(dense_bounds_fit_budget(MAX_DENSE_BOUNDS_BYTES, MAX_DENSE_BOUNDS_BYTES, 0));
+        assert!(!dense_bounds_fit_budget(MAX_DENSE_BOUNDS_BYTES + 1, MAX_DENSE_BOUNDS_BYTES + 1, 0));
+        assert!(dense_bounds_fit_budget(1, 2, 0));
+        assert!(!dense_bounds_fit_budget(usize::MAX, usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn test_budget_selects_and_roundtrips_both_representations() {
+        for (step, want_dense) in [(1, false), (100, true)] {
+            let n = 10_000;
+            let total = n * step;
+            let mut builder = EliasFanoBuilder::new(n + 1, total + 1);
+            for i in 0..=n {
+                builder.push(i * step);
+            }
+            let table = ContigTable::from_parts(1, 1, builder.build_with_seq(), BitFieldVec::new(3, total));
+            assert_eq!(matches!(table.bounds, ContigBounds::Dense(_)), want_dense);
+            let mut bytes = Vec::new();
+            table.save(&mut bytes).unwrap();
+            let loaded = ContigTable::load(&mut &bytes[..]).unwrap();
+            assert_eq!(matches!(loaded.bounds, ContigBounds::Dense(_)), want_dense);
+            for i in 0..n {
+                let ContigSpan::Packed { start, len, .. } = loaded.contig_entries(i as u64) else {
+                    panic!("expected a packed span");
+                };
+                assert_eq!((start, len), (i * step, step));
+            }
+            let mut saved = Vec::new();
+            loaded.save(&mut saved).unwrap();
+            assert_eq!(saved, bytes);
         }
     }
 
