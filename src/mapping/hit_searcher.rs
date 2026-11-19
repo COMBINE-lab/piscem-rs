@@ -1219,7 +1219,11 @@ mod tests {
                 };
                 let refseq: Vec<u8> = (0..len).map(|_| b"ACGT"[(rng() % 4) as usize]).collect();
                 let direction = if case % 2 == 0 { 1 } else { -1 };
-                let mut read = if direction > 0 { refseq.clone() } else { revcomp(&refseq) };
+                let mut read = if direction > 0 {
+                    refseq.clone()
+                } else {
+                    revcomp(&refseq)
+                };
                 // Mutate past the first window, which must match.
                 for _ in 0..(rng() % 4) {
                     if len > k {
@@ -1242,7 +1246,11 @@ mod tests {
                 assert_eq!(it.pos(), 0);
                 let max_steps = (len - k) as i32;
                 let expected = |fw: u64| {
-                    if direction > 0 { fw } else { ReadKmerIter::reverse_complement_word(fw, k) }
+                    if direction > 0 {
+                        fw
+                    } else {
+                        ReadKmerIter::reverse_complement_word(fw, k)
+                    }
                 };
                 let mut want = 0;
                 while want < max_steps {

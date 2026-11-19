@@ -205,7 +205,11 @@ impl<'a> ContigSpan<'a> {
                     words: entries.as_slice(),
                     bit: start * width,
                     width,
-                    mask: if width >= 64 { u64::MAX } else { (1u64 << width) - 1 },
+                    mask: if width >= 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << width) - 1
+                    },
                     remaining: len,
                 }
             }
@@ -1189,7 +1193,11 @@ mod packed_iter_tests {
         for width in [1usize, 3, 7, 13, 31, 32, 33, 37, 41, 63] {
             let n = 517;
             let mut v = BitFieldVec::new(width, n);
-            let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+            let mask = if width >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << width) - 1
+            };
             for i in 0..n {
                 x ^= x << 13;
                 x ^= x >> 7;
@@ -1203,7 +1211,9 @@ mod packed_iter_tests {
                     }
                     let span = ContigSpan::packed(&v, start, len);
                     let got: Vec<u64> = span.iter().collect();
-                    let want: Vec<u64> = (start..start + len).map(|i| v.index_value(i) as u64).collect();
+                    let want: Vec<u64> = (start..start + len)
+                        .map(|i| v.index_value(i) as u64)
+                        .collect();
                     assert_eq!(got, want, "width {width} start {start} len {len}");
                 }
             }
