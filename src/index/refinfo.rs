@@ -5,7 +5,9 @@
 //! stored in the `.refinfo` file.
 
 use anyhow::{Context, Result, bail};
+use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::Path;
 
 /// Magic bytes for the piscem-rs refinfo file format.
 const REFINFO_MAGIC: &[u8; 8] = b"PRFINF01";
@@ -135,6 +137,24 @@ impl RefInfo {
 
     /// Deserialize from a reader.
     pub fn load<R: Read>(reader: &mut R) -> Result<Self> {
+        Self::load_with_file_size(reader, None)
+    }
+
+    /// Deserialize from a file, reserving space for the names before reading them.
+    ///
+    /// The file size, less the header, name-length prefixes, and reference
+    /// lengths, gives the total name bytes without a preliminary scan.
+    pub fn load_file(path: impl AsRef<Path>) -> Result<Self> {
+        let mut file = File::open(path.as_ref())
+            .with_context(|| format!("failed to open {}", path.as_ref().display()))?;
+        let metadata = file
+            .metadata()
+            .context("failed to read refinfo file metadata")?;
+        let file_size = metadata.is_file().then_some(metadata.len());
+        Self::load_with_file_size(&mut file, file_size)
+    }
+
+    fn load_with_file_size<R: Read>(reader: &mut R, file_size: Option<u64>) -> Result<Self> {
         let mut r = BufReader::new(reader);
 
         let mut magic = [0u8; 8];
@@ -148,11 +168,31 @@ impl RefInfo {
             );
         }
 
-        let num_refs = read_u64_le(&mut r).context("failed to read num_refs")? as usize;
+        let num_refs = read_u64_le(&mut r).context("failed to read num_refs")?;
+        let mut remaining_name_bytes = if let Some(file_size) = file_size {
+            let fixed_bytes = num_refs
+                .checked_mul(12)
+                .and_then(|n| n.checked_add(16))
+                .context("refinfo fixed-size fields overflow")?;
+            let name_bytes = file_size
+                .checked_sub(fixed_bytes)
+                .context("refinfo file is too short for its reference count")?;
+            Some(usize::try_from(name_bytes).context("refinfo names exceed addressable memory")?)
+        } else {
+            None
+        };
+        let num_refs =
+            usize::try_from(num_refs).context("refinfo reference count exceeds usize")?;
+        let mut names = String::new();
+        if let Some(name_bytes) = remaining_name_bytes {
+            names
+                .try_reserve_exact(name_bytes)
+                .context("failed to reserve refinfo name storage")?;
+        }
 
         // Read names
         let mut info = Self {
-            names: String::new(),
+            names,
             name_ends: Vec::with_capacity(num_refs),
             ref_lens: Vec::with_capacity(num_refs),
         };
@@ -161,6 +201,11 @@ impl RefInfo {
             let name_len = read_u32_le(&mut r)
                 .with_context(|| format!("failed to read name length for ref {i}"))?
                 as usize;
+            if let Some(remaining) = &mut remaining_name_bytes {
+                *remaining = remaining.checked_sub(name_len).with_context(|| {
+                    format!("name length for ref {i} exceeds refinfo file size")
+                })?;
+            }
             name_buf.resize(name_len, 0);
             r.read_exact(&mut name_buf)
                 .with_context(|| format!("failed to read name bytes for ref {i}"))?;
@@ -285,7 +330,10 @@ mod tests {
     #[test]
     fn test_names_empty_and_multibyte() {
         let names = ["", "é-tx", "tx3", ""];
-        let ri = RefInfo::new(names.iter().map(|s| s.to_string()).collect(), vec![1, 2, 3, 4]);
+        let ri = RefInfo::new(
+            names.iter().map(|s| s.to_string()).collect(),
+            vec![1, 2, 3, 4],
+        );
         assert!(ri.names().eq(names));
         let mut buf = Vec::new();
         ri.save(&mut buf).unwrap();
@@ -294,5 +342,55 @@ mod tests {
         assert_eq!(back.names().len(), 4);
         assert_eq!(back.name(1), "é-tx");
         assert_eq!(back.lens(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_file_load_matches_generic_reader() {
+        for names in [
+            vec![],
+            vec!["".to_owned(), "é-tx".to_owned(), "long".repeat(500)],
+        ] {
+            let original = RefInfo::new(names.clone(), (0..names.len() as u64).collect());
+            let mut bytes = Vec::new();
+            original.save(&mut bytes).unwrap();
+            // The generic reader accepts trailing bytes; keep that behavior.
+            for trailer in [&b""[..], &b"trailing bytes"[..]] {
+                let mut file = tempfile::NamedTempFile::new().unwrap();
+                file.write_all(&bytes).unwrap();
+                file.write_all(trailer).unwrap();
+                let loaded = RefInfo::load_file(file.path()).unwrap();
+                let generic = RefInfo::load(&mut &bytes[..]).unwrap();
+                assert!(loaded.names().eq(generic.names()));
+                assert_eq!(loaded.lens(), generic.lens());
+                let mut saved = Vec::new();
+                loaded.save(&mut saved).unwrap();
+                assert_eq!(saved, bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn test_file_load_rejects_invalid_sizes_and_names() {
+        let mut valid = Vec::new();
+        RefInfo::new(vec!["x".to_owned()], vec![42])
+            .save(&mut valid)
+            .unwrap();
+        let mut overflow = valid.clone();
+        overflow[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        let mut bad_length = valid.clone();
+        bad_length[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut invalid_utf8 = valid.clone();
+        invalid_utf8[20] = 0xff;
+        for bytes in [
+            valid[..16].to_vec(),
+            valid[..valid.len() - 1].to_vec(),
+            overflow,
+            bad_length,
+            invalid_utf8,
+        ] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(&bytes).unwrap();
+            assert!(RefInfo::load_file(file.path()).is_err());
+        }
     }
 }

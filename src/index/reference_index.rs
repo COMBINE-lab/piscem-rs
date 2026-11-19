@@ -231,10 +231,7 @@ impl ReferenceIndex<Dictionary, ContigTable> {
         // 3. Load reference info
         let refinfo_path = paths.file(REFINFO_EXT);
         info!("Loading reference info from {}", refinfo_path.display());
-        let refinfo_file = std::fs::File::open(&refinfo_path)
-            .with_context(|| format!("failed to open {}", refinfo_path.display()))?;
-        let mut refinfo_reader = std::io::BufReader::new(refinfo_file);
-        let ref_info = RefInfo::load(&mut refinfo_reader)
+        let ref_info = RefInfo::load_file(&refinfo_path)
             .with_context(|| format!("failed to load {}", refinfo_path.display()))?;
         info!(
             "  {} references, max_ref_len={}",
@@ -531,10 +528,7 @@ impl ReferenceIndex<TinyDictionary, TinyContigTable> {
 
         // 3. Reference info
         let refinfo_path = paths.file(REFINFO_EXT);
-        let refinfo_file = std::fs::File::open(&refinfo_path)
-            .with_context(|| format!("failed to open {}", refinfo_path.display()))?;
-        let mut refinfo_reader = std::io::BufReader::new(refinfo_file);
-        let ref_info = RefInfo::load(&mut refinfo_reader)
+        let ref_info = RefInfo::load_file(&refinfo_path)
             .with_context(|| format!("failed to load {}", refinfo_path.display()))?;
         let sigs_path = paths.file(SIGS_EXT);
         let sigs = read_sigs_json(&sigs_path);
