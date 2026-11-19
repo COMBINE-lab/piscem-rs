@@ -205,7 +205,11 @@ impl<'a> ContigSpan<'a> {
                     words: entries.as_slice(),
                     bit: start * width,
                     width,
-                    mask: if width >= 64 { u64::MAX } else { (1u64 << width) - 1 },
+                    mask: if width >= 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << width) - 1
+                    },
                     remaining: len,
                 }
             }
@@ -427,6 +431,110 @@ impl ContigTable {
             ctg_offsets,
             ctg_entries,
         })
+    }
+}
+
+/// Maximum temporary allocation for dense bounds in the mapping commands.
+/// This is a resource allowance, not a performance crossover. Callers can
+/// increase it for larger indexes, or use zero to retain Elias-Fano.
+pub const DEFAULT_DENSE_BOUNDS_BYTES: usize = 64 * 1024 * 1024;
+
+/// A mapping-only table with fixed-width cumulative offsets. The original
+/// [`ContigTable`] remains the serialized/build representation and EF fallback.
+/// The two types let callers dispatch once before starting mapping workers.
+#[derive(Debug)]
+pub struct DenseContigTable {
+    ref_len_bits: u64,
+    num_ref_bits: u64,
+    bounds: BitFieldVec,
+    ctg_entries: BitFieldVec,
+}
+
+fn dense_allocation_bytes(len: usize, width: usize) -> Option<usize> {
+    len.checked_mul(width)?
+        .div_ceil(usize::BITS as usize)
+        .max(1)
+        .checked_mul(std::mem::size_of::<usize>())
+}
+
+impl ContigTable {
+    /// New allocation needed to convert the offsets, including word rounding.
+    /// The input EF stays alive during conversion; afterwards it is dropped.
+    /// Thus this bounds both the temporary increment and retained increase.
+    /// Returns `None` if the allocation size cannot be represented.
+    /// This check uses only metadata and takes constant time.
+    pub fn dense_bounds_bytes(&self) -> Option<usize> {
+        // The terminal boundary is the occurrence count for a valid table.
+        let max = self.ctg_offsets.iter().last().unwrap_or(0);
+        let width = (usize::BITS - max.leading_zeros()).max(1) as usize;
+        dense_allocation_bytes(self.ctg_offsets.len(), width)
+    }
+
+    /// Convert only when the new allocation fits `max_bytes`. Zero disables
+    /// conversion. On rejection returns the original object without walking
+    /// offsets, allocating, or changing its EF lookup implementation.
+    /// Match the result outside the mapping loop to retain static dispatch.
+    #[allow(clippy::result_large_err)] // Return the original table without allocating a box.
+    pub fn try_into_dense(self, max_bytes: usize) -> Result<DenseContigTable, Self> {
+        if !self.dense_bounds_bytes().is_some_and(|n| n <= max_bytes) {
+            return Err(self);
+        }
+        let max = self.ctg_offsets.iter().last().unwrap_or(0);
+        let width = (usize::BITS - max.leading_zeros()).max(1) as usize;
+        let mut bounds = BitFieldVec::new(width, self.ctg_offsets.len());
+        for (i, offset) in self.ctg_offsets.iter().enumerate() {
+            bounds.set_value(i, offset);
+        }
+        Ok(DenseContigTable {
+            ref_len_bits: self.ref_len_bits,
+            num_ref_bits: self.num_ref_bits,
+            bounds,
+            ctg_entries: self.ctg_entries,
+        })
+    }
+}
+
+impl ContigTableLike for DenseContigTable {
+    fn num_contigs(&self) -> usize {
+        self.bounds.len().saturating_sub(1)
+    }
+    fn num_entries(&self) -> usize {
+        self.ctg_entries.len()
+    }
+    fn encoding(&self) -> EntryEncoding {
+        EntryEncoding::new(self.ref_len_bits, self.num_ref_bits)
+    }
+    fn ref_len_bits(&self) -> u64 {
+        self.ref_len_bits
+    }
+    fn num_ref_bits(&self) -> u64 {
+        self.num_ref_bits
+    }
+
+    #[inline]
+    fn contig_entries(&self, contig_id: u64) -> ContigSpan<'_> {
+        assert!(
+            contig_id < self.num_contigs() as u64,
+            "contig id out of range"
+        );
+        let words = self.bounds.as_slice();
+        let width = self.bounds.bit_width();
+        let mask = if width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        };
+        let bit = contig_id as usize * width;
+        let start = packed_entry_at(words, bit, mask) as usize;
+        let end = packed_entry_at(words, bit + width, mask) as usize;
+        ContigSpan::packed(&self.ctg_entries, start, end - start)
+    }
+
+    fn size_bytes(&self) -> usize {
+        self.bounds.mem_size(SizeFlags::CAPACITY) - std::mem::size_of::<BitFieldVec>()
+            + self.ctg_entries.mem_size(SizeFlags::CAPACITY)
+            - std::mem::size_of::<BitFieldVec>()
+            + std::mem::size_of::<Self>()
     }
 }
 
@@ -1189,7 +1297,11 @@ mod packed_iter_tests {
         for width in [1usize, 3, 7, 13, 31, 32, 33, 37, 41, 63] {
             let n = 517;
             let mut v = BitFieldVec::new(width, n);
-            let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+            let mask = if width >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << width) - 1
+            };
             for i in 0..n {
                 x ^= x << 13;
                 x ^= x >> 7;
@@ -1203,10 +1315,86 @@ mod packed_iter_tests {
                     }
                     let span = ContigSpan::packed(&v, start, len);
                     let got: Vec<u64> = span.iter().collect();
-                    let want: Vec<u64> = (start..start + len).map(|i| v.index_value(i) as u64).collect();
+                    let want: Vec<u64> = (start..start + len)
+                        .map(|i| v.index_value(i) as u64)
+                        .collect();
                     assert_eq!(got, want, "width {width} start {start} len {len}");
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod dense_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn budget_boundary_and_contents() {
+        // Include empty, singleton, and long lists; offsets cross machine words.
+        let counts: Vec<u32> = (0..257).map(|i| (i % 17) as u32).collect();
+        let mut builder = ContigTableDirectBuilder::new(&counts, 1000, 32);
+        for (i, &count) in counts.iter().enumerate() {
+            for j in 0..count {
+                builder.add_occurrence(i as u32, j, j * 7, j % 2 == 0);
+            }
+        }
+        let ef = builder.build();
+        let expected: Vec<Vec<_>> = (0..counts.len())
+            .map(|i| ef.contig_entries(i as u64).iter().collect())
+            .collect();
+        let mut serialized = Vec::new();
+        ef.save(&mut serialized).unwrap();
+        let allocation = ef.dense_bounds_bytes().unwrap();
+        let entries_ptr = ef.ctg_entries.as_slice().as_ptr();
+        let ef = ef.try_into_dense(allocation - 1).unwrap_err();
+        assert_eq!(entries_ptr, ef.ctg_entries.as_slice().as_ptr());
+        let mut rejected_bytes = Vec::new();
+        ef.save(&mut rejected_bytes).unwrap();
+        assert_eq!(serialized, rejected_bytes);
+        let dense = ef.try_into_dense(allocation).unwrap();
+        assert_eq!(entries_ptr, dense.ctg_entries.as_slice().as_ptr());
+        assert_eq!(allocation, std::mem::size_of_val(dense.bounds.as_slice()));
+        for (i, values) in expected.iter().enumerate() {
+            assert_eq!(
+                *values,
+                dense.contig_entries(i as u64).iter().collect::<Vec<_>>()
+            );
+        }
+        let zero = ContigTableDirectBuilder::new(&[], 0, 0).build();
+        assert!(zero.try_into_dense(0).is_err());
+    }
+
+    #[test]
+    fn dense_endpoints_at_all_widths() {
+        for width in 1..=usize::BITS as usize {
+            let max = usize::MAX >> (usize::BITS as usize - width);
+            let values: Vec<usize> = (0..70).map(|i| ((max as u128) * i / 69) as usize).collect();
+            let mut bounds = BitFieldVec::new(width, values.len());
+            for (i, &v) in values.iter().enumerate() {
+                bounds.set_value(i, v);
+            }
+            let dense = DenseContigTable {
+                ref_len_bits: 0,
+                num_ref_bits: 0,
+                bounds,
+                ctg_entries: BitFieldVec::new(1, 0),
+            };
+            for i in 0..69 {
+                assert_eq!(
+                    dense.contig_entries(i as u64).len(),
+                    values[i + 1] - values[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn allocation_overflow_is_rejected() {
+        assert_eq!(dense_allocation_bytes(usize::MAX, 64), None);
+        assert_eq!(
+            dense_allocation_bytes(0, 1),
+            Some(std::mem::size_of::<usize>())
+        );
     }
 }

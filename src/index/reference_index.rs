@@ -12,7 +12,9 @@ use std::path::Path;
 use tiny_dict::TinyDictionary;
 use tracing::{info, warn};
 
-use super::contig_table::{ContigTable, ContigTableLike, EntryEncoding, TinyContigTable};
+use super::contig_table::{
+    ContigTable, ContigTableLike, DenseContigTable, EntryEncoding, TinyContigTable,
+};
 use super::eq_classes::EqClassMap;
 use super::paths::{
     CTAB_EXT, DICT_EXT, ECTAB_EXT, IndexLayout, IndexPaths, POISON_EXT, POISON_JSON_EXT,
@@ -187,6 +189,47 @@ where
     poison_table: Option<PoisonTable>,
     /// Optional reference signature hashes from `{prefix}.sigs.json`.
     sig_info: Option<RefSigInfo>,
+}
+
+impl<D: KmerDictionary> ReferenceIndex<D, ContigTable> {
+    /// Prepare dense contig bounds within an explicit allocation budget.
+    /// Match once, before entering a generic mapping pipeline. Rejection
+    /// returns the unmodified EF index; lookup has no representation check.
+    #[allow(clippy::result_large_err)] // Preserve ownership without an extra allocation.
+    pub fn try_into_dense(
+        self,
+        max_bytes: usize,
+    ) -> Result<ReferenceIndex<D, DenseContigTable>, Self> {
+        let ReferenceIndex {
+            dict,
+            contig_table,
+            ref_info,
+            encoding,
+            ec_table,
+            poison_table,
+            sig_info,
+        } = self;
+        match contig_table.try_into_dense(max_bytes) {
+            Ok(contig_table) => Ok(ReferenceIndex {
+                dict,
+                contig_table,
+                ref_info,
+                encoding,
+                ec_table,
+                poison_table,
+                sig_info,
+            }),
+            Err(contig_table) => Err(ReferenceIndex {
+                dict,
+                contig_table,
+                ref_info,
+                encoding,
+                ec_table,
+                poison_table,
+                sig_info,
+            }),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
