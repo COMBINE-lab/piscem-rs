@@ -121,6 +121,10 @@ pub struct MapBulkArgs {
     /// (hashbrown-backed, faster but higher memory).
     #[arg(long, value_enum, default_value_t = DictKind::Auto)]
     pub dict: DictKind,
+    /// Maximum new allocation in MiB for faster contig bounds (0 retains EF).
+    /// Selected once before mapping; does not apply to Tiny indexes.
+    #[arg(long, default_value_t = crate::index::contig_table::DEFAULT_DENSE_BOUNDS_BYTES / (1024 * 1024))]
+    pub dense_bounds_budget_mib: usize,
 }
 
 pub fn run(args: MapBulkArgs) -> Result<()> {
@@ -194,7 +198,32 @@ pub fn run(args: MapBulkArgs) -> Result<()> {
         return run_bulk_with_index(args, &tiny_index, start, is_paired, load_secs);
     }
 
-    run_bulk_with_index(args, &index, start, is_paired, load_secs)
+    let budget = args.dense_bounds_budget_mib.saturating_mul(1024 * 1024);
+    match index.try_into_dense(budget) {
+        Ok(index) => {
+            info!(
+                "Using dense contig bounds (budget {} MiB)",
+                args.dense_bounds_budget_mib
+            );
+            run_bulk_with_index(
+                args,
+                &index,
+                start,
+                is_paired,
+                load_start.elapsed().as_secs_f64(),
+            )
+        }
+        Err(index) => {
+            info!("Retaining Elias-Fano contig bounds");
+            run_bulk_with_index(
+                args,
+                &index,
+                start,
+                is_paired,
+                load_start.elapsed().as_secs_f64(),
+            )
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
