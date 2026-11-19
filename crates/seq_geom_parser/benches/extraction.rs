@@ -12,7 +12,7 @@ use seq_geom_parser::{parse_geometry, CompiledGeom};
 
 /// Generate a synthetic read of the given length filled with random-ish bases.
 fn make_read(len: usize, seed: u8) -> Vec<u8> {
-    let bases = [b'A', b'C', b'G', b'T'];
+    let bases = *b"ACGT";
     (0..len)
         .map(|i| bases[((i as u8).wrapping_add(seed)) as usize % 4])
         .collect()

@@ -11,23 +11,23 @@ license-file = "LICENSE"
 repository = "https://github.com/COMBINE-lab/piscem-rs"
 
 [workspace.dependencies]
-sshash-lib = { version = "0.8.1" }
-tiny-dict = { version = "0.8.0" }
-sux = { version = "0.15.2", default-features = false, features = ["epserde", "rayon"] }
+sshash-lib = { version = "0.8.2" }
+tiny-dict = { version = "0.8.2" }
+sux = { version = "0.15.4", default-features = false, features = ["epserde", "rayon"] }
 anyhow = "1.0"
 thiserror = "2.0"
 clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rayon = "1.11"
-memmap2 = "0.9"
+memmap2 = "0.9.11"
 tempfile = "3.15"
 seq-macro = "0.3"
 cpu-time = "1.0.0"
 
 [package]
 name = "piscem-rs"
-version = "0.12.4"
+version = "0.13.0"
 edition = "2024"
 rust-version = "1.91"
 license = "BSD-3-Clause"
@@ -71,12 +71,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sshash-lib = "0.8.1"
-tiny-dict = "0.8.0"
+sshash-lib = "0.8.2"
+tiny-dict = "0.8.2"
 # Total physical memory, portably. Paired with getrlimit and cgroup reads in
 # `index::mem_budget`, which cover the limits `sysinfo` cannot see.
 # Held at 0.36: `sux` -> `dsi-progress-logger` pins `sysinfo = "0.36.1"`, which
-# can never unify with 0.39, so bumping puts two copies of the crate in the
+# cannot unify with newer 0.x lines, so bumping puts two copies in the
 # build tree. Nothing we call needs anything newer.
 sysinfo = { version = "0.36", default-features = false, features = ["system"] }
 # getrlimit(RLIMIT_AS): the one memory ceiling visible on both Linux and macOS.
@@ -100,38 +100,19 @@ hashbrown = "0.17"
 dashmap = "6"
 smallvec = "1.13"
 crossbeam = "0.8"
-# TEMPORARY: `paraseq-temp` 0.6.3-pre.1 is upstream paraseq 0.6.2 plus two
-# fixes offered upstream: a FASTQ cut short one or two lines into its last
-# record is an error instead of reading as complete, and format errors can name
-# their input (the readers below are named after their paths). Its library is
-# still named `paraseq`, so code is unchanged; switch back to
-# `paraseq = { version = "0.6", default-features = false }` once a paraseq
-# release includes both. `ThreadPool` (paraseq's resizable worker pool, from
-# noamteyssier/paraseq#78) is what lets the mapping thread count change
-# mid-run, so a bad decode/map split can be corrected rather than merely
-# avoided.
-#
-# Default features are off on purpose: piscem opens and decompresses its own
-# inputs (niffler below, or rapidgzip) and hands paraseq plain readers, so it
-# needs none of paraseq's optional features. paraseq's defaults would also turn
-# on `niffler/default`, and with it niffler >= 3.0.1's `lzma` feature, which
-# links liblzma 0.4 -- unresolvable next to sshash-lib's needletail 0.7, which
-# links liblzma 0.3 (only one crate may link the native `lzma`).
-paraseq = { package = "paraseq-temp", version = "=0.6.3-pre.1", default-features = false }
-# niffler with its *default* features: exactly the set piscem has always been
-# built with, since paraseq-temp's defaults enabled `niffler/default` and
-# features unify. The old `default-features = false` list here was inert, and
-# is wrong on its own: niffler 3.0.0's `bz2` does not enable a bzip2 backend
-# (only `bzip2/default` does, via niffler's defaults), so it fails to compile
-# once paraseq stops supplying them. Defaults also keep .xz input working.
-# While needletail (via sshash-lib) links liblzma 0.3 this resolves to niffler
-# 3.0.0, since 3.0.1's `lzma` moved to liblzma 0.4.
-niffler = "3"
+# Upstream 0.6.3 includes named format errors and rejects truncated FASTQ
+# records, replacing our temporary fork. Its resizable ThreadPool supports
+# the mapping/decompression broker. Piscem opens/decompresses inputs itself,
+# so paraseq needs none of its optional input features.
+paraseq = { version = "0.6.3", default-features = false }
+# Keep all existing compression formats. 3.0.2 uses patched zstd 0.14 and
+# liblzma 0.4, which now matches sshash-lib's needletail 0.7.4.
+niffler = "3.0.2"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 indicatif = "0.18"
 
 # Succinct data structures (same versions as sshash-rs)
-sux = { version = "0.15.2", default-features = false, features = ["epserde", "rayon"] }
+sux = { version = "0.15.4", default-features = false, features = ["epserde", "rayon"] }
 epserde = "0.13.2"
 value-traits = "0.3"
 mem_dbg = "0.4.1"
@@ -202,9 +183,3 @@ required-features = ["rapidgzip"]
 [[test]]
 name = "decode_parallelism"
 required-features = ["rapidgzip"]
-
-[patch.crates-io]
-# Keep direct, tiny-dict and Python dependencies on the same reviewed SSHash
-# commit until these merged changes have a crate release. Downstream workspace
-# builds must apply this patch at their own workspace root as well.
-sshash-lib = { git = "https://github.com/COMBINE-lab/sshash-rs", rev = "186f9f4ed36995e34bc24e2bbf9ea6460ef68e08" }

@@ -868,6 +868,7 @@ impl PyReferenceIndex {
     /// :raises RuntimeError: If the build fails.
     #[staticmethod]
     #[pyo3(signature = (input_prefix, output_prefix, *, k=31, m=19, threads=4, build_ec=true, canonical=None, decoys=None))]
+    #[allow(clippy::too_many_arguments)] // Preserve the public Python keyword API.
     fn build(
         py: Python<'_>,
         input_prefix: &str,
@@ -951,7 +952,7 @@ impl PyReferenceIndex {
 
             Ok(())
         })
-        .map_err(|e| PyRuntimeError::new_err(e))?;
+        .map_err(PyRuntimeError::new_err)?;
 
         // Load the final index (with poison if decoys were provided)
         let index = ReferenceIndex::load(Path::new(output_prefix), true, has_poison)

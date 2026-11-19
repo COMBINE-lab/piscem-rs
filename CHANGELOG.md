@@ -3,11 +3,11 @@
 Notable changes to `piscem-rs`. Versions follow [Semantic Versioning](https://semver.org);
 pre-1.0, a minor bump may carry breaking changes.
 
-## [Unreleased]
+## [0.13.0] — 2026-11-19
 
 ### Changed
 
-- **Breaking API change, targeted for 0.13.0:** `RefInfo::names()` returns
+- **Breaking API change:** `RefInfo::names()` returns
   an `ExactSizeIterator<Item = &str>` instead of `&[String]`. Reference names
   share one string arena with an end offset per name, reducing retained
   metadata memory. Use the iterator directly where callers previously used
@@ -17,6 +17,33 @@ pre-1.0, a minor bump may carry breaking changes.
   reading, avoiding temporary arena growth and shrinking allocations. Both
   SSHash and Tiny index loaders use it. `RefInfo::load` remains available for
   generic readers, where the total size need not be known.
+
+### Performance
+
+- Strict contig walking compares read/reference blocks every k bases and
+  validates only newly entering bases. This avoids rescanning the remaining
+  read on every restart, improving long-read walking without changing hit or
+  boundary semantics. Default permissive mapping remains effectively unchanged.
+- The reference-name arena saves about 10.48 MB of retained metadata memory
+  on the reviewed full GENCODE transcriptome. File-backed reservation also
+  reduces peak loading memory; no general mapping speedup is claimed.
+
+### Dependencies
+
+- Use published `sshash-lib` and `tiny-dict` 0.8.2, removing the temporary
+  SSHash Git override. This includes lazy streaming minimizers, widened bucket
+  starts, and the empty-skew-partition correctness fix. The release preserves
+  existing index formats.
+- Return to upstream `paraseq` 0.6.3, which includes both fixes from
+  `paraseq-temp`: truncated FASTQ records are errors, and format errors name
+  the offending input. Resizable worker-pool support is retained. Consumers that
+  pass paraseq readers or pools through piscem APIs must also switch their
+  direct dependency from `paraseq-temp` to `paraseq` 0.6.3 so the types match.
+- Require `sux` 0.15.4 and `niffler` 3.0.2. The latter aligns its compression
+  dependencies with SSHash's needletail 0.7.4, removing the old zstd 0.13 and
+  liblzma 0.3 dependency lines. Refresh compatible patch releases in the lockfile.
+
+Existing indexes remain readable without rebuilding.
 
 ## [0.12.4] — 2026-11-17
 
