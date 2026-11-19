@@ -342,6 +342,79 @@ impl<'a> ReadKmerIter<'a> {
         self.pos - old_pos
     }
 
+    /// Number of steps `s` in `0..=max_steps` such that every window from
+    /// `pos` to `pos + s` holds only valid bases and matches its reference
+    /// k-mer in one orientation: `ref_at(j)`, the reference k-mer the window
+    /// at `pos + j` is compared with (2-bit words, like `fw`), equal to the
+    /// window (`direction > 0`) or to its reverse complement (`direction < 0`).
+    /// The reference must advance with the read in that orientation: one base
+    /// per step, forward or backward. `0` when the current window itself does
+    /// not match.
+    ///
+    /// Probes every `k` steps: matching windows `pos + j` and `pos + j + k`
+    /// cover every window between them, and the first mismatching base of a
+    /// failed probe gives the last matching window.
+    #[inline]
+    fn matching_steps(&self, max_steps: i32, direction: i32, ref_at: impl Fn(i32) -> u64) -> i32 {
+        let expected = |fw: u64| {
+            if direction > 0 {
+                fw
+            } else {
+                Self::reverse_complement_word(fw, self.k)
+            }
+        };
+        if expected(self.fw) != ref_at(0) {
+            return 0;
+        }
+        let k = self.k as i32;
+        let start = self.pos as usize;
+        let mut s = 0;
+        while s < max_steps {
+            let mut j = (s + k).min(max_steps);
+            // Validate only the new bases covered by this probe. An early
+            // mismatch must not force a scan of the unread contig suffix.
+            let entering = &self.read[start + self.k + s as usize..start + self.k + j as usize];
+            let invalid = entering.iter().position(|&b| !is_valid_base(b));
+            if let Some(e) = invalid {
+                j = s + e as i32;
+                if j == s {
+                    return s;
+                }
+            }
+            let w = &self.read[start + j as usize..start + j as usize + self.k];
+            let mut fw = 0u64;
+            for (i, &b) in w.iter().enumerate() {
+                fw |= Self::encode(b) << (2 * i);
+            }
+            let x = expected(fw) ^ ref_at(j);
+            if x == 0 {
+                s = j;
+                if invalid.is_some() {
+                    return s;
+                }
+                continue;
+            }
+            // Offset in the window of the first read base that mismatches:
+            // the lowest 2-bit group forward, the highest one reversed. The
+            // bases up to `s + k` matched already, so the result is >= `s`.
+            let first_bad = if direction > 0 {
+                x.trailing_zeros() as i32 / 2
+            } else {
+                k - 1 - (63 - x.leading_zeros() as i32) / 2
+            };
+            return j + first_bad - k;
+        }
+        max_steps
+    }
+
+    /// Move `n` positions forward inside a stretch known to hold only valid
+    /// bases (as [`Self::matching_steps`] checks), rebuilding the words.
+    #[inline]
+    fn jump_forward(&mut self, n: i32) {
+        self.pos += n;
+        self.build_kmer_words();
+    }
+
     /// Scan forward from the current position to find the next valid k-mer
     /// window (one with no invalid bases).
     fn find_next_valid(&mut self) {
@@ -895,6 +968,40 @@ impl<'idx, D: KmerDictionary, C: ContigTableLike> HitSearcher<'idx, D, C> {
                 let mut ended_on_match = false;
                 let mut last_valid_hit = raw_hits.last().unwrap().clone();
 
+                // Take the steps whose k-mer matches the contig in the hit's
+                // orientation in blocks of k instead of one base at a time:
+                // the step-by-step loop below would accept each of them, and
+                // ends in the state set here. It then resumes from the first
+                // step that differs (a mismatch, a k-mer matching the other
+                // way, an invalid base, or the end of the read or contig).
+                let max_steps = dist_to_contig_end.min((iter.max_pos - iter.pos) as i64) as i32;
+                if max_steps > 0 {
+                    let dict = index.dict();
+                    let c0 = c_curr_pos;
+                    let n = iter.matching_steps(max_steps, direction, |j| {
+                        let p = (c0 + (direction * j) as i64) as usize;
+                        <Kmer<K> as KmerBits>::to_u64(dict.kmer_at_pos::<K>(p).bits())
+                    });
+                    if n > 0 {
+                        iter.jump_forward(n);
+                        let offset = direction * n;
+                        dist_to_contig_end -= n as i64;
+                        c_curr_pos += offset as i64;
+                        // The per-step loop leaves the orientation of the
+                        // last step, which `is_equivalent` decides.
+                        let ref_kmer: Kmer<K> = dict.kmer_at_pos(c_curr_pos as usize);
+                        let ref_bits = <Kmer<K> as KmerBits>::to_u64(ref_kmer.bits());
+                        let hit_fw = iter.is_equivalent(ref_bits) == KmerMatchType::IdentityMatch;
+                        let phit = &mut last_valid_hit.1;
+                        phit.set_resulted_from_open_search(false);
+                        phit.set_contig_orientation(hit_fw);
+                        phit.set_global_pos((phit.global_pos() as i64 + offset as i64) as u64);
+                        phit.set_contig_pos((phit.contig_pos() as i32 + offset) as u32);
+                        last_valid_hit.0 = iter.pos();
+                        ended_on_match = dist_to_contig_end == 0;
+                    }
+                }
+
                 while !iter.is_exhausted() && matches && dist_to_contig_end > 0 {
                     let inc_amt = iter.advance();
                     dist_to_contig_end -= inc_amt as i64;
@@ -1070,6 +1177,90 @@ mod tests {
                     assert_eq!(it.fw_word(), fw, "fw k={k} pos={}", it.pos());
                     assert_eq!(it.rc_word(), rc, "rc k={k} pos={}", it.pos());
                     it.advance();
+                }
+            }
+        }
+    }
+
+    /// `matching_steps` (block probes) must agree with stepping one base at a
+    /// time and comparing whole windows, in both orientations, with
+    /// mismatches, invalid bases and mixed case in the read.
+    #[test]
+    fn test_matching_steps_matches_per_step() {
+        let mut st = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rng = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        let word = |s: &[u8], at: usize, k: usize| {
+            (0..k).fold(0u64, |w, i| w | ReadKmerIter::encode(s[at + i]) << (2 * i))
+        };
+        let revcomp = |s: &[u8]| -> Vec<u8> {
+            s.iter()
+                .rev()
+                .map(|&b| match b {
+                    b'A' => b'T',
+                    b'C' => b'G',
+                    b'G' => b'C',
+                    _ => b'A',
+                })
+                .collect()
+        };
+        for k in [15usize, 19, 23, 31] {
+            for case in 0..4000 {
+                // Include long walks with errors and invalid bases: rescanning
+                // the whole suffix at each restart is costly on these reads.
+                let len = k + if case % 250 == 0 {
+                    10_000
+                } else {
+                    (rng() % 120) as usize
+                };
+                let refseq: Vec<u8> = (0..len).map(|_| b"ACGT"[(rng() % 4) as usize]).collect();
+                let direction = if case % 2 == 0 { 1 } else { -1 };
+                let mut read = if direction > 0 { refseq.clone() } else { revcomp(&refseq) };
+                // Mutate past the first window, which must match.
+                for _ in 0..(rng() % 4) {
+                    if len > k {
+                        let at = k + rng() as usize % (len - k);
+                        read[at] = match rng() % 6 {
+                            0 => b'N',
+                            1 => read[at].to_ascii_lowercase(),
+                            _ => b"ACGT"[(rng() % 4) as usize],
+                        };
+                    }
+                }
+                let ref_at = |j: i32| {
+                    if direction > 0 {
+                        word(&refseq, j as usize, k)
+                    } else {
+                        word(&refseq, len - k - j as usize, k)
+                    }
+                };
+                let it = ReadKmerIter::new(&read, k);
+                assert_eq!(it.pos(), 0);
+                let max_steps = (len - k) as i32;
+                let expected = |fw: u64| {
+                    if direction > 0 { fw } else { ReadKmerIter::reverse_complement_word(fw, k) }
+                };
+                let mut want = 0;
+                while want < max_steps {
+                    let p = (want + 1) as usize;
+                    if !read[p..p + k].iter().all(|&b| is_valid_base(b))
+                        || expected(word(&read, p, k)) != ref_at(want + 1)
+                    {
+                        break;
+                    }
+                    want += 1;
+                }
+                for cap in [max_steps, max_steps / 2, 1.min(max_steps)] {
+                    assert_eq!(
+                        it.matching_steps(cap, direction, ref_at),
+                        want.min(cap),
+                        "k={k} dir={direction} cap={cap} read={}",
+                        String::from_utf8_lossy(&read)
+                    );
                 }
             }
         }

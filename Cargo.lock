@@ -2258,8 +2258,7 @@ checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 [[package]]
 name = "sshash-lib"
 version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71ea4a34780f39a2a0ac04eb5d2f5c42a6f2ab69f6430f3c2d846df4fc744c36"
+source = "git+https://github.com/COMBINE-lab/sshash-rs?rev=186f9f4ed36995e34bc24e2bbf9ea6460ef68e08#186f9f4ed36995e34bc24e2bbf9ea6460ef68e08"
 dependencies = [
  "anyhow",
  "dsi-progress-logger",
