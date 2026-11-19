@@ -312,11 +312,12 @@ pub struct ContigTable {
     ctg_entries: BitFieldVec,
     /// Cumulative offsets into `ctg_entries`, `num_contigs + 1` of them, at
     /// the fixed width of the largest: the entries of contig `i` span
-    /// `[bounds[i], bounds[i+1])`. On disk they are an Elias-Fano sequence
-    /// (~3 bits per contig); in memory they take `bits(num_entries)` bits
-    /// per contig, so that a contig's bounds cost one cache line rather than
-    /// an Elias-Fano select (inventory, upper and lower bits: three likely
-    /// misses on every k-mer hit).
+    /// `[bounds[i], bounds[i+1])`. On disk they are an Elias-Fano sequence;
+    /// in memory each bound takes `max(1, bits(num_entries))` bits. Elias-Fano
+    /// space depends on the entries-per-contig ratio and select metadata.
+    /// Fixed-width bounds use more memory but replace an Elias-Fano select
+    /// and next-value step with reads from adjacent packed words. Those words
+    /// may span cache lines; neither representation has a fixed miss count.
     bounds: BitFieldVec,
 }
 
@@ -1162,7 +1163,7 @@ mod tests {
                 st ^= st << 13;
                 st ^= st >> 7;
                 st ^= st << 17;
-                let step = (st % 9) as usize * if st % 5 == 0 { 1000 } else { 1 };
+                let step = (st % 9) as usize * if st.is_multiple_of(5) { 1000 } else { 1 };
                 offsets.push(offsets.last().unwrap() + step);
             }
             let u = offsets.last().unwrap() + 1;
