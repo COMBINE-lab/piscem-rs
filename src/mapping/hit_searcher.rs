@@ -368,15 +368,19 @@ impl<'a> ReadKmerIter<'a> {
         }
         let k = self.k as i32;
         let start = self.pos as usize;
-        // Stop before the first invalid base entering the window.
-        let entering = &self.read[start + self.k..start + self.k + max_steps as usize];
-        let max_steps = entering
-            .iter()
-            .position(|&b| !is_valid_base(b))
-            .map_or(max_steps, |e| e as i32);
         let mut s = 0;
         while s < max_steps {
-            let j = (s + k).min(max_steps);
+            let mut j = (s + k).min(max_steps);
+            // Validate only the new bases covered by this probe. An early
+            // mismatch must not force a scan of the unread contig suffix.
+            let entering = &self.read[start + self.k + s as usize..start + self.k + j as usize];
+            let invalid = entering.iter().position(|&b| !is_valid_base(b));
+            if let Some(e) = invalid {
+                j = s + e as i32;
+                if j == s {
+                    return s;
+                }
+            }
             let w = &self.read[start + j as usize..start + j as usize + self.k];
             let mut fw = 0u64;
             for (i, &b) in w.iter().enumerate() {
@@ -385,6 +389,9 @@ impl<'a> ReadKmerIter<'a> {
             let x = expected(fw) ^ ref_at(j);
             if x == 0 {
                 s = j;
+                if invalid.is_some() {
+                    return s;
+                }
                 continue;
             }
             // Offset in the window of the first read base that mismatches:
@@ -1203,7 +1210,13 @@ mod tests {
         };
         for k in [15usize, 19, 23, 31] {
             for case in 0..4000 {
-                let len = k + (rng() % 120) as usize;
+                // Include long walks with errors and invalid bases: rescanning
+                // the whole suffix at each restart is costly on these reads.
+                let len = k + if case % 250 == 0 {
+                    10_000
+                } else {
+                    (rng() % 120) as usize
+                };
                 let refseq: Vec<u8> = (0..len).map(|_| b"ACGT"[(rng() % 4) as usize]).collect();
                 let direction = if case % 2 == 0 { 1 } else { -1 };
                 let mut read = if direction > 0 { refseq.clone() } else { revcomp(&refseq) };
